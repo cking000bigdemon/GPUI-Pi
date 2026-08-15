@@ -46,7 +46,20 @@ T1 照常：`.\scripts\validate.ps1` 全绿。
 | 风险 | 预案 |
 |---|---|
 | 门禁 2 不过（`TextView` 每次 delta 全量重解析） | 先试「已定稿段落缓存 + 只重解析尾段」的分块渲染；仍不过才算门禁失败 |
-| 门禁 1 不过 | **无预案** —— IME 在 GPUI 层，不是应用层能修的。直接停项 |
+| 门禁 1 不过 | **应用层无预案** —— IME 在 GPUI 平台层。但它是 zed monorepo 的 in-tree 官方 crate（不是社区分支），所以是「停项 + 给上游提 issue，修复后重估」，不是永久放弃。**不许在应用层写 hack 绕过去** |
+
+### 门禁 1 debug 时看哪里
+
+GPUI 的 Windows IME 走 **IMM32 而非 TSF**，实现全在 `crates/gpui_windows/src/events.rs`（钉死 commit `cc053a4a` 已核对）：
+
+| 症状 | 对应实现 |
+|---|---|
+| 候选窗位置不对 | `update_ime_position()` → `ImmSetCompositionWindow` + `ImmSetCandidateWindow` |
+| 组合期丢字 / 串字 | `handle_ime_composition()` → `GCS_COMPSTR` / `GCS_RESULTSTR` 解析 |
+| 输入框失焦后仍吃键 | `update_ime_enabled()` → `ImmAssociateContextEx` |
+| `Enter` 误发消息（候选未提交就上屏） | `ImmNotifyIME(NI_COMPOSITIONSTR, CPS_COMPLETE)` 的时机 |
+
+提 issue 时带上这几个函数名，比只说"中文输入有问题"有效得多。
 
 ## 禁止
 
