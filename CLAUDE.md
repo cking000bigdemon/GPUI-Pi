@@ -70,6 +70,8 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 | 颜色/字体 | 颜色一律走 gpui-component 的 `Theme` 变量，禁止硬编码；字体族按平台条件编译（Windows 微软雅黑/Segoe UI，其余 Noto Sans CJK SC） |
 | 注释 | 中文。写**为什么**，不复述代码在做什么 |
 | clippy | `-D warnings`，不许 `#[allow]` 糊过去；确有必要时必须写明理由 |
+| PowerShell 脚本 | 改完**必须验证**，不许"照 sh 版翻译完就提交"（R0 因此红过一次 CI）。130 上已装 pwsh 7.6.5（`~/.local/bin/pwsh`）：能跑的直接跑，跑不了的至少过一遍语法解析（`[Parser]::ParseFile`） |
+| `$LASTEXITCODE` | PowerShell 只有跑过**外部程序**才写它 —— 调 `.ps1` 且它正常结束时该变量保持旧值、首次调用时是空的。判断成败前先 `$global:LASTEXITCODE = 0`，且被调脚本成功时要显式 `exit 0` |
 
 ## 上游源码在哪（只读参考）
 

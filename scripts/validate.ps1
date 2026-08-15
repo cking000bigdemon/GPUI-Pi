@@ -10,8 +10,13 @@ Push-Location $Root
 
 function Step($n, $name, $block) {
     Write-Host "### [$n/5] $name"
+    # 每步前手动清零：PowerShell 只有在跑过「外部程序」之后才会写 $LASTEXITCODE，
+    # 调 .ps1 且它正常结束时这个变量保持上一次的值、首次调用时干脆是空的 ——
+    # 空值 -ne 0 为真，会把成功的一步判成失败（R0 的 CI 就是这么红的）。
+    $global:LASTEXITCODE = 0
     & $block
-    if ($LASTEXITCODE -ne 0) { Pop-Location; throw "$name 失败（exit $LASTEXITCODE）" }
+    # Pop-Location 交给外层 finally，这里再 pop 一次会把位置栈弹空。
+    if ($LASTEXITCODE -ne 0) { throw "$name 失败（exit $LASTEXITCODE）" }
 }
 
 try {

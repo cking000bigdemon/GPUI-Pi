@@ -34,4 +34,6 @@ Check "gpui-component"             "git+https://github.com/longbridge/gpui-compo
 CheckNoStray "zed"            "https://github.com/zed-industries/zed"        $ZedSha
 CheckNoStray "gpui-component" "https://github.com/longbridge/gpui-component" $GpuicSha
 
-if ($fail) { exit 1 }
+# 成功也要显式 exit 0：调用方（validate.ps1）靠 $LASTEXITCODE 判断，
+# 而 .ps1 正常落地时并不会写这个变量。
+if ($fail) { exit 1 } else { exit 0 }

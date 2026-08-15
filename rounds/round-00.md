@@ -99,8 +99,33 @@ cargo 不报错，但这是一份半新半旧的锁 —— gpui 与 gpui_platfor
 
 `target/release/gpui-pi` 只有 **1.9MB** —— 因为 R0 的 `main()` 根本没调用 GPUI，链接器把整个渲染栈裁掉了。真实体积要等 R1 开出窗口后再测，立项文档里 50–90MB 的估计**尚未验证**。
 
+### CI 第一次红：`$LASTEXITCODE` 在纯 PowerShell 调用链里是空的
+
+PR #1 的 windows job 39s 就红了，栈顶是 `validate.ps1:14`：
+
+```
+上游钉版本 失败（exit ）        ← 注意 exit 后面是空的
+```
+
+`check-pins.ps1` 自己四条全 OK，是 `validate.ps1` 的 `Step` 判错了。原因：**PowerShell 只有在跑过「外部程序」之后才会写 `$LASTEXITCODE`**。`& ./check-pins.ps1` 是 PowerShell 内部调用，脚本正常落地时不会写这个变量 —— 首次调用时它干脆是空的，而空值 `-ne 0` 为真。
+
+修法两处都要：
+
+1. `validate.ps1` 每步前 `$global:LASTEXITCODE = 0`；顺手把 `Step` 里的 `Pop-Location` 删了（外层 `finally` 已经有一次，重复 pop 会把位置栈弹空）；
+2. `check-pins.ps1` 成功路径显式 `exit 0`。
+
+**顺手解决了 BACKLOG #1**：130 上装了 PowerShell 7.6.5 到 `~/.local/bin/pwsh`（官方 linux-x64 tarball，不动系统）。于是：
+
+| 脚本 | 130 上的验证程度 |
+|---|---|
+| `validate.ps1` | ✅ 实跑 `-Logic` 全绿 |
+| `check-pins.ps1` | ✅ 实跑；并做了**反向测试** —— 篡改 Cargo.lock 的 sha 后 sh/ps1 两版都正确 exit 1 |
+| `fetch-pi.ps1` | ⚠️ 只过了语法解析（依赖 `PROCESSOR_ARCHITECTURE` 与 Windows zip，Linux 上跑不了） |
+
+教训已写进 `CLAUDE.md` 的编码约定：**PowerShell 脚本改完必须验证，不许照 sh 版翻译完就提交**。
+
 ### 留给 R1 的三件事
 
 1. `rustup toolchain install 1.97.1-x86_64-pc-windows-msvc` + Build Tools + 长路径开关；
-2. `.\scripts\fetch-pi.ps1` 与 `.\scripts\check-pins.ps1` **在 130 上无法执行验证**，两个 PowerShell 脚本是照着 sh 版翻的，R1 第一件事就是跑通它们；
+2. `.\scripts\fetch-pi.ps1` 仍只过了语法解析（Linux 跑不了），R1 开工先在 Windows 上真跑一次；
 3. spike 结束后把 spike 代码的去留记进 `BACKLOG.md`。
