@@ -1,0 +1,22 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# 构建输入（体积大，按文档重新准备）
+/vendor/
+/dist/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# 本地配置与日志
+/.env
+/.env.local
+*.log
+/.claude/settings.local.json
+/.claude/worktrees/
