@@ -86,4 +86,5 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 
 - worktree + PR，分支 `WinClaude/round-NN`（130 端用 `ArchLinuxClaude/round-NN`）；
 - `main` 只接 PR，不直推；
-- PR 描述必须贴 validation 的实际回显，不贴不审。
+- PR 描述必须贴 validation 的实际回显，不贴不审；
+- **合并后必须验证 main 真的包含那些 commit**（`git log main --oneline` 或 `git branch --contains <sha>`）。R0 合并时踩过：最后一个 commit 已经 push 成功（remote-tracking reflog 有记录），但 `gh pr merge` 用的是 GitHub 侧尚未刷新的 PR head，那个 commit 被静默漏掉，而分支随即被 `--delete-branch` 删了。
