@@ -124,6 +124,17 @@ PR #1 的 windows job 39s 就红了，栈顶是 `validate.ps1:14`：
 
 教训已写进 `CLAUDE.md` 的编码约定：**PowerShell 脚本改完必须验证，不许照 sh 版翻译完就提交**。
 
+### CI 第二次：双绿
+
+| job | 结果 | 耗时 |
+|---|---|---|
+| linux 纯逻辑（非阻断） | ✅ pass | 24s |
+| windows（阻断） | ✅ pass | **17m43s** |
+
+windows 冷缓存分段：clippy 4m33 → test 4m04 → release build 7m00。
+
+**这个数字对后面 16 轮的 loop 节奏有意义**：冷缓存下一次全量 Windows 验收接近 18 分钟，靠 `Swatinem/rust-cache` 命中后会短很多，但 GPUI 一旦重编就是分钟级。所以本地开发应优先 `validate.ps1 -Logic` 快速回环，全量留给提交前和 CI。
+
 ### 留给 R1 的三件事
 
 1. `rustup toolchain install 1.97.1-x86_64-pc-windows-msvc` + Build Tools + 长路径开关；
