@@ -1,0 +1,13 @@
+# 全仓统一 LF —— 立项文档 § 八 编码约定。
+# pi-web-desktop 曾因 core.autocrlf 把种子检出成 CRLF，导致「文件是否被改过」
+# 的内容哈希全部误判；这里从源头掐死。
+* text=auto eol=lf
+
+*.ps1 text eol=lf
+*.sh  text eol=lf
+*.rs  text eol=lf
+*.md  text eol=lf
+
+*.png binary
+*.ico binary
+*.svg text eol=lf

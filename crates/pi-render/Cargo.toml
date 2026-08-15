@@ -1,0 +1,13 @@
+[package]
+name = "pi-render"
+description = "消息 → 可渲染中间模型的转换（Markdown 分块 / ANSI / diff / 工具卡片），不依赖 GPUI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

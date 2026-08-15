@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # 交付目标平台 —— 唯一阻断合并的 job。
+  windows:
+    name: windows (阻断)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 工具链（由 rust-toolchain.toml 决定版本）
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: T1 全量验收
+        shell: pwsh
+        run: .\scripts\validate.ps1
+
+  # 静态兜底 —— 没有人在 Linux 上开发（见立项文档 § 八），因此不阻断合并。
+  # 只跑三个纯逻辑 crate：不碰 GPUI，就不需要 Vulkan / Wayland / X11 一堆系统库。
+  linux-logic:
+    name: linux 纯逻辑 (非阻断)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: 工具链（由 rust-toolchain.toml 决定版本）
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: T1 纯逻辑验收
+        run: ./scripts/validate.sh --logic
