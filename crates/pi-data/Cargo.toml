@@ -1,0 +1,16 @@
+[package]
+name = "pi-data"
+description = "~/.pi/agent 文件层：会话、模型、设置、扩展（不依赖 GPUI）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

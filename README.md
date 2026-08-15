@@ -29,7 +29,13 @@ v1 开发期间锁死，不追上游：
 
 ## 状态
 
-📋 立项中 —— 见 [`docs/立项文档.md`](docs/立项文档.md)。
+18 轮拆解开发中，进度见 [`ROUNDS.md`](ROUNDS.md)，设计见 [`docs/立项文档.md`](docs/立项文档.md)。
+
+```bash
+./scripts/fetch-pi.sh      # 拉 pi v0.84.2 独立二进制到 vendor/pi/
+./scripts/validate.sh      # T1 验收（--logic 只跑纯逻辑 crate）
+cargo run -p gpui-pi       # 环境自检（R0 阶段尚未开窗口）
+```
 
 ## License
 

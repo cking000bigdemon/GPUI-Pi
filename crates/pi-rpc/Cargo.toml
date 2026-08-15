@@ -1,0 +1,15 @@
+[package]
+name = "pi-rpc"
+description = "pi --mode rpc 子进程管理与 JSONL 协议（不依赖 GPUI）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

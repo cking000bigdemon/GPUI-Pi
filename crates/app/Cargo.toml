@@ -1,0 +1,26 @@
+[package]
+name = "gpui-pi"
+description = "GPUI-Pi —— pi 编程智能体的原生桌面客户端"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gpui-pi"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-pi-ui.workspace = true
+pi-data.workspace = true
+pi-rpc.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# GPUI 在 Linux 上需要显式选择窗口后端；Windows/macOS 由 gpui_platform 自行决定。
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui_platform = { workspace = true, features = ["x11", "wayland"] }
