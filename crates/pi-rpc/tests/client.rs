@@ -1,0 +1,209 @@
+use std::{
+    path::PathBuf,
+    process::Command as ProcessCommand,
+    sync::{Arc, Barrier},
+    thread,
+    time::{Duration, Instant},
+};
+
+use pi_rpc::{
+    Client, ClientConfig, ClientError, ClientEvent, Command, LifecycleEvent, RpcSessionState,
+};
+
+fn fake_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_fake_child"))
+}
+
+fn config() -> ClientConfig {
+    let mut config = ClientConfig::new(fake_binary());
+    config.restart_delay = Duration::from_millis(20);
+    config
+}
+
+#[test]
+fn correlates_concurrent_requests_and_drains_stderr() {
+    let client = Client::spawn(config()).unwrap();
+    let events = client.subscribe();
+    let client = Arc::new(client);
+    let barrier = Arc::new(Barrier::new(3));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let client = Arc::clone(&client);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            client
+                .request(Command::GetMessages, Duration::from_secs(2))
+                .unwrap()
+        }));
+    }
+    barrier.wait();
+    let first = handles.remove(0).join().unwrap();
+    let second = handles.remove(0).join().unwrap();
+    assert_ne!(first.id, second.id);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut saw_stderr = false;
+    while Instant::now() < deadline {
+        if let Ok(ClientEvent::Lifecycle(LifecycleEvent::Stderr { line })) =
+            events.recv_timeout(Duration::from_millis(50))
+        {
+            saw_stderr = line.contains("fake child ready");
+            if saw_stderr {
+                break;
+            }
+        }
+    }
+    assert!(saw_stderr);
+    client.shutdown().unwrap();
+}
+
+#[test]
+fn crash_fails_old_pending_then_restarts_with_session() {
+    let client = Client::spawn(config()).unwrap();
+    let events = client.subscribe();
+    let state: RpcSessionState = client
+        .request_data(Command::GetState, Duration::from_secs(2))
+        .unwrap();
+    let session_file = state.session_file.map(PathBuf::from).unwrap();
+
+    let pending_client = client.clone();
+    let pending = thread::spawn(move || {
+        pending_client.request(
+            Command::Prompt {
+                message: "ignored".into(),
+                images: None,
+                streaming_behavior: None,
+            },
+            Duration::from_secs(5),
+        )
+    });
+    thread::sleep(Duration::from_millis(50));
+    client.kill_process_tree().unwrap();
+    assert!(matches!(
+        pending.join().unwrap(),
+        Err(ClientError::ProcessExited { .. })
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut resumed = false;
+    while Instant::now() < deadline {
+        if let Ok(ClientEvent::Lifecycle(LifecycleEvent::Restarted {
+            session_file: actual,
+            ..
+        })) = events.recv_timeout(Duration::from_millis(100))
+        {
+            resumed = actual.as_deref() == Some(session_file.as_path());
+            if resumed {
+                break;
+            }
+        }
+    }
+    assert!(resumed);
+    let restored: RpcSessionState = client
+        .request_data(Command::GetState, Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(restored.session_id, state.session_id);
+    client.shutdown().unwrap();
+}
+
+#[test]
+fn ephemeral_state_clears_a_previous_resume_target() {
+    let mut child_config = config();
+    child_config.args.push("--no-session".into());
+    let client = Client::spawn(child_config).unwrap();
+    client.set_resume_session(Some(PathBuf::from("stale-session.jsonl")));
+    let state: RpcSessionState = client
+        .request_data(Command::GetState, Duration::from_secs(2))
+        .unwrap();
+    assert!(state.session_file.is_none());
+    assert!(client.resume_session().is_none());
+    client.shutdown().unwrap();
+}
+
+#[test]
+fn active_shutdown_does_not_restart() {
+    let client = Client::spawn(config()).unwrap();
+    let events = client.subscribe();
+    client.shutdown().unwrap();
+    let deadline = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < deadline {
+        if let Ok(ClientEvent::Lifecycle(LifecycleEvent::Restarting { .. })) =
+            events.recv_timeout(Duration::from_millis(20))
+        {
+            panic!("active shutdown restarted the process");
+        }
+    }
+}
+
+#[test]
+fn external_tree_kill_works_for_fake_child() {
+    let client = Client::spawn(config()).unwrap();
+    let pid = client.pid().unwrap();
+    #[cfg(windows)]
+    let status = ProcessCommand::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}")])
+        .output()
+        .unwrap();
+    #[cfg(unix)]
+    let status = ProcessCommand::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    client.shutdown().unwrap();
+}
+
+#[test]
+fn shutdown_kills_a_child_that_does_not_handle_stdin_eof() {
+    let mut child_config = config();
+    child_config.shutdown_grace_period = Duration::from_millis(50);
+    let client = Client::spawn(child_config).unwrap();
+    let pending_client = client.clone();
+    let pending = thread::spawn(move || {
+        pending_client.request(
+            Command::Prompt {
+                message: "ignored".into(),
+                images: None,
+                streaming_behavior: None,
+            },
+            Duration::from_secs(5),
+        )
+    });
+    thread::sleep(Duration::from_millis(50));
+    let started = Instant::now();
+    client.shutdown().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(matches!(
+        pending.join().unwrap(),
+        Err(ClientError::ProcessExited { .. })
+    ));
+}
+
+#[test]
+fn slow_event_subscribers_are_disconnected() {
+    let client = Client::spawn(config()).unwrap();
+    let slow = client.subscribe();
+    let response = client
+        .request(
+            Command::SetSessionName {
+                name: "emit_many".into(),
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert!(response.success);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match slow.recv_timeout(Duration::from_millis(20)) {
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                client.shutdown().unwrap();
+                return;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+    panic!("slow subscriber was not disconnected after its bounded buffer filled");
+}
