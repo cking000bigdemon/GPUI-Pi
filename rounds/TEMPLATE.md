@@ -1,5 +1,7 @@
 # Round NN — <标题>
 
+<!-- 保存为 rounds/round-NN/round-NN.md；该轮其他管理产出也放在同一目录。 -->
+
 > 执行方：<130 Arch | Windows> · 状态：<未开始 | 进行中 | 已完成 | BLOCKED>
 
 ## 目标
@@ -28,7 +30,7 @@
 
 ## 失败处理
 
-连续 2 次 validation 不过 → 写 `rounds/BLOCKED-NN.md`，停下呼人。禁止放宽验收标准自我通过。
+连续 2 次 validation 不过 → 写 `rounds/round-NN/BLOCKED.md`，停下呼人。禁止放宽验收标准自我通过。
 
 ## 本轮实测
 

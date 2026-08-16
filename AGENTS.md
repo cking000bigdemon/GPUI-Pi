@@ -15,15 +15,15 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 1. **不引入 web 技术栈** —— 不加 WebView（含 `gpui-wry`）、不嵌 HTML 页面。Mermaid 按立项文档 § 一 直出源码。
 2. **不动上游钉版本** —— `Cargo.lock` 与 `PINNED_PI_VERSION` 是钉死点，`cargo update` 会被 `scripts/check-pins.*` 判红。要改版本先改立项文档 § 二。
 3. **不跨轮次改动** —— 发现前面轮次的问题写进 `rounds/BACKLOG.md`，不当场顺手改。
-4. **不放宽验收** —— 连续 2 次 validation 不过，写 `rounds/BLOCKED-NN.md` 停下呼人，禁止改标准让自己通过。
+4. **不放宽验收** —— 连续 2 次 validation 不过，写 `rounds/round-NN/BLOCKED.md` 停下呼人，禁止改标准让自己通过。
 5. **不写 `~/.pi` 的破坏性操作** —— 数据目录与终端 pi、pi-web-desktop 共享。能只读就只读，必须写走「临时文件 + rename」。
 
 ## 每轮怎么跑
 
 ```
-读 rounds/round-NN.md  →  实现  →  跑 validate  →  不过就改，重跑
-                                        ↓ 全绿
-                     commit + 更新 ROUNDS.md + 回填任务卡「本轮实测」
+读 rounds/round-NN/round-NN.md  →  实现  →  跑 validate  →  不过就改，重跑
+                                                 ↓ 全绿
+                              commit + 更新 ROUNDS.md + 回填任务卡「本轮实测」
 ```
 
 ```bash
@@ -37,6 +37,21 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 ```
 
 **任何一次迭代结束都必须跑 validate**，不许"看起来对了就下一步"。
+
+## 轮次目录
+
+- `rounds/` 根目录只放全局文件：`README.md`、`TEMPLATE.md`、`BACKLOG.md`；
+- 每轮建立独立目录 `rounds/round-NN/`，任务卡固定为 `rounds/round-NN/round-NN.md`；
+- 属于该轮的管理产出（实测记录、阻塞报告、复盘、可提交的验收附件说明等）全部放在该目录下；阻塞报告固定命名为 `BLOCKED.md`；
+- 源码、脚本、fixture、构建产物仍放各自的标准目录，不为了“归档”复制进 `rounds/`；本地大日志与截图继续放 gitignored 的 `.pi/`，在任务卡中记录结论或引用路径；
+- 新增或引用轮次文件时禁止恢复 `rounds/round-NN.md`、`rounds/BLOCKED-NN.md` 这类扁平路径。
+
+## 子代理代码审查
+
+- 启动 `reviewer` 前先用 `subagent action=models`（或 `/subagents-models reviewer`）核对当前运行时映射；
+- 代码审查优先显式指定 **DeepSeek provider** 的 `deepseek/deepseek-v4-pro`；这里的 provider 必须是 `deepseek`，不得改用 `variflight-ticket`、OpenRouter 等其他 provider 的同名/路由模型；
+- 若 `deepseek/deepseek-v4-pro` 未登记、鉴权/限流不可用或启动失败，立即以**不传 `model`** 的方式重试 reviewer，使其继承主会话模型；禁止拿 DeepSeek V4 Flash 或其他 DeepSeek 型号冒充 V4 Pro；
+- 模型优先级不改变审查隔离要求：审查默认 `context: fresh`、只读、不与 writer 共用写权限，最终判断与修复仍由主会话负责。
 
 ## 平台归属
 
