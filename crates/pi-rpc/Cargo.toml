@@ -13,3 +13,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[[bin]]
+name = "fake_child"
+path = "tests/fixtures/fake_child.rs"
+test = false
+bench = false

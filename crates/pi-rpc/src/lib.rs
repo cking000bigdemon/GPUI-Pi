@@ -3,7 +3,14 @@
 //! 驱动官方发布的 pi 独立二进制（`pi --mode rpc`），用 JSONL over stdin/stdout
 //! 通信。本 crate **不依赖 GPUI**，可在无窗口、无 GPU 的环境完整单测。
 //!
-//! R0 只提供二进制定位所需的常量；协议实现见 Round 2。
+pub mod jsonl;
+pub mod process;
+pub mod protocol;
+
+pub use process::{
+    Client, ClientConfig, ClientError, ClientEvent, LifecycleEvent, kill_process_tree,
+};
+pub use protocol::*;
 
 /// 钉死的 pi 内核版本，与 `scripts/fetch-pi.*` 下载的版本必须一致。
 ///
