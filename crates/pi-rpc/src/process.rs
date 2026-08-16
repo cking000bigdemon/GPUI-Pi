@@ -644,7 +644,8 @@ pub fn kill_process_tree(pid: u32) -> std::io::Result<()> {
 #[cfg(unix)]
 pub fn kill_process_tree(pid: u32) -> std::io::Result<()> {
     let status = ProcessCommand::new("kill")
-        .args(["-TERM", &format!("-{pid}")])
+        // `--` 避免 procps-ng kill 把负 PGID 误解为旧式 signal 参数。
+        .args(["-TERM", "--", &format!("-{pid}")])
         .status()?;
     if status.success() {
         Ok(())

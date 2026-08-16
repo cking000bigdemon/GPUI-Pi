@@ -56,6 +56,7 @@
 - 真实 pi：`PI_RPC_TEST_BINARY=D:/variFlight_work/GPUI-Pi/vendor/pi.exe cargo test -p pi-rpc --test real_pi -- --ignored --nocapture --test-threads=1`，2 passed，精确版本 0.84.2；覆盖零 token 查询/设置/错误/bash/new session 矩阵和 switch fixture 后 kill/restart/resume。
 - T2 隔离：每次真实测试都把 `PI_CODING_AGENT_DIR` 与 `--session-dir` 指到仓库 `target/pi-rpc-tests/` 临时目录，并开启 `--offline --no-extensions --no-skills --no-prompt-templates --no-context-files`；测试前后真实 `~/.pi/agent/settings.json` SHA256 均为 `7298af9b…`。
 - Windows 路径踩坑：真实用户 home 含非 ASCII 时官方 binary 回报的默认 session path 可能不可直接用于 Rust 文件探测；真实 resume 测试改用仓库 `target/` 下显式 fixture 和 `switch_session`，通过 `set_resume_session` 明确交给监督器，再验证同一路径 `--session` 恢复。
+- CI 跨平台修复：Linux 的 procps-ng `kill` 会把裸 `-{pid}` 误解为旧式 signal 参数，导致进程组未终止和测试等待 60 秒；Unix 调用改为 `kill -TERM -- -<pgid>`，用 `--` 明确结束选项。
 - 审查后收口：在 restart delay 的下一次 spawn 前检查 shutdown，避免主动关闭期间多起一个进程；`new_session` / `switch_session` 的上层可用 `set_resume_session` 立即更新恢复目标，无需等待下一次 `get_state`；无持久会话的 `get_state` 会清除旧恢复目标；事件订阅改为 1024 条有界缓冲并断开落后的消费者；graceful shutdown 超时后自动进程树强杀，失败时按 100ms 重试；fake child 增补慢订阅者、ephemeral 状态清除与不处理 stdin EOF 三条黑盒测试。
 - 最终 validation：`./scripts/validate.sh --logic` 与 `./scripts/validate.sh` 均输出 `VALIDATE OK`；`pi-rpc` 为 8 个协议/JSONL 单测 + 7 个 fake child 黑盒测试，真实 T2 为 2/2 passed。
 - PowerShell 说明：本机仅有 Windows PowerShell 5.1，直接读取仓库 UTF-8 无 BOM 中文脚本会误解码并 parser error，因此本轮未能直接执行 `validate.ps1`；没有修改该脚本。等价的 `validate.sh --logic` / 全量 cargo 门禁均在本 Windows 环境通过，真实 pi T2 也通过；R2 PR 的 Windows CI 结果仍待远端验证。
