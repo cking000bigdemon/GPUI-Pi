@@ -61,5 +61,6 @@
 - project identity 在 Windows 下归一分隔符、大小写和尾分隔符；真实临时 git linked worktree 黑盒测试验证 main checkout 与 linked checkout 归并到同一 project key，而 repo 子目录保持独立 identity。
 - `pi-data` 最终为 **13 个单元测试 + 5 个 fixture/worktree 集成测试 + 1 个 opt-in 真实只读测试**；`cargo test -p pi-data` 全绿。
 - 最终 validation：`./scripts/validate.sh --logic` 和 `./scripts/validate.sh` 均输出 `VALIDATE OK`；全量 validation 包含 GPUI clippy/test/release build。
+- PR：[#6](https://github.com/cking000bigdemon/GPUI-Pi/pull/6)；CI 结论见本轮后续文档提交。
 - 审查说明：按约定先尝试 `deepseek/deepseek-v4-pro` reviewer，再回退继承模型；本机 subagent runtime 两次 reviewer 都在 0 tool 状态停滞，未产出审查报告。主会话因此完成逐文件审查，并修正了两项：过滤嵌套 subagent session，及 Windows `canonicalize` 的 `\\?\\` 前缀导致的 worktree identity 风险（改用 `dunce`）。
 - PowerShell 说明：本机只有 Windows PowerShell 5.1，它把仓库 UTF-8 无 BOM 中文脚本误解码并 parser error；没有修改脚本。Git Bash validation 的同一 cargo 门禁均已全绿。
