@@ -66,3 +66,4 @@
 - T3 Windows 人工复核已完成：系统深浅主题实时同步、原生标题栏拖动/双击及最小化/最大化/关闭、原生目录选择和取消均通过；150% DPI 下中文、Tab、Dock 与图标无截断/溢出。首轮复核发现工具栏与侧栏标题图标过于贴左、组件库内置 Dock 收展按钮点击无响应；已把统一的应用级侧栏按钮移到工具栏，使用 12 logical px 左右 padding，移除重复装饰 icon，并由用户复核确认 150% DPI 间距及侧栏拖动/收起/展开全部通过。
 - 独立审查：按约定先核对 reviewer runtime，并使用 **DeepSeek provider 的 `deepseek/deepseek-v4-pro`** 完成多轮只读审查。主审与 T3 修复后终审均明确 **无 Blocker、无 High**；标题栏 Drag hitbox、最小窗口断言、正式 Root/字体测试链、base typography、根目录标签、工具栏重绘、重复 Dock 按钮与收展测试等审查意见均已修正。
 - Pull Request：[#7](https://github.com/cking000bigdemon/GPUI-Pi/pull/7)；PR 描述已附 Bash / Windows PowerShell 全量 validation 的实际回显、T3 人工结果与 DSV4 Pro 终审结论。
+- GitHub CI（run [`31957359982`](https://github.com/cking000bigdemon/GPUI-Pi/actions/runs/31957359982)）首轮实测全绿：`windows (阻断)` **pass / 10m24s**，`linux 纯逻辑 (非阻断)` **pass / 45s**。回填本条后的最终文档 commit 仍须重新等待 CI 全绿后再合并。
