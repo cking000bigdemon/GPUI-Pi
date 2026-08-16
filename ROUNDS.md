@@ -1,6 +1,6 @@
 # 轮次进度
 
-拆解与验收标准见 [`docs/立项文档.md`](docs/立项文档.md) § 七，每轮任务卡在 `rounds/`。
+拆解与验收标准见 [`docs/立项文档.md`](docs/立项文档.md) § 七；目录规则见 [`rounds/README.md`](rounds/README.md)，每轮任务卡位于 `rounds/round-NN/round-NN.md`。
 每轮完成后由执行方更新本表 —— 状态、PR、完成日期三列都要填。
 
 | 轮 | 内容 | 执行方 | 状态 | PR | 完成 |

@@ -29,7 +29,7 @@
 | `.github/workflows/ci.yml` | windows 阻断 + linux 纯逻辑非阻断 |
 | `CLAUDE.md` / `AGENTS.md` | 每轮必守的操作约定 |
 | `ROUNDS.md` | 轮次进度表 |
-| `rounds/{TEMPLATE,BACKLOG,round-00,round-01}.md` | 轮次机制 |
+| `rounds/{README,TEMPLATE,BACKLOG}.md`、`rounds/round-{00,01}/round-{00,01}.md` | 轮次机制 |
 | `.gitattributes` | 全仓 LF |
 
 ## 设计说明：为什么 gpui 依赖不写 rev
@@ -59,7 +59,7 @@ gpui-component 自己对 zed 的依赖是**不带 rev 的 git 依赖**。如果�
 
 ## 失败处理
 
-连续 2 次 validation 不过 → 写 `rounds/BLOCKED-00.md`，停下呼人。
+连续 2 次 validation 不过 → 写 `rounds/round-00/BLOCKED.md`，停下呼人。
 
 ## 本轮实测
 

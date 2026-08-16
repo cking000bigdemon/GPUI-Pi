@@ -30,7 +30,7 @@ fn main() -> ExitCode {
     );
     println!("  UI 层标记       : {}", gpui_pi_ui::theme_marker());
     println!();
-    println!("R0 骨架：窗口尚未实现，见 rounds/round-01.md。");
+    println!("R0 骨架：窗口尚未实现，见 rounds/round-01/round-01.md。");
 
     ExitCode::SUCCESS
 }
