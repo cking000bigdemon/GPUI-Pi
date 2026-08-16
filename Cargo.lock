@@ -4743,11 +4743,15 @@ name = "pi-data"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs",
+ "dunce",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

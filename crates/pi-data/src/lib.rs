@@ -3,10 +3,32 @@
 //! 与终端 `pi`、`pi-web`、pi-web-desktop **共享同一份目录**，因此本 crate 的
 //! 写操作必须保守：能只读就只读，必须写时走「临时文件 + rename」。
 //!
-//! 本 crate 不依赖 GPUI。R0 只提供目录定位；解析实现见 Round 3。
+//! 本 crate 不依赖 GPUI。
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+
+pub mod config;
+pub mod extensions;
+pub mod project;
+pub mod session;
+
+pub use config::{
+    ConfigError, models_path, read_json, read_models, read_settings, read_trust, settings_path,
+    trust_path, write_json_atomic, write_models, write_settings, write_trust,
+};
+pub use extensions::{
+    ExtensionDiagnostic, ExtensionInfo, ExtensionKind, ExtensionScan, scan_extensions,
+};
+pub use project::{
+    GroupedSession, PathPlatform, ProjectGroup, ProjectInfo, group_sessions, native_platform,
+    project_identity_key, project_identity_key_for, resolve_project,
+};
+pub use session::{
+    EntryBase, SessionDiagnostic, SessionEntry, SessionError, SessionFile, SessionHeader,
+    SessionList, SessionListDiagnostic, SessionSummary, list_sessions, load_session,
+    read_session_summary,
+};
 
 /// pi 用来覆盖数据目录的环境变量，语义与上游一致。
 pub const AGENT_DIR_ENV: &str = "PI_CODING_AGENT_DIR";
