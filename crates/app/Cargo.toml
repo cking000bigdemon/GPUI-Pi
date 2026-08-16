@@ -11,10 +11,18 @@ rust-version.workspace = true
 name = "gpui-pi"
 path = "src/main.rs"
 
+[[bin]]
+name = "spike"
+path = "src/bin/spike.rs"
+
 [dependencies]
 anyhow.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+gpui-fps.workspace = true
+instant.workspace = true
 gpui-pi-ui.workspace = true
 pi-data.workspace = true
 pi-rpc.workspace = true

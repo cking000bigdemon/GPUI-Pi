@@ -1,6 +1,6 @@
 # Round 01 — 风险门禁 spike ⚠️
 
-> 执行方：**Windows** · 状态：未开始
+> 执行方：**Windows** · 状态：✅ 已完成
 >
 > **这是全项目唯一的停项开关。四条门禁任一不过，写 `BLOCKED-01.md` 停项汇报，
 > 回退到「pi 二进制瘦身 Electron 版」方案。禁止降低阈值继续。**
@@ -73,4 +73,20 @@ GPUI 的 Windows IME 走 **IMM32 而非 TSF**，实现全在 `crates/gpui_window
 
 ## 本轮实测
 
-<!-- 完成后回填：四条门禁的实际数字 -->
+测试环境：Windows 11 Pro；release 构建 `target/release/spike.exe`。
+
+| 门禁 | 实测结果 | 结论 |
+|---|---|---|
+| 中文 IME | 微软拼音连续输入 200 字通过；搜狗输入法连续输入 200 字通过 | ✅ 通过 |
+| 流式渲染 | 8000+ whitespace-token Markdown，wall-clock 30ms/chunk；灌注期间最低 **60 FPS** | ✅ 通过（阈值 ≥50 FPS） |
+| 文本选中 | 跨 5 条消息拖选，复制到记事本后换行与代码块格式正确 | ✅ 通过 |
+| 冷启动 | 人工复测 `560 / 600 / 670 / 530 / 559 ms`；排序后为 `530 / 559 / 560 / 600 / 670 ms`，中位数 **560 ms** | ✅ 通过（阈值 <1500 ms） |
+
+自动化辅助证据（**不替代冷启动人工门禁**）：
+
+- `scripts/measure-spike-cold-start.ps1`：`1164 / 549 / 528 / 539 / 525 ms`，代理中位数 `539 ms`；仅测 `MainWindowHandle != 0 && Responding`。
+- 流式 UIA smoke：2 秒进度 `56.90%`，4 秒进度 `100%`。
+- Windows 本地 `scripts/validate.ps1`：`VALIDATE OK`。
+- PR #3 GitHub CI：Windows 阻断 job 与 Linux 纯逻辑 job 均通过。
+
+当前结论：四条风险门禁均已取得有效人工实测数据并通过，**R1 完成，可以继续 R2**。
