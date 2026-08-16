@@ -59,4 +59,5 @@
 - CI 跨平台修复：Linux 的 procps-ng `kill` 会把裸 `-{pid}` 误解为旧式 signal 参数，导致进程组未终止和测试等待 60 秒；Unix 调用改为 `kill -TERM -- -<pgid>`，用 `--` 明确结束选项。
 - 审查后收口：在 restart delay 的下一次 spawn 前检查 shutdown，避免主动关闭期间多起一个进程；`new_session` / `switch_session` 的上层可用 `set_resume_session` 立即更新恢复目标，无需等待下一次 `get_state`；无持久会话的 `get_state` 会清除旧恢复目标；事件订阅改为 1024 条有界缓冲并断开落后的消费者；graceful shutdown 超时后自动进程树强杀，失败时按 100ms 重试；fake child 增补慢订阅者、ephemeral 状态清除与不处理 stdin EOF 三条黑盒测试。
 - 最终 validation：`./scripts/validate.sh --logic` 与 `./scripts/validate.sh` 均输出 `VALIDATE OK`；`pi-rpc` 为 8 个协议/JSONL 单测 + 7 个 fake child 黑盒测试，真实 T2 为 2/2 passed。
-- PowerShell 说明：本机仅有 Windows PowerShell 5.1，直接读取仓库 UTF-8 无 BOM 中文脚本会误解码并 parser error，因此本轮未能直接执行 `validate.ps1`；没有修改该脚本。等价的 `validate.sh --logic` / 全量 cargo 门禁均在本 Windows 环境通过，真实 pi T2 也通过；R2 PR 的 Windows CI 结果仍待远端验证。
+- PowerShell 说明：本机仅有 Windows PowerShell 5.1，直接读取仓库 UTF-8 无 BOM 中文脚本会误解码并 parser error，因此本轮未能直接执行 `validate.ps1`；没有修改该脚本。等价的 `validate.sh --logic` / 全量 cargo 门禁均在本 Windows 环境通过，真实 pi T2 也通过。
+- PR #5 CI：首次 `windows (阻断)` 5m44s 通过；`linux 纯逻辑 (非阻断)` 暴露 Unix `kill` 参数歧义后已修复。修复轮次 run `31942339800` 中 Linux 47s、Windows 4m39s，两个 job 均为 pass。
