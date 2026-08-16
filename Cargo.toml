@@ -28,13 +28,12 @@ gpui-pi-ui = { path = "crates/ui" }
 # 真正的版本钉死落在 **提交进仓库的 Cargo.lock**，由 scripts/check-pins.* 校验。
 # 期望 sha 见 docs/立项文档.md § 二，改动必须同步那张表。
 gpui = { git = "https://github.com/zed-industries/zed" }
+gpui-base = { git = "https://github.com/longbridge/gpui-component" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
     "font-kit",
 ] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
-gpui-fps = { git = "https://github.com/longbridge/gpui-component" }
-instant = "0.1"
 
 # ── 通用 ─────────────────────────────────────────────────────────────────────
 anyhow = "1"

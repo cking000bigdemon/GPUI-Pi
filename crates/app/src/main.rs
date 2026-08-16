@@ -1,36 +1,69 @@
-//! GPUI-Pi 入口。
-//!
-//! R0 **刻意不开窗口** —— 本轮的验收目标是「工程骨架能编译、依赖链能对上」，
-//! 起窗口是 Round 1 风险门禁 spike 的事。这里只做环境自检并打印，方便在
-//! CI 与空机器上确认二进制真的能跑起来。
+//! GPUI-Pi 正式桌面入口。
 
-use std::process::ExitCode;
+mod panels;
+mod workspace;
 
-fn main() -> ExitCode {
+use gpui::*;
+use gpui_component::{Root, TitleBar};
+use gpui_component_assets::Assets;
+use workspace::Workspace;
+
+fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
-    let agent_dir = pi_data::agent_dir();
-    let pi_binary = std::path::Path::new("vendor")
-        .join("pi")
-        .join(pi_rpc::pi_binary_name());
+    gpui_platform::application()
+        .with_assets(Assets)
+        .run(move |cx| {
+            gpui_component::init(cx);
+            gpui_pi_ui::theme::init_fonts(cx).expect("无法加载内嵌字体");
 
-    println!("GPUI-Pi {}", env!("CARGO_PKG_VERSION"));
-    println!("  pi 内核钉死版本 : {}", pi_rpc::PINNED_PI_VERSION);
-    println!("  发布包目标      : pi-{}", pi_rpc::pi_release_target());
-    println!("  期望二进制路径  : {}", pi_binary.display());
-    println!(
-        "  agent 数据目录  : {}",
-        agent_dir
-            .as_deref()
-            .map_or_else(|| "<未解析出 home>".into(), |p| p.display().to_string())
-    );
-    println!("  UI 层标记       : {}", gpui_pi_ui::theme_marker());
-    println!();
-    println!("R0 骨架：窗口尚未实现，见 rounds/round-01/round-01.md。");
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            cx.activate(true);
 
-    ExitCode::SUCCESS
+            let mut window_size = size(px(1280.), px(820.));
+            if let Some(display) = cx.primary_display() {
+                let display_size = display.bounds().size;
+                window_size.width = window_size.width.min(display_size.width * 0.88);
+                window_size.height = window_size.height.min(display_size.height * 0.88);
+            }
+
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    window_size,
+                    cx,
+                ))),
+                window_min_size: Some(size(px(800.), px(560.))),
+                kind: WindowKind::Normal,
+                #[cfg(target_os = "linux")]
+                window_background: WindowBackgroundAppearance::Transparent,
+                #[cfg(target_os = "linux")]
+                window_decorations: Some(WindowDecorations::Client),
+                ..TitleBar::window_options()
+            };
+
+            cx.spawn(async move |cx| {
+                let window = cx.open_window(options, |window, cx| {
+                    let workspace = cx.new(|cx| Workspace::new(window, cx));
+                    cx.new(|cx| Root::new(workspace, window, cx))
+                })?;
+
+                window.update(cx, |_, window, _| {
+                    window.activate_window();
+                    window.set_window_title("GPUI-Pi");
+                })?;
+
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+        });
 }
