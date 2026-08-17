@@ -2464,6 +2464,8 @@ dependencies = [
  "gpui-component-assets",
  "gpui-pi-ui",
  "gpui_platform",
+ "pi-data",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

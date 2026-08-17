@@ -18,11 +18,13 @@ gpui_platform.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
 gpui-pi-ui.workspace = true
+pi-data.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
 
 # GPUI 在 Linux 上需要显式选择窗口后端；Windows/macOS 由 gpui_platform 自行决定。
 [target.'cfg(target_os = "linux")'.dependencies]

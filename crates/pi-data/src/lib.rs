@@ -12,6 +12,9 @@ pub mod config;
 pub mod extensions;
 pub mod project;
 pub mod session;
+pub mod session_actions;
+pub mod session_view;
+pub mod trust;
 
 pub use config::{
     ConfigError, models_path, read_json, read_models, read_settings, read_trust, settings_path,
@@ -26,8 +29,17 @@ pub use project::{
 };
 pub use session::{
     EntryBase, SessionDiagnostic, SessionEntry, SessionError, SessionFile, SessionHeader,
-    SessionList, SessionListDiagnostic, SessionSummary, list_sessions, load_session,
-    read_session_summary,
+    SessionList, SessionListDiagnostic, SessionMetrics, SessionRevision, SessionSummary,
+    list_sessions, load_session, read_session_summary, session_metrics,
+};
+pub use session_actions::{
+    SessionActionError, delete_leaf_session, export_session_jsonl, rename_session,
+};
+pub use session_view::{
+    ProjectSessionView, RunningSessionOverlay, SessionView, build_session_view,
+};
+pub use trust::{
+    ProjectTrustStatus, TrustError, has_trust_resources, project_trust_status, trust_project,
 };
 
 /// pi 用来覆盖数据目录的环境变量，语义与上游一致。

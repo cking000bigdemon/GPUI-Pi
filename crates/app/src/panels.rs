@@ -25,18 +25,18 @@ pub(crate) struct LayoutProbe {
 
 #[cfg(not(test))]
 #[derive(Clone, Copy)]
-struct LayoutProbe;
+pub(crate) struct LayoutProbe;
 
 impl LayoutProbe {
     #[cfg(test)]
-    fn record_sidebar(&self, bounds: gpui::Bounds<gpui::Pixels>) {
+    pub(crate) fn record_sidebar(&self, bounds: gpui::Bounds<gpui::Pixels>) {
         self.sidebar.set(bounds);
         self.sidebar_prepaints
             .set(self.sidebar_prepaints.get().saturating_add(1));
     }
 
     #[cfg(not(test))]
-    fn record_sidebar(&self, _: gpui::Bounds<gpui::Pixels>) {}
+    pub(crate) fn record_sidebar(&self, _: gpui::Bounds<gpui::Pixels>) {}
 
     #[cfg(test)]
     fn record_workspace(&self, bounds: gpui::Bounds<gpui::Pixels>) {
@@ -49,19 +49,10 @@ impl LayoutProbe {
 
 #[derive(Clone, Copy)]
 enum PanelKind {
-    Sidebar,
     Workspace,
 }
 
 impl PlaceholderPanel {
-    pub fn sidebar(cx: &mut Context<Self>) -> Self {
-        Self {
-            kind: PanelKind::Sidebar,
-            focus_handle: cx.focus_handle(),
-            probe: None,
-        }
-    }
-
     pub fn workspace(cx: &mut Context<Self>) -> Self {
         Self {
             kind: PanelKind::Workspace,
@@ -78,7 +69,6 @@ impl PlaceholderPanel {
 
     fn panel_title(&self) -> &'static str {
         match self.kind {
-            PanelKind::Sidebar => "会话",
             PanelKind::Workspace => "对话",
         }
     }
@@ -95,7 +85,6 @@ impl Focusable for PlaceholderPanel {
 impl Panel for PlaceholderPanel {
     fn panel_name(&self) -> &'static str {
         match self.kind {
-            PanelKind::Sidebar => "gpui-pi-sidebar",
             PanelKind::Workspace => "gpui-pi-workspace",
         }
     }
@@ -128,45 +117,6 @@ impl Render for PlaceholderPanel {
         #[cfg(not(test))]
         let probe = self.probe;
         match self.kind {
-            PanelKind::Sidebar => div()
-                .id("session-sidebar")
-                .debug_selector(|| "session-sidebar".into())
-                .when_some(probe, |this, probe| {
-                    this.on_prepaint(move |bounds, _, _| probe.record_sidebar(bounds))
-                })
-                .track_focus(&self.focus_handle)
-                .size_full()
-                .min_w_0()
-                .p_3()
-                .bg(cx.theme().sidebar)
-                .child(
-                    v_flex()
-                        .size_full()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .text_sm()
-                                .font_semibold()
-                                .child("项目与会话"),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_h_0()
-                                .rounded_lg()
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .bg(cx.theme().background)
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child("会话列表将在 R5 接入"),
-                        ),
-                ),
             PanelKind::Workspace => div()
                 .id("chat-workspace")
                 .debug_selector(|| "chat-workspace".into())

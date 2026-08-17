@@ -15,6 +15,8 @@ use gpui_pi_ui::{AppShell, WorkspaceTabBar, theme};
 #[cfg(test)]
 use crate::panels::LayoutProbe;
 use crate::panels::PlaceholderPanel;
+use crate::session_sidebar::{SessionSelected, SessionSidebar};
+use crate::trust_prompt::prompt_project_trust;
 
 const MAIN_DOCK_ID: &str = "gpui-pi-main-dock";
 const MAIN_DOCK_VERSION: usize = 1;
@@ -23,7 +25,9 @@ pub(crate) const SIDEBAR_WIDTH: f32 = 280.;
 pub struct Workspace {
     dock_area: gpui::Entity<DockArea>,
     selected_directory: Option<PathBuf>,
+    selected_session: Option<SessionSelected>,
     _appearance_subscription: Subscription,
+    _session_subscription: Subscription,
 }
 
 impl Workspace {
@@ -51,7 +55,10 @@ impl Workspace {
         let dock_area =
             cx.new(|cx| DockArea::new(MAIN_DOCK_ID, Some(MAIN_DOCK_VERSION), window, cx));
         let sidebar = cx.new(|cx| {
-            let panel = PlaceholderPanel::sidebar(cx);
+            #[cfg(test)]
+            let panel = SessionSidebar::new_empty(window, cx);
+            #[cfg(not(test))]
+            let panel = SessionSidebar::new(window, cx);
             #[cfg(test)]
             if let Some(probe) = probe.clone() {
                 return panel.with_probe(probe);
@@ -70,7 +77,7 @@ impl Workspace {
         dock_area.update(cx, |dock_area, cx| {
             dock_area.set_center(DockItem::panel(Arc::new(workspace)), window, cx);
             dock_area.set_left_dock(
-                DockItem::panel(Arc::new(sidebar)),
+                DockItem::panel(Arc::new(sidebar.clone())),
                 Some(px(SIDEBAR_WIDTH)),
                 true,
                 window,
@@ -92,11 +99,19 @@ impl Workspace {
             theme::sync_system_theme(window, cx);
             cx.notify();
         });
+        let session_subscription =
+            cx.subscribe(&sidebar, |workspace, _, event: &SessionSelected, cx| {
+                workspace.selected_directory = Some(event.cwd.clone());
+                workspace.selected_session = Some(event.clone());
+                cx.notify();
+            });
 
         Self {
             dock_area,
             selected_directory: None,
+            selected_session: None,
             _appearance_subscription: appearance_subscription,
+            _session_subscription: session_subscription,
         }
     }
 
@@ -133,24 +148,40 @@ impl Workspace {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            let _ = workspace.update(cx, |workspace, cx| {
-                workspace.selected_directory = Some(path);
-                cx.notify();
+            let _ = cx.update(|window, cx| {
+                let _ = workspace.update(cx, |workspace, cx| {
+                    workspace.selected_directory = Some(path.clone());
+                    workspace.selected_session = None;
+                    cx.notify();
+                });
+                prompt_project_trust(pi_data::agent_dir(), &path, window, cx);
             });
         })
         .detach();
     }
 
     fn tab_label(&self) -> SharedString {
-        self.selected_directory
-            .as_deref()
-            .map_or_else(|| "未选择项目".into(), tab_label_for_path)
+        self.selected_session.as_ref().map_or_else(
+            || {
+                self.selected_directory
+                    .as_deref()
+                    .map_or_else(|| "未选择项目".into(), tab_label_for_path)
+            },
+            |session| session.title.clone().into(),
+        )
     }
 
     fn directory_tooltip(&self) -> SharedString {
         self.selected_directory.as_deref().map_or_else(
             || "选择项目目录".into(),
             |path| path.display().to_string().into(),
+        )
+    }
+
+    fn tab_tooltip(&self) -> SharedString {
+        self.selected_session.as_ref().map_or_else(
+            || self.directory_tooltip(),
+            |session| format!("{}\n{}", session.id, session.cwd.display()).into(),
         )
     }
 }
@@ -217,7 +248,7 @@ impl Render for Workspace {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .child(WorkspaceTabBar::new(self.tab_label())),
+                    .child(WorkspaceTabBar::new(self.tab_label()).tooltip(self.tab_tooltip())),
             )
             .child(
                 Button::new("choose-project-directory")

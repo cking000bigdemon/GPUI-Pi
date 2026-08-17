@@ -108,14 +108,26 @@ pub fn write_trust(agent_dir: impl AsRef<Path>, value: &Value) -> Result<(), Con
     write_json_atomic(trust_path(agent_dir), value)
 }
 
-fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_bytes_atomic_if(path, bytes, || Ok(()))
+}
+
+pub(crate) fn write_bytes_atomic_if<E>(
+    path: &Path,
+    bytes: &[u8],
+    verify_before_replace: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E>
+where
+    E: From<io::Error>,
+{
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
+    fs::create_dir_all(parent).map_err(E::from)?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("config.json");
     let mut last_collision = None;
+    let mut verify_before_replace = Some(verify_before_replace);
 
     for _ in 0..100 {
         let temp_path = parent.join(format!(".{file_name}-{:016x}.tmp", next_temp_nonce()));
@@ -125,14 +137,17 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
                 last_collision = Some(error);
                 continue;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(E::from(error)),
         };
         let result = (|| {
-            file.write_all(bytes)?;
-            file.flush()?;
-            file.sync_all()?;
+            file.write_all(bytes).map_err(E::from)?;
+            file.flush().map_err(E::from)?;
+            file.sync_all().map_err(E::from)?;
             drop(file);
-            replace_file(&temp_path, path)?;
+            verify_before_replace
+                .take()
+                .expect("revision verifier is called once")()?;
+            replace_file(&temp_path, path).map_err(E::from)?;
             sync_directory(parent);
             Ok(())
         })();
@@ -141,7 +156,9 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         }
         return result;
     }
-    Err(last_collision.unwrap_or_else(|| io::Error::other("无法创建唯一临时文件")))
+    Err(E::from(last_collision.unwrap_or_else(|| {
+        io::Error::other("无法创建唯一临时文件")
+    })))
 }
 
 fn open_private_temp(path: &Path) -> io::Result<File> {

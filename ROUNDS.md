@@ -10,7 +10,7 @@
 | **R2** | `pi-rpc`：子进程 + JSONL 协议 | Windows | ✅ 已完成 | #5 | 2026-08-16 |
 | **R3** | `pi-data`：`~/.pi/agent` 文件层 | Windows | ✅ 已完成 | [#6](https://github.com/cking000bigdemon/GPUI-Pi/pull/6) | 2026-08-16 |
 | **R4** | 主界面框架（Dock / 侧栏 / 标题栏 / 主题） | Windows | ✅ 已完成 | [#7](https://github.com/cking000bigdemon/GPUI-Pi/pull/7) | 2026-08-16 |
-| **R5** | 会话列表（只读） | Windows | ⬜ | — | — |
+| **R5** | 会话列表（只读） | Windows | ✅ 已完成 | 待创建 | 2026-08-17 |
 | **R6** | 历史消息渲染（静态） | Windows | ⬜ | — | — |
 | **R7** | 活会话流式 | Windows | ⬜ | — | — |
 | **R8** | 输入框 / 附件 / slash 面板 | Windows | ⬜ | — | — |

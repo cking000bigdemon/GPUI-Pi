@@ -63,9 +63,21 @@ pub fn resolve_project(cwd: impl AsRef<Path>) -> ProjectInfo {
 }
 
 pub fn group_sessions(sessions: impl IntoIterator<Item = SessionSummary>) -> Vec<ProjectGroup> {
+    group_sessions_with(sessions, |cwd| resolve_project(cwd))
+}
+
+fn group_sessions_with(
+    sessions: impl IntoIterator<Item = SessionSummary>,
+    mut resolver: impl FnMut(&Path) -> ProjectInfo,
+) -> Vec<ProjectGroup> {
     let mut groups = BTreeMap::<String, ProjectGroup>::new();
+    let mut projects = BTreeMap::<String, ProjectInfo>::new();
     for session in sessions {
-        let project = resolve_project(&session.cwd);
+        let cwd_key = project_identity_key(canonical_or_self(&session.cwd));
+        let project = projects
+            .entry(cwd_key)
+            .or_insert_with(|| resolver(&session.cwd))
+            .clone();
         groups
             .entry(project.project_key.clone())
             .or_insert_with(|| ProjectGroup {
@@ -247,6 +259,46 @@ mod tests {
             ),
             expected
         );
+    }
+
+    #[test]
+    fn group_sessions_resolves_each_normalized_cwd_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let first = SessionSummary {
+            path: PathBuf::from("first.jsonl"),
+            revision: crate::SessionRevision {
+                len: 0,
+                modified: std::time::SystemTime::UNIX_EPOCH,
+                fingerprint: 0,
+            },
+            id: "first".to_owned(),
+            cwd: cwd.clone(),
+            name: None,
+            created: std::time::SystemTime::UNIX_EPOCH,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            message_count: 0,
+            first_message: String::new(),
+            parent_session_path: None,
+            parent_session_id: None,
+            metrics: crate::SessionMetrics::default(),
+        };
+        let mut second = first.clone();
+        second.id = "second".to_owned();
+        second.path = PathBuf::from("second.jsonl");
+        let mut calls = 0;
+        let groups = group_sessions_with([first, second], |cwd| {
+            calls += 1;
+            ProjectInfo {
+                project_root: cwd.to_path_buf(),
+                project_key: project_identity_key(cwd),
+                branch: None,
+                is_worktree: false,
+                is_top_level: false,
+            }
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(groups[0].sessions.len(), 2);
     }
 
     #[test]
