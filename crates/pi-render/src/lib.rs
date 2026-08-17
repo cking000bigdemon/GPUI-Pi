@@ -5,10 +5,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use pi_data::{EntryBase, SessionEntry, SessionFile};
 use serde_json::Value;
+
+mod live;
+pub use live::{
+    LiveAssistantUpdate, LiveBlockKind, LiveEvent, LivePhase, LiveSessionReducer, ReduceOutcome,
+};
 
 const MAX_TEXT_CHARS: usize = 512 * 1024;
 const MAX_IMAGE_BASE64_CHARS: usize = 8 * 1024 * 1024;
@@ -19,15 +25,43 @@ const PREVIEW_CHARS: usize = 240;
 pub struct ConversationDocument {
     pub session_id: String,
     pub source_path: PathBuf,
-    pub messages: Vec<Message>,
-    pub minimap: Vec<MinimapNode>,
-    pub diagnostics: Vec<RenderDiagnostic>,
+    /// 文档快照共享已定稿历史，流式帧只复制 Arc 与当前草稿，不深拷贝全部消息。
+    pub messages: Arc<[Arc<Message>]>,
+    /// UI 直接消费按 turn 投影后的列表项，避免每帧重新扫描长会话。
+    pub items: Arc<[ConversationItem]>,
+    pub minimap: Arc<[MinimapNode]>,
+    pub diagnostics: Arc<[RenderDiagnostic]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderDiagnostic {
     pub entry_id: Option<String>,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConversationItem {
+    Message(Arc<Message>),
+    Process(ProcessGroup),
+}
+
+impl ConversationItem {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Message(message) => &message.id,
+            Self::Process(group) => &group.id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessGroup {
+    pub id: String,
+    pub messages: Arc<[Arc<Message>]>,
+    pub message_count: usize,
+    pub tool_call_count: usize,
+    /// 没有最终 answer 的 turn（通常是活跃 tail）必须保持展开。
+    pub collapsible: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,7 +264,7 @@ impl ConversationDocument {
             diagnostics: self.diagnostics.len(),
             ..DocumentStats::default()
         };
-        for message in &self.messages {
+        for message in self.messages.iter() {
             stats.blocks += message.blocks.len();
             for block in &message.blocks {
                 match block {
@@ -252,7 +286,7 @@ impl ConversationDocument {
 
     pub fn text_snapshot(&self) -> String {
         let mut out = String::new();
-        for message in &self.messages {
+        for message in self.messages.iter() {
             out.push_str(&format!("[{:#?}] {}\n", message.role, message.id));
             for block in &message.blocks {
                 snapshot_block(block, &mut out);
@@ -260,7 +294,7 @@ impl ConversationDocument {
         }
         if !self.minimap.is_empty() {
             out.push_str("[Minimap]\n");
-            for node in &self.minimap {
+            for node in self.minimap.iter() {
                 out.push_str(&format!(
                     "{}:{}:{}\n",
                     node.turn, node.message_id, node.label
@@ -415,13 +449,19 @@ pub fn render_session(session: &SessionFile) -> ConversationDocument {
         }
     }
 
-    let minimap = build_minimap(&messages);
+    let messages: Arc<[Arc<Message>]> = messages
+        .into_iter()
+        .map(Arc::new)
+        .collect::<Vec<_>>()
+        .into();
+    let (items, minimap) = project_conversation(&messages, false);
     ConversationDocument {
         session_id: session.header.id.clone(),
         source_path: session.path.clone(),
         messages,
-        minimap,
-        diagnostics,
+        items: items.into(),
+        minimap: minimap.into(),
+        diagnostics: diagnostics.into(),
     }
 }
 
@@ -1349,70 +1389,182 @@ fn image_placeholder(mime: Option<String>, state: ImageState, description: &str)
     }
 }
 
-fn build_minimap(messages: &[Message]) -> Vec<MinimapNode> {
-    let mut nodes = Vec::new();
+pub(crate) fn project_conversation(
+    messages: &[Arc<Message>],
+    active_tail: bool,
+) -> (Vec<ConversationItem>, Vec<MinimapNode>) {
+    let mut items = Vec::new();
+    let mut minimap = Vec::new();
     let mut turn = 0;
-    for message in messages {
-        if message.role == MessageRole::User {
-            turn += 1;
-            if let Some(label) = first_visible_text(message) {
-                nodes.push(MinimapNode {
-                    message_id: message.id.clone(),
-                    turn,
-                    role: message.role,
-                    label: truncate_chars(&label, 80),
-                    level: None,
-                });
-            }
-        } else if message.role == MessageRole::Assistant {
-            let mut headings = Vec::new();
-            for block in &message.blocks {
-                if let Block::Markdown(markdown) = block {
-                    for line in markdown.source.lines() {
-                        let trimmed = line.trim_start();
-                        let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
-                        if (1..=3).contains(&hashes)
-                            && trimmed.as_bytes().get(hashes) == Some(&b' ')
-                        {
-                            headings.push((hashes as u8, trimmed[hashes + 1..].trim().to_owned()));
-                        }
-                    }
-                }
-            }
-            if headings.is_empty() {
-                if let Some(label) = first_visible_text(message) {
-                    nodes.push(MinimapNode {
-                        message_id: message.id.clone(),
-                        turn,
-                        role: message.role,
-                        label: truncate_chars(&label, 80),
-                        level: None,
-                    });
-                }
-            } else {
-                for (level, label) in headings {
-                    nodes.push(MinimapNode {
-                        message_id: message.id.clone(),
-                        turn,
-                        role: message.role,
-                        label: truncate_chars(&label, 80),
-                        level: Some(level),
-                    });
-                }
-            }
+    let mut index = 0;
+    while index < messages.len() {
+        let message = &messages[index];
+        if message.role != MessageRole::User {
+            items.push(ConversationItem::Message(message.clone()));
+            index += 1;
+            continue;
         }
+
+        turn += 1;
+        items.push(ConversationItem::Message(message.clone()));
+        push_minimap_node(&mut minimap, message, turn);
+
+        let end = messages[index + 1..]
+            .iter()
+            .position(|candidate| candidate.role == MessageRole::User)
+            .map_or(messages.len(), |offset| index + 1 + offset);
+        let final_assistant = (index + 1..end).rev().find(|candidate| {
+            messages[*candidate].role == MessageRole::Assistant
+                && has_answer_content(&messages[*candidate])
+        });
+
+        let is_live_tail = active_tail && end == messages.len();
+        if is_live_tail {
+            push_process_item(
+                &mut items,
+                message,
+                messages[index + 1..end].to_vec(),
+                false,
+            );
+        } else if let Some(final_index) = final_assistant {
+            let final_message = &messages[final_index];
+            let (process_blocks, answer_blocks) = split_final_assistant_blocks(final_message);
+            let mut process_messages = messages[index + 1..final_index].to_vec();
+            if !process_blocks.is_empty() {
+                process_messages.push(Arc::new(Message {
+                    id: format!("{}-process", final_message.id),
+                    role: final_message.role,
+                    timestamp: final_message.timestamp.clone(),
+                    label: final_message.label.clone(),
+                    blocks: process_blocks,
+                }));
+            }
+            push_process_item(
+                &mut items,
+                message,
+                process_messages,
+                !answer_blocks.is_empty(),
+            );
+            if !answer_blocks.is_empty() {
+                let answer = Arc::new(Message {
+                    id: final_message.id.clone(),
+                    role: final_message.role,
+                    timestamp: final_message.timestamp.clone(),
+                    label: final_message.label.clone(),
+                    blocks: answer_blocks,
+                });
+                push_minimap_node(&mut minimap, &answer, turn);
+                items.push(ConversationItem::Message(answer));
+            }
+            items.extend(
+                messages[final_index + 1..end]
+                    .iter()
+                    .cloned()
+                    .map(ConversationItem::Message),
+            );
+        } else {
+            push_process_item(
+                &mut items,
+                message,
+                messages[index + 1..end].to_vec(),
+                false,
+            );
+        }
+        index = end;
     }
-    nodes
+    (items, minimap)
+}
+
+fn push_process_item(
+    items: &mut Vec<ConversationItem>,
+    anchor: &Message,
+    messages: Vec<Arc<Message>>,
+    collapsible: bool,
+) {
+    if messages.is_empty() {
+        return;
+    }
+    let tool_call_count = messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter(|block| matches!(block, Block::Tool(_)))
+        .count();
+    items.push(ConversationItem::Process(ProcessGroup {
+        id: format!("process-{}", anchor.id),
+        message_count: messages.len(),
+        tool_call_count,
+        messages: messages.into(),
+        collapsible,
+    }));
+}
+
+fn split_final_assistant_blocks(message: &Message) -> (Vec<Block>, Vec<Block>) {
+    let last_process = message
+        .blocks
+        .iter()
+        .rposition(|block| !is_answer_block(block));
+    match last_process {
+        Some(index) => (
+            message.blocks[..=index].to_vec(),
+            message.blocks[index + 1..].to_vec(),
+        ),
+        None => (Vec::new(), message.blocks.clone()),
+    }
+}
+
+fn is_answer_block(block: &Block) -> bool {
+    matches!(
+        block,
+        Block::Markdown(_)
+            | Block::Code(_)
+            | Block::Image(_)
+            | Block::Frontmatter(_)
+            | Block::Notice(_)
+    )
+}
+
+fn has_answer_content(message: &Message) -> bool {
+    let (_, answer) = split_final_assistant_blocks(message);
+    answer.iter().any(|block| match block {
+        Block::Markdown(markdown) => !markdown.source.trim().is_empty(),
+        Block::Code(code) => !code.source.trim().is_empty(),
+        Block::Notice(notice) => !notice.text.trim().is_empty(),
+        Block::Image(_) | Block::Frontmatter(_) => true,
+        _ => false,
+    })
+}
+
+fn push_minimap_node(nodes: &mut Vec<MinimapNode>, message: &Message, turn: usize) {
+    if let Some(label) = first_visible_text(message) {
+        nodes.push(MinimapNode {
+            message_id: message.id.clone(),
+            turn,
+            role: message.role,
+            label: truncate_chars(&label, 80),
+            level: None,
+        });
+    }
 }
 
 fn first_visible_text(message: &Message) -> Option<String> {
     message.blocks.iter().find_map(|block| match block {
-        Block::Markdown(markdown) => first_paragraph(&markdown.source),
+        Block::Markdown(markdown) => markdown_label(&markdown.source),
         Block::Thinking(text) | Block::Unknown(UnknownBlock { text, .. }) => first_paragraph(text),
         Block::Notice(notice) => Some(notice.text.clone()),
         Block::Tool(tool) => Some(format!("{} · {}", tool.name, tool.preview)),
         _ => None,
     })
+}
+
+fn markdown_label(text: &str) -> Option<String> {
+    let paragraph = first_paragraph(text)?;
+    let trimmed = paragraph.trim_start();
+    let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if hashes > 0 && trimmed.as_bytes().get(hashes) == Some(&b' ') {
+        Some(trimmed[hashes + 1..].trim().to_owned())
+    } else {
+        Some(paragraph)
+    }
 }
 
 fn first_paragraph(text: &str) -> Option<String> {
@@ -1611,12 +1763,121 @@ mod tests {
                 ..
             })
         )));
-        assert!(
+        assert!(document.minimap.iter().any(|node| {
+            node.label.contains("Result")
+                && node.role == MessageRole::Assistant
+                && node.level.is_none()
+        }));
+    }
+
+    #[test]
+    fn completed_turn_projects_query_process_and_final_answer() {
+        let document = render_fixture(&[
+            serde_json::json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            serde_json::json!({"type":"message","id":"trace","parentId":"u","message":{"role":"assistant","content":[{"type":"thinking","thinking":"reasoning"},{"type":"toolCall","id":"call","name":"read","arguments":{"path":"a.rs"}}]}}),
+            serde_json::json!({"type":"message","id":"answer","parentId":"trace","message":{"role":"assistant","content":[{"type":"thinking","thinking":"last thought"},{"type":"text","text":"final answer"}]}}),
+        ]);
+        assert_eq!(document.items.len(), 3);
+        assert!(matches!(
+            &document.items[0],
+            ConversationItem::Message(message) if message.id == "u"
+        ));
+        let ConversationItem::Process(group) = &document.items[1] else {
+            panic!("expected process group")
+        };
+        assert!(group.collapsible);
+        assert_eq!(group.message_count, 2);
+        assert_eq!(group.tool_call_count, 1);
+        assert!(group.messages.iter().any(|message| {
+            message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Thinking(text) if text == "last thought"))
+        }));
+        assert!(matches!(
+            &document.items[2],
+            ConversationItem::Message(message)
+                if message.id == "answer"
+                    && matches!(&message.blocks[..], [Block::Markdown(markdown)] if markdown.source == "final answer")
+        ));
+        assert_eq!(
             document
                 .minimap
                 .iter()
-                .any(|node| node.label == "Result" && node.level == Some(1))
+                .map(|node| (node.role, node.label.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (MessageRole::User, "question"),
+                (MessageRole::Assistant, "final answer")
+            ]
         );
+    }
+
+    #[test]
+    fn final_answer_is_only_the_suffix_after_the_last_process_block() {
+        let trailing_answer = Message {
+            id: "a".to_owned(),
+            role: MessageRole::Assistant,
+            timestamp: None,
+            label: None,
+            blocks: vec![
+                Block::Markdown(MarkdownBlock {
+                    source: "early text".to_owned(),
+                }),
+                Block::Tool(ToolCard {
+                    id: "call".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: Value::Null,
+                    input_json: "null".to_owned(),
+                    preview: "read".to_owned(),
+                    status: ToolStatus::Success,
+                    output: Vec::new(),
+                    details: None,
+                    orphan: false,
+                }),
+                Block::Markdown(MarkdownBlock {
+                    source: "final text".to_owned(),
+                }),
+            ],
+        };
+        let (process, answer) = split_final_assistant_blocks(&trailing_answer);
+        assert_eq!(process.len(), 2);
+        assert!(
+            matches!(&answer[..], [Block::Markdown(markdown)] if markdown.source == "final text")
+        );
+
+        let interleaved = Message {
+            id: "b".to_owned(),
+            blocks: vec![
+                Block::Thinking("first".to_owned()),
+                Block::Markdown(MarkdownBlock {
+                    source: "middle".to_owned(),
+                }),
+                Block::Thinking("second".to_owned()),
+                Block::Markdown(MarkdownBlock {
+                    source: "last".to_owned(),
+                }),
+            ],
+            ..trailing_answer
+        };
+        let (process, answer) = split_final_assistant_blocks(&interleaved);
+        assert_eq!(process.len(), 3);
+        assert!(matches!(&answer[..], [Block::Markdown(markdown)] if markdown.source == "last"));
+    }
+
+    #[test]
+    fn unfinished_turn_keeps_process_expanded_and_out_of_minimap() {
+        let document = render_fixture(&[
+            serde_json::json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            serde_json::json!({"type":"message","id":"trace","parentId":"u","message":{"role":"assistant","content":[{"type":"thinking","thinking":"still working"},{"type":"toolCall","id":"call","name":"read","arguments":{}}]}}),
+        ]);
+        assert_eq!(document.items.len(), 2);
+        assert!(matches!(
+            &document.items[1],
+            ConversationItem::Process(group) if !group.collapsible && group.message_count == 1
+        ));
+        assert_eq!(document.minimap.len(), 1);
+        assert_eq!(document.minimap[0].role, MessageRole::User);
     }
 
     #[test]

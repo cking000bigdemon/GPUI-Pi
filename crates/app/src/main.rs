@@ -1,5 +1,6 @@
 //! GPUI-Pi 正式桌面入口。
 
+mod live_session;
 mod panels;
 mod session_sidebar;
 mod trust_prompt;

@@ -30,4 +30,3 @@ Body
   unknown:future_entry:{"id":"future","parentId":"orphan","payload":{"visible":true},"type":"future_entry"}
 [Minimap]
 1:user:Hello **Markdown**
-1:assistant:Answer

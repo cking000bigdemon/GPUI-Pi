@@ -9,7 +9,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -24,12 +24,13 @@ use crate::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
-const EVENT_BUFFER_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub binary: PathBuf,
     pub current_dir: Option<PathBuf>,
+    /// 首次启动即恢复此会话；不能先创建空会话再在启动后补设恢复目标。
+    pub initial_session: Option<PathBuf>,
     pub args: Vec<OsString>,
     pub env: Vec<(OsString, OsString)>,
     pub max_restarts: usize,
@@ -44,6 +45,7 @@ impl ClientConfig {
         Self {
             binary: binary.into(),
             current_dir: None,
+            initial_session: None,
             args: Vec::new(),
             env: Vec::new(),
             max_restarts: 3,
@@ -116,7 +118,7 @@ struct PendingRequest {
 struct Shared {
     writer: Mutex<Option<ChildStdin>>,
     pending: Mutex<HashMap<String, PendingRequest>>,
-    subscribers: Mutex<Vec<SyncSender<ClientEvent>>>,
+    subscribers: Mutex<Vec<Sender<ClientEvent>>>,
     shutdown: AtomicBool,
     next_id: AtomicU64,
     pid: AtomicU64,
@@ -132,6 +134,7 @@ pub struct Client {
 
 impl Client {
     pub fn spawn(config: ClientConfig) -> Result<Self, ClientError> {
+        let initial_session = config.initial_session.clone();
         let shared = Arc::new(Shared {
             writer: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
@@ -139,7 +142,7 @@ impl Client {
             shutdown: AtomicBool::new(false),
             next_id: AtomicU64::new(0),
             pid: AtomicU64::new(0),
-            resume_session: Mutex::new(None),
+            resume_session: Mutex::new(initial_session),
         });
         let (start_tx, start_rx) = mpsc::sync_channel(1);
         let thread_shared = Arc::clone(&shared);
@@ -164,10 +167,10 @@ impl Client {
         }
     }
 
-    /// 订阅有界事件流。容量耗尽说明消费者已落后，监督器会断开该订阅，
-    /// 避免流式回复或工具输出让进程内存无界增长。
+    /// 订阅事件流。stdout reader 与 reducer pump 分线程消费，慢 UI 不会让订阅在 burst
+    /// 中被静默永久断开；上层必须持续 drain 并按帧合并事件。
     pub fn subscribe(&self) -> Receiver<ClientEvent> {
-        let (tx, rx) = mpsc::sync_channel(EVENT_BUFFER_CAPACITY);
+        let (tx, rx) = mpsc::channel();
         self.shared.subscribers.lock().unwrap().push(tx);
         rx
     }
@@ -619,12 +622,11 @@ fn fail_all_pending(shared: &Shared) {
 }
 
 fn broadcast(shared: &Shared, event: ClientEvent) {
-    shared.subscribers.lock().unwrap().retain(|subscriber| {
-        match subscriber.try_send(event.clone()) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
-        }
-    });
+    shared
+        .subscribers
+        .lock()
+        .unwrap()
+        .retain(|subscriber| subscriber.send(event.clone()).is_ok());
 }
 
 #[cfg(windows)]

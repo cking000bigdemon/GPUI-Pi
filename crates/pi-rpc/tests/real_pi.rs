@@ -2,12 +2,14 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
+use tempfile::TempDir;
+
 use pi_rpc::{
-    BashResult, Client, ClientConfig, ClientEvent, Command, LifecycleEvent, PINNED_PI_VERSION,
-    QueueMode, RpcSessionState, ThinkingLevel,
+    BashResult, Client, ClientConfig, ClientEvent, Command, LifecycleEvent, MessagesData,
+    PINNED_PI_VERSION, QueueMode, RpcSessionState, StreamingBehavior, ThinkingLevel,
 };
 use serde_json::Value;
 
@@ -31,21 +33,17 @@ fn assert_version(binary: &Path) {
     );
 }
 
-fn client() -> Client {
+struct TestClient {
+    client: Client,
+    _temp: TempDir,
+}
+
+fn client_config(temp: &TempDir) -> ClientConfig {
     let binary = configured_binary();
     assert_version(&binary);
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let session_dir = env::current_dir()
-        .unwrap()
-        .join("target")
-        .join("pi-rpc-tests")
-        .join("real-sessions")
-        .join(format!("{}-{nonce}", std::process::id()));
+    let session_dir = temp.path().join("sessions");
     fs::create_dir_all(&session_dir).unwrap();
-    let agent_dir = session_dir.join("agent");
+    let agent_dir = temp.path().join("agent");
     fs::create_dir_all(&agent_dir).unwrap();
     let mut config = ClientConfig::new(binary);
     config
@@ -61,13 +59,23 @@ fn client() -> Client {
         session_dir.into_os_string(),
     ];
     config.restart_delay = Duration::from_millis(100);
-    Client::spawn(config).unwrap()
+    config
+}
+
+fn client() -> TestClient {
+    let temp = tempfile::tempdir().unwrap();
+    let client = Client::spawn(client_config(&temp)).unwrap();
+    TestClient {
+        client,
+        _temp: temp,
+    }
 }
 
 #[test]
 #[ignore = "requires PI_RPC_TEST_BINARY=official pi 0.84.2"]
 fn zero_token_command_matrix() {
-    let client = client();
+    let test = client();
+    let client = &test.client;
     let state: RpcSessionState = client.request_data(Command::GetState, TIMEOUT).unwrap();
     assert!(!state.session_id.is_empty());
 
@@ -179,16 +187,43 @@ fn zero_token_command_matrix() {
 
 #[test]
 #[ignore = "requires PI_RPC_TEST_BINARY=official pi 0.84.2"]
+fn first_spawn_resumes_fixture_directly() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture_path = temp.path().join("initial-resume.jsonl");
+    let cwd = env::current_dir().unwrap();
+    fs::write(
+        &fixture_path,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "session",
+                "version": 3,
+                "id": "pi-rpc-initial-resume-fixture",
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "cwd": cwd
+            })
+        ),
+    )
+    .unwrap();
+    let mut config = client_config(&temp);
+    config.initial_session = Some(fixture_path.clone());
+    let client = Client::spawn(config).unwrap();
+    let state: RpcSessionState = client.request_data(Command::GetState, TIMEOUT).unwrap();
+    assert_eq!(state.session_id, "pi-rpc-initial-resume-fixture");
+    assert_eq!(
+        state.session_file.as_deref().map(Path::new),
+        Some(fixture_path.as_path())
+    );
+    client.shutdown().unwrap();
+}
+
+#[test]
+#[ignore = "requires PI_RPC_TEST_BINARY=official pi 0.84.2"]
 fn kill_restart_and_resume_fixture() {
-    let client = client();
+    let test = client();
+    let client = &test.client;
     let events = client.subscribe();
-    let fixture_dir = env::current_dir()
-        .unwrap()
-        .join("target")
-        .join("pi-rpc-tests")
-        .join("real-fixtures");
-    fs::create_dir_all(&fixture_dir).unwrap();
-    let fixture_path = fixture_dir.join(format!("resume-{}.jsonl", std::process::id()));
+    let fixture_path = test._temp.path().join("resume.jsonl");
     let cwd = env::current_dir().unwrap();
     let fixture = format!(
         "{}\n{}\n",
@@ -246,5 +281,146 @@ fn kill_restart_and_resume_fixture() {
     assert_eq!(after.session_id, before.session_id);
     assert_eq!(after.session_name, before.session_name);
     assert_eq!(after.message_count, before.message_count);
+    client.shutdown().unwrap();
+}
+
+#[test]
+#[ignore = "spends real model tokens; requires PI_RPC_R7_LIVE=1 and existing pi credentials"]
+fn r7_live_stream_requires_explicit_opt_in() {
+    if env::var("PI_RPC_R7_LIVE").as_deref() != Ok("1") {
+        eprintln!("skip: set PI_RPC_R7_LIVE=1 explicitly before spending tokens");
+        return;
+    }
+    let test = client();
+    let client = &test.client;
+    let events = client.subscribe();
+    let prompt = env::var("PI_RPC_R7_PROMPT")
+        .unwrap_or_else(|_| "Reply with exactly: r7-live-ok".to_owned());
+    let response = client
+        .request(
+            Command::Prompt {
+                message: prompt,
+                images: None,
+                streaming_behavior: None,
+            },
+            Duration::from_secs(120),
+        )
+        .unwrap();
+    assert!(response.success, "{:?}", response.error);
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut deltas = 0;
+    let mut message_end = None;
+    let mut settled = false;
+    while Instant::now() < deadline && !settled {
+        if let Ok(ClientEvent::Rpc(event)) = events.recv_timeout(Duration::from_millis(250)) {
+            match *event {
+                pi_rpc::RpcEvent::MessageUpdate {
+                    assistant_message_event: pi_rpc::AssistantMessageEvent::TextDelta { .. },
+                    ..
+                } => deltas += 1,
+                pi_rpc::RpcEvent::MessageEnd { message } => message_end = Some(message),
+                pi_rpc::RpcEvent::AgentSettled => settled = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(deltas > 0, "no text deltas observed");
+    let authoritative = message_end.expect("no authoritative message_end observed");
+    assert!(settled, "no agent_settled observed");
+
+    let messages: MessagesData = client.request_data(Command::GetMessages, TIMEOUT).unwrap();
+    assert!(
+        messages
+            .messages
+            .iter()
+            .any(|message| message == &authoritative),
+        "get_messages did not contain authoritative assistant"
+    );
+    let state: RpcSessionState = client.request_data(Command::GetState, TIMEOUT).unwrap();
+    let session_file = state.session_file.expect("persistent live session");
+    let session_text = fs::read_to_string(session_file).unwrap();
+    let assistant_text = authoritative
+        .0
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|blocks| {
+            blocks
+                .iter()
+                .find_map(|block| block.get("text").and_then(Value::as_str))
+        })
+        .expect("authoritative assistant text");
+    assert!(session_text.contains(assistant_text));
+    client.shutdown().unwrap();
+}
+
+#[test]
+#[ignore = "spends real model tokens; requires PI_RPC_R7_QUEUE=1 and existing pi credentials"]
+fn r7_live_queue_contract_requires_explicit_opt_in() {
+    if env::var("PI_RPC_R7_QUEUE").as_deref() != Ok("1") {
+        eprintln!("skip: set PI_RPC_R7_QUEUE=1 explicitly before spending tokens");
+        return;
+    }
+    let test = client();
+    let client = &test.client;
+    let events = client.subscribe();
+    let prompt = env::var("PI_RPC_R7_LONG_PROMPT").unwrap_or_else(|_| {
+        "Write a numbered list from 1 to 80, with one short sentence per item.".to_owned()
+    });
+    assert!(
+        client
+            .request(
+                Command::Prompt {
+                    message: prompt,
+                    images: None,
+                    streaming_behavior: None
+                },
+                Duration::from_secs(120),
+            )
+            .unwrap()
+            .success
+    );
+    assert!(
+        client
+            .request(
+                Command::Prompt {
+                    message: "Steer: keep every item under eight words.".into(),
+                    images: None,
+                    streaming_behavior: Some(StreamingBehavior::Steer),
+                },
+                TIMEOUT,
+            )
+            .unwrap()
+            .success
+    );
+    assert!(
+        client
+            .request(
+                Command::Prompt {
+                    message: "Afterward reply with queue-contract-done.".into(),
+                    images: None,
+                    streaming_behavior: Some(StreamingBehavior::FollowUp),
+                },
+                TIMEOUT,
+            )
+            .unwrap()
+            .success
+    );
+    assert!(client.request(Command::Abort, TIMEOUT).unwrap().success);
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut queue_updates = 0;
+    let mut settled = false;
+    while Instant::now() < deadline && !settled {
+        if let Ok(ClientEvent::Rpc(event)) = events.recv_timeout(Duration::from_millis(250)) {
+            match *event {
+                pi_rpc::RpcEvent::QueueUpdate { .. } => queue_updates += 1,
+                pi_rpc::RpcEvent::AgentSettled => settled = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(queue_updates > 0, "no queue_update observed");
+    assert!(settled, "no agent_settled observed after abort");
     client.shutdown().unwrap();
 }
