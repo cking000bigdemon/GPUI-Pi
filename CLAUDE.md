@@ -17,9 +17,24 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 5. **不写 `~/.pi` 的破坏性操作** —— 数据目录与终端 pi、pi-web-desktop 共享。能只读就只读，必须写走「临时文件 + rename」。
 6. **不把共享目录链接进 worktree** —— 从创建 worktree 起，禁止在其中建立任何指向主 checkout、其他 worktree 或外部共享目录的 Junction、目录 symlink 或其他 reparse point，尤其禁止链接 `vendor/`、`target/`、`.venv/`、`.pi/`。每个 worktree 的本地目录必须独立准备；上游参考源码走该 worktree 自己的 fetch 脚本，临时只读参考可直接读外部绝对路径，但不得挂载进 worktree。执行 `git worktree remove` 前必须检查 reparse point；发现任何目录链接就立即停止并呼人，禁止假设删除 worktree 只会删除链接本身——Git for Windows 可能沿 Junction 递归删除共享目标内容。
 
+## 新 round 启动门禁
+
+`git worktree add` 完成后，**第一项操作就是在新 worktree 内独立准备并验证完整 `vendor`**；此门禁必须早于读取轮次任务卡、搜索上游对照源码、启动子代理或修改任何代码：
+
+```powershell
+.\scripts\fetch-pi.ps1
+.\scripts\fetch-pi-source.ps1
+.\scripts\fetch-pi-web.ps1
+.\scripts\check-pins.ps1
+```
+
+开始实现前必须同时确认 `vendor/pi/pi.exe`、`vendor/upstream/pi-0.84.2/`、`vendor/upstream/pi-web-0.8.9/` 均存在，且 `check-pins` 全绿。任何一项缺失或准备失败都立即停止并呼人；禁止先寻找替代源码路径、边开发边补、读取主 checkout 的 `vendor` 顶替，或创建共享目录链接。这样每轮从第一分钟起就有完整运行时和钉死对照源码，不再把实现时间浪费在寻找缺失的 `vendor`。
+
 ## 每轮怎么跑
 
 ```
+新 worktree 独立准备完整 vendor + check-pins
+                  ↓ 全绿
 读 rounds/round-NN/round-NN.md  →  实现  →  跑 validate  →  不过就改，重跑
                                                  ↓ 全绿
                               commit + 更新 ROUNDS.md + 回填任务卡「本轮实测」
