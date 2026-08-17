@@ -2468,6 +2468,7 @@ name = "gpui-pi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "futures",
  "gpui",
  "gpui-component",
@@ -4761,6 +4762,7 @@ name = "pi-data"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "dirs",
  "dunce",

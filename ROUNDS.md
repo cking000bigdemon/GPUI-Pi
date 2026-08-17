@@ -13,7 +13,7 @@
 | **R5** | 会话列表（只读） | Windows | ✅ 已完成 | [#9](https://github.com/cking000bigdemon/GPUI-Pi/pull/9) | 2026-08-17 |
 | **R6** | 历史消息渲染（静态） | Windows | ✅ 已完成 | [#10](https://github.com/cking000bigdemon/GPUI-Pi/pull/10) | 2026-08-17 |
 | **R7** | 活会话流式 | Windows | ✅ 已完成 | [#13](https://github.com/cking000bigdemon/GPUI-Pi/pull/13) | 2026-08-17 |
-| **R8** | 输入框 / 附件 / slash 面板 | Windows | ⬜ | — | — |
+| **R8** | 输入框 / 附件 / slash 面板 | Windows | ✅ 已完成 | [#14](https://github.com/cking000bigdemon/GPUI-Pi/pull/14) | 2026-08-17 |
 | **R9** | 模型 · 思考级别 · 工具预设 | Windows | ⬜ | — | — |
 | **R10** | 文件浏览器 + 查看器 | Windows | ⬜ | — | — |
 | **R11** | git diff / worktree / 本轮改动文件 | Windows | ⬜ | — | — |

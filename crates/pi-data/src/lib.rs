@@ -8,6 +8,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+pub mod composer;
 pub mod config;
 pub mod extensions;
 pub mod project;
@@ -16,6 +17,13 @@ pub mod session_actions;
 pub mod session_view;
 pub mod trust;
 
+pub use composer::{
+    AT_RESULT_LIMIT, AtInsertion, AtQuery, ComposerDraft, DraftImage, DraftStore, FILE_INDEX_LIMIT,
+    FileIndex, FileIndexEntry, ImageValidationError, MAX_ATTACHED_IMAGE_BYTES, MAX_ATTACHED_IMAGES,
+    SupportedImageFormat, apply_at_insertion, build_at_insertion, build_entries_from_files,
+    build_file_index, detect_image_format, extract_at_query, filter_file_entries, image_from_bytes,
+    merge_restored_submission, validate_image_batch,
+};
 pub use config::{
     ConfigError, models_path, read_json, read_models, read_settings, read_trust, settings_path,
     trust_path, write_json_atomic, write_models, write_settings, write_trust,

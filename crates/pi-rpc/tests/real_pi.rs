@@ -8,8 +8,8 @@ use std::{
 use tempfile::TempDir;
 
 use pi_rpc::{
-    BashResult, Client, ClientConfig, ClientEvent, Command, LifecycleEvent, MessagesData,
-    PINNED_PI_VERSION, QueueMode, RpcSessionState, StreamingBehavior, ThinkingLevel,
+    BashResult, Client, ClientConfig, ClientEvent, Command, CommandsData, LifecycleEvent,
+    MessagesData, PINNED_PI_VERSION, QueueMode, RpcSessionState, StreamingBehavior, ThinkingLevel,
 };
 use serde_json::Value;
 
@@ -79,8 +79,14 @@ fn zero_token_command_matrix() {
     let state: RpcSessionState = client.request_data(Command::GetState, TIMEOUT).unwrap();
     assert!(!state.session_id.is_empty());
 
+    let commands: CommandsData = client.request_data(Command::GetCommands, TIMEOUT).unwrap();
+    assert!(commands.commands.iter().all(|command| {
+        !command.name.is_empty()
+            && !command.source_info.path.is_empty()
+            && !command.source_info.source.is_empty()
+    }));
+
     for command in [
-        Command::GetCommands,
         Command::GetMessages,
         Command::GetEntries { since: None },
         Command::GetTree,

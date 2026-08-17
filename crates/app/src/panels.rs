@@ -1,10 +1,13 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+
 use futures::{StreamExt as _, channel::mpsc::UnboundedReceiver};
 use gpui::{
-    App, AppContext as _, Context, EventEmitter, FocusHandle, Focusable, FollowMode,
-    InteractiveElement as _, IntoElement, ListAlignment, ListState, ParentElement as _, Render,
-    SharedString, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
+    App, AppContext as _, ClipboardEntry, Context, EventEmitter, ExternalPaths, FocusHandle,
+    Focusable, FollowMode, Image, ImageFormat, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ListAlignment, ListState, ParentElement as _, PathPromptOptions, Render, SharedString,
+    Styled as _, Subscription, Window, div, img, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Selectable as _,
@@ -13,12 +16,16 @@ use gpui_component::{
     dock::{Panel, PanelControl, PanelEvent},
     h_flex,
     input::{InputEvent, Textarea, TextareaState},
+    scroll::ScrollableElement as _,
     v_flex,
 };
 use pi_render::{ConversationDocument, ConversationItem, LivePhase};
 
 use crate::{
-    live_session::{ActiveSession, ComposerMode, PumpMessage, RpcIntent, official_binary},
+    live_session::{
+        ActiveSession, ComposerMode, ComposerSubmission, PumpMessage, RequestFailureKind,
+        RpcIntent, official_binary,
+    },
     session_sidebar::SessionSelected,
 };
 
@@ -29,6 +36,15 @@ pub struct ChatPanel {
     active: Option<ActiveSession>,
     composer: gpui::Entity<TextareaState>,
     composer_mode: ComposerMode,
+    draft_key: Option<String>,
+    drafts: pi_data::DraftStore,
+    attachments: Vec<ComposerAttachment>,
+    slash_commands: Vec<pi_rpc::RpcSlashCommand>,
+    popup: Option<ComposerPopup>,
+    popup_index: usize,
+    file_index: Option<pi_data::FileIndex>,
+    composer_cwd: Option<PathBuf>,
+    pending_draft_restore: bool,
     list_state: ListState,
     list_item_ids: Vec<String>,
     tail_attached: bool,
@@ -41,6 +57,21 @@ pub struct ChatPanel {
     calibration_generation: u64,
     _composer_subscription: Subscription,
     probe: Option<LayoutProbe>,
+}
+
+#[derive(Debug, Clone)]
+struct ComposerAttachment {
+    draft: pi_data::DraftImage,
+    preview: Arc<Image>,
+}
+
+#[derive(Debug, Clone)]
+enum ComposerPopup {
+    Slash(Vec<pi_rpc::RpcSlashCommand>),
+    At {
+        query: pi_data::AtQuery,
+        entries: Vec<pi_data::FileIndexEntry>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -91,11 +122,20 @@ impl ChatPanel {
                 .submit_on_enter(true)
                 .placeholder("输入消息；Enter 发送，Shift+Enter 换行")
         });
-        let subscription = cx.subscribe_in(&composer, window, |this, input, event, window, cx| {
-            if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
-                this.submit_composer(input, window, cx);
-            }
-        });
+        let subscription =
+            cx.subscribe_in(
+                &composer,
+                window,
+                |this, input, event, window, cx| match event {
+                    InputEvent::PressEnter { shift: false, .. } => {
+                        if !this.accept_popup(input, window, cx) {
+                            this.submit_composer(input, window, cx);
+                        }
+                    }
+                    InputEvent::Change => this.composer_changed(input, cx),
+                    _ => {}
+                },
+            );
         let list_state = ListState::new(0, ListAlignment::Top, px(1200.));
         let scroll_state = list_state.clone();
         let panel = cx.weak_entity();
@@ -121,6 +161,15 @@ impl ChatPanel {
             active: None,
             composer,
             composer_mode: ComposerMode::Steer,
+            draft_key: None,
+            drafts: pi_data::DraftStore::default(),
+            attachments: Vec::new(),
+            slash_commands: Vec::new(),
+            popup: None,
+            popup_index: 0,
+            file_index: None,
+            composer_cwd: None,
+            pending_draft_restore: false,
             list_state,
             list_item_ids: Vec::new(),
             tail_attached: true,
@@ -142,7 +191,56 @@ impl ChatPanel {
         self
     }
 
+    fn current_draft(&self, cx: &App) -> pi_data::ComposerDraft {
+        pi_data::ComposerDraft {
+            text: self.composer.read(cx).value().to_string(),
+            images: self
+                .attachments
+                .iter()
+                .map(|attachment| attachment.draft.clone())
+                .collect(),
+        }
+    }
+
+    fn save_current_draft(&mut self, cx: &App) {
+        if let Some(key) = self.draft_key.clone() {
+            self.drafts.set(key, self.current_draft(cx));
+        }
+    }
+
+    fn prepare_draft_restore(&mut self) {
+        let draft = self
+            .draft_key
+            .as_deref()
+            .map(|key| self.drafts.get(key))
+            .unwrap_or_default();
+        self.pending_draft_restore = true;
+        self.attachments = draft
+            .images
+            .into_iter()
+            .filter_map(attachment_from_draft)
+            .collect();
+    }
+
+    fn start_file_index(&self, generation: u64, cwd: PathBuf, cx: &mut Context<Self>) {
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |panel, cx| {
+            let result = executor
+                .spawn(async move { pi_data::build_file_index(&cwd) })
+                .await;
+            let _ = panel.update(cx, |panel, cx| {
+                if generation == panel.load_generation {
+                    panel.file_index = Some(result);
+                    panel.refresh_popup(cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn load_selection(&mut self, selection: SessionSelected, cx: &mut Context<Self>) {
+        self.save_current_draft(cx);
         self.load_generation = self.load_generation.wrapping_add(1);
         let generation = self.load_generation;
         if let Some(active) = self.active.take() {
@@ -152,6 +250,14 @@ impl ChatPanel {
             title: selection.title.clone(),
         };
         self.rpc_error = None;
+        self.draft_key = Some(selection.id.clone());
+        self.composer_cwd = Some(selection.cwd.clone());
+        self.file_index = None;
+        self.slash_commands.clear();
+        self.popup = None;
+        self.popup_index = 0;
+        self.prepare_draft_restore();
+        self.start_file_index(generation, selection.cwd.clone(), cx);
         self.activity_generation = 0;
         self.calibration_generation = 0;
         self.tail_attached = true;
@@ -267,6 +373,7 @@ impl ChatPanel {
         let generation = match &message {
             PumpMessage::Events { generation, .. }
             | PumpMessage::RequestFinished { generation, .. }
+            | PumpMessage::CommandsLoaded { generation, .. }
             | PumpMessage::Calibrated { generation, .. }
             | PumpMessage::Stopped { generation, .. } => *generation,
         };
@@ -304,18 +411,60 @@ impl ChatPanel {
                 self.sync_list_document(&document);
                 self.status = ChatStatus::Ready(document);
             }
-            PumpMessage::RequestFinished { intent, result, .. } => match result {
+            PumpMessage::RequestFinished {
+                intent,
+                submission,
+                pending_activity_generation,
+                result,
+                ..
+            } => match result {
                 Ok(()) => {
                     self.rpc_error = None;
                 }
-                Err(error) => {
+                Err((kind, error)) => {
                     if intent == RpcIntent::Abort {
                         active.reducer_mut().restore_running_if_stopping();
-                    } else if active.phase() == LivePhase::Running {
+                    } else if should_restore_idle_phase(
+                        pending_activity_generation,
+                        self.activity_generation,
+                        active.phase(),
+                    ) {
                         active.reducer_mut().restore_phase(LivePhase::Idle);
                     }
-                    self.rpc_error = Some(error);
+                    if should_restore_submission(kind)
+                        && let (Some(key), Some(submission)) =
+                            (self.draft_key.as_deref(), submission)
+                    {
+                        let restored = self.drafts.restore_submission(
+                            key,
+                            pi_data::ComposerDraft {
+                                text: submission.message,
+                                images: submission.images,
+                            },
+                        );
+                        self.pending_draft_restore = true;
+                        self.attachments = restored
+                            .images
+                            .into_iter()
+                            .filter_map(attachment_from_draft)
+                            .collect();
+                    }
+                    self.rpc_error = Some(match kind {
+                        RequestFailureKind::Rejected => {
+                            format!("pi 明确拒绝提交，已恢复草稿：{error}")
+                        }
+                        RequestFailureKind::Ambiguous => {
+                            format!("提交结果不明确，为避免重复 turn 未自动恢复：{error}")
+                        }
+                    });
                 }
+            },
+            PumpMessage::CommandsLoaded { result, .. } => match result {
+                Ok(commands) => {
+                    self.slash_commands = commands;
+                    self.refresh_popup_without_input();
+                }
+                Err(error) => self.rpc_error = Some(format!("加载 slash 命令失败：{error}")),
             },
             PumpMessage::Calibrated {
                 calibration,
@@ -350,6 +499,153 @@ impl ChatPanel {
         }
     }
 
+    fn composer_changed(&mut self, input: &gpui::Entity<TextareaState>, cx: &mut Context<Self>) {
+        if self.pending_draft_restore {
+            self.pending_draft_restore = false;
+        }
+        if let Some(key) = self.draft_key.clone() {
+            self.drafts.set(key, self.current_draft(cx));
+        }
+        let input = input.read(cx);
+        self.refresh_popup_for_value(input.value().as_ref(), input.cursor());
+        cx.notify();
+    }
+
+    fn refresh_popup(&mut self, cx: &App) {
+        let input = self.composer.read(cx);
+        self.refresh_popup_for_value(input.value().as_ref(), input.cursor());
+    }
+
+    fn refresh_popup_without_input(&mut self) {
+        if let Some(ComposerPopup::Slash(_)) = self.popup {
+            self.popup = Some(ComposerPopup::Slash(self.filtered_slash_commands("")));
+        }
+    }
+
+    fn refresh_popup_for_value(&mut self, value: &str, cursor: usize) {
+        let cursor = cursor.min(value.len());
+        if cursor == value.len()
+            && let Some(query) = slash_query(value)
+        {
+            self.popup = Some(ComposerPopup::Slash(self.filtered_slash_commands(query)));
+            self.popup_index = 0;
+            return;
+        }
+        if self.composer_cwd.is_some()
+            && let Some(query) = pi_data::extract_at_query(&value[..cursor])
+        {
+            let entries = self.file_index.as_ref().map_or_else(Vec::new, |index| {
+                pi_data::filter_file_entries(&index.entries, &query.query, pi_data::AT_RESULT_LIMIT)
+            });
+            self.popup = Some(ComposerPopup::At { query, entries });
+            self.popup_index = 0;
+            return;
+        }
+        self.popup = None;
+        self.popup_index = 0;
+    }
+
+    fn filtered_slash_commands(&self, query: &str) -> Vec<pi_rpc::RpcSlashCommand> {
+        let query = query.to_lowercase();
+        self.slash_commands
+            .iter()
+            .filter(|command| {
+                command.name.to_lowercase().contains(&query)
+                    || command
+                        .description
+                        .as_deref()
+                        .is_some_and(|description| description.to_lowercase().contains(&query))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn accept_popup(
+        &mut self,
+        input: &gpui::Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(popup) = self.popup.clone() else {
+            return false;
+        };
+        let (value, cursor) = {
+            let state = input.read(cx);
+            (state.value().to_string(), state.cursor())
+        };
+        let (next, next_cursor) = match popup {
+            ComposerPopup::Slash(commands) => commands.get(self.popup_index).map(|command| {
+                let next = format!("/{} ", command.name);
+                let cursor = next.len();
+                (next, cursor)
+            }),
+            ComposerPopup::At { query, entries } => entries
+                .get(self.popup_index)
+                .map(|entry| pi_data::apply_at_insertion(&value, cursor, &query, entry)),
+        }
+        .unwrap_or_else(|| (String::new(), 0));
+        if next.is_empty() {
+            return false;
+        }
+        input.update(cx, |input, cx| {
+            input.set_value(next, window, cx);
+            input.set_selected_range(next_cursor..next_cursor, cx);
+        });
+        let state = input.read(cx);
+        self.refresh_popup_for_value(state.value().as_ref(), state.cursor());
+        true
+    }
+
+    fn composer_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.modifiers.secondary()
+            && event.keystroke.key.eq_ignore_ascii_case("v")
+            && self.attach_clipboard_images(cx)
+        {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        let Some(popup) = &self.popup else {
+            return;
+        };
+        let len = match popup {
+            ComposerPopup::Slash(commands) => commands.len(),
+            ComposerPopup::At { entries, .. } => entries.len(),
+        };
+        match event.keystroke.key.as_str() {
+            "up" => {
+                self.popup_index = self.popup_index.saturating_sub(1);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "down" => {
+                if len > 0 {
+                    self.popup_index = (self.popup_index + 1).min(len - 1);
+                }
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "tab" => {
+                let input = self.composer.clone();
+                self.accept_popup(&input, window, cx);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "escape" => {
+                self.popup = None;
+                self.popup_index = 0;
+                cx.stop_propagation();
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
     fn submit_composer(
         &mut self,
         input: &gpui::Entity<TextareaState>,
@@ -357,7 +653,7 @@ impl ChatPanel {
         cx: &mut Context<Self>,
     ) {
         let message = input.read(cx).value().trim().to_owned();
-        if message.is_empty() {
+        if message.is_empty() && self.attachments.is_empty() {
             return;
         }
         let Some(active) = self.active.as_mut() else {
@@ -377,16 +673,126 @@ impl ChatPanel {
             },
             LivePhase::Idle | LivePhase::Error => RpcIntent::Prompt,
         };
-        active.dispatch(intent, Some(message), self.composer_mode);
+        let submission = build_submission(message, &self.attachments);
+        active.dispatch(
+            intent,
+            Some(submission),
+            self.composer_mode,
+            self.activity_generation,
+        );
         input.update(cx, |input, cx| input.set_value("", window, cx));
+        self.attachments.clear();
+        self.popup = None;
+        if let Some(key) = self.draft_key.as_deref() {
+            self.drafts.clear(key);
+        }
         cx.notify();
+    }
+
+    fn choose_images(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("选择图片附件".into()),
+        });
+        cx.spawn_in(window, async move |panel, cx| {
+            let Some(paths) = receiver.await.ok().and_then(Result::ok).flatten() else {
+                return;
+            };
+            let _ = cx.update(|_, cx| {
+                let _ = panel.update(cx, |panel, cx| {
+                    panel.start_attach_paths(paths, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn start_attach_paths(&self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let generation = self.load_generation;
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |panel, cx| {
+            let result = executor
+                .spawn(async move {
+                    paths
+                        .into_iter()
+                        .map(|path| {
+                            std::fs::read(&path)
+                                .map_err(|error| format!("{}：{error}", path.display()))
+                                .and_then(|bytes| {
+                                    pi_data::image_from_bytes(bytes)
+                                        .map_err(|error| format!("{}：{error}", path.display()))
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .await;
+            let _ = panel.update(cx, |panel, cx| {
+                if generation != panel.load_generation {
+                    return;
+                }
+                match result {
+                    Ok(images) => panel.add_draft_images(images, cx),
+                    Err(error) => panel.rpc_error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn add_draft_images(&mut self, images: Vec<pi_data::DraftImage>, cx: &mut Context<Self>) {
+        if let Err(error) = pi_data::validate_image_batch(self.attachments.len(), &images) {
+            self.rpc_error = Some(error.to_string());
+            return;
+        }
+        self.attachments
+            .extend(images.into_iter().filter_map(attachment_from_draft));
+        if let Some(key) = self.draft_key.clone() {
+            self.drafts.set(key, self.current_draft(cx));
+        }
+        self.rpc_error = None;
+    }
+
+    fn attach_clipboard_images(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+        let images = item
+            .into_entries()
+            .filter_map(|entry| match entry {
+                ClipboardEntry::Image(image) => gpui_image_to_draft(image),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if images.is_empty() {
+            return false;
+        }
+        self.add_draft_images(images, cx);
+        true
+    }
+
+    fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.attachments.len() {
+            self.attachments.remove(index);
+            if let Some(key) = self.draft_key.clone() {
+                self.drafts.set(key, self.current_draft(cx));
+            }
+            cx.notify();
+        }
     }
 
     fn abort(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(active) = self.active.as_mut()
             && active.phase() == LivePhase::Running
         {
-            active.dispatch(RpcIntent::Abort, None, self.composer_mode);
+            active.dispatch(
+                RpcIntent::Abort,
+                None,
+                self.composer_mode,
+                self.activity_generation,
+            );
             cx.notify();
         }
     }
@@ -475,6 +881,111 @@ impl ChatPanel {
         }
         cx.notify();
     }
+
+    fn render_composer_popup(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let popup = self.popup.as_ref()?;
+        let rows = match popup {
+            ComposerPopup::Slash(commands) => commands
+                .iter()
+                .enumerate()
+                .map(|(index, command)| {
+                    let description = command.description.clone().unwrap_or_default();
+                    h_flex()
+                        .debug_selector(|| "composer-popup-item".into())
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .when(index == self.popup_index, |row| {
+                            row.bg(cx.theme().secondary_active)
+                        })
+                        .child(div().font_semibold().child(format!("/{}", command.name)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(description),
+                        )
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>(),
+            ComposerPopup::At { entries, .. } => entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    h_flex()
+                        .debug_selector(|| "composer-popup-item".into())
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .when(index == self.popup_index, |row| {
+                            row.bg(cx.theme().secondary_active)
+                        })
+                        .child(Icon::new(if entry.is_dir {
+                            IconName::Folder
+                        } else {
+                            IconName::File
+                        }))
+                        .child(entry.path.clone())
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>(),
+        };
+        Some(
+            v_flex()
+                .debug_selector(|| "composer-popup".into())
+                .max_h(px(180.))
+                .overflow_y_scrollbar()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().popover)
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    fn render_attachments(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.attachments.is_empty() {
+            return None;
+        }
+        let panel = cx.entity();
+        Some(
+            h_flex()
+                .debug_selector(|| "composer-attachments".into())
+                .gap_2()
+                .overflow_x_scrollbar()
+                .children(
+                    self.attachments
+                        .iter()
+                        .enumerate()
+                        .map(|(index, attachment)| {
+                            h_flex()
+                                .id(("attachment", index))
+                                .gap_1()
+                                .p_1()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .child(img(attachment.preview.clone()).size(px(40.)))
+                                .child(
+                                    Button::new(("remove-attachment", index))
+                                        .xsmall()
+                                        .label("删除")
+                                        .on_click({
+                                            let panel = panel.clone();
+                                            move |_, _, cx| {
+                                                panel.update(cx, |panel, cx| {
+                                                    panel.remove_attachment(index, cx);
+                                                });
+                                            }
+                                        }),
+                                )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
 }
 
 impl Drop for ChatPanel {
@@ -520,7 +1031,7 @@ impl Panel for ChatPanel {
 }
 
 impl Render for ChatPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
         let probe = self.probe.clone();
         #[cfg(not(test))]
@@ -606,6 +1117,18 @@ impl Render for ChatPanel {
         let running = matches!(phase, Some(LivePhase::Running));
         let stopping = matches!(phase, Some(LivePhase::Stopping));
         let live_started = self.active.is_some();
+        if self.pending_draft_restore {
+            let input = self.composer.clone();
+            let text = self
+                .draft_key
+                .as_deref()
+                .map(|key| self.drafts.get(key).text)
+                .unwrap_or_default();
+            input.update(cx, |input, cx| input.set_value(text, window, cx));
+            self.pending_draft_restore = false;
+        }
+        let popup = self.render_composer_popup(cx);
+        let attachments = self.render_attachments(cx);
         let queue_summary = self.active.as_ref().and_then(|active| {
             let steering = active.reducer().steering_queue().len();
             let follow_up = active.reducer().follow_up_queue().len();
@@ -620,6 +1143,10 @@ impl Render for ChatPanel {
                 this.on_prepaint(move |bounds, _, _| probe.record_workspace(bounds))
             })
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::composer_key_down))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.start_attach_paths(paths.paths().to_vec(), cx);
+            }))
             .size_full()
             .min_w_0()
             .min_h_0()
@@ -669,10 +1196,25 @@ impl Render for ChatPanel {
                             .p_3()
                             .border_t_1()
                             .border_color(cx.theme().border)
+                            .when_some(popup, |composer, popup| composer.child(popup))
+                            .when_some(attachments, |composer, attachments| {
+                                composer.child(attachments)
+                            })
                             .child(Textarea::new(&self.composer).h(px(76.)))
                             .child(
                                 h_flex()
                                     .gap_2()
+                                    .child(
+                                        Button::new("attach-images")
+                                            .debug_selector(|| "attach-images".into())
+                                            .small()
+                                            .label("添加图片")
+                                            .disabled(
+                                                self.attachments.len()
+                                                    >= pi_data::MAX_ATTACHED_IMAGES,
+                                            )
+                                            .on_click(cx.listener(Self::choose_images)),
+                                    )
                                     .child(
                                         Button::new("start-live-session")
                                             .small()
@@ -729,6 +1271,61 @@ impl Render for ChatPanel {
                     ),
             )
     }
+}
+
+const fn should_restore_submission(kind: RequestFailureKind) -> bool {
+    matches!(kind, RequestFailureKind::Rejected)
+}
+
+const fn should_restore_idle_phase(
+    pending_activity_generation: Option<u64>,
+    current_activity_generation: u64,
+    phase: LivePhase,
+) -> bool {
+    matches!(
+        (pending_activity_generation, phase),
+        (Some(start_generation), LivePhase::Running)
+            if start_generation == current_activity_generation
+    )
+}
+
+fn build_submission(message: String, attachments: &[ComposerAttachment]) -> ComposerSubmission {
+    ComposerSubmission {
+        message,
+        images: attachments
+            .iter()
+            .map(|attachment| attachment.draft.clone())
+            .collect(),
+    }
+}
+
+fn slash_query(value: &str) -> Option<&str> {
+    let query = value.strip_prefix('/')?;
+    (!query.chars().any(char::is_whitespace)).then_some(query)
+}
+
+fn attachment_from_draft(draft: pi_data::DraftImage) -> Option<ComposerAttachment> {
+    let bytes = STANDARD.decode(&draft.data).ok()?;
+    let format = match draft.mime_type.as_str() {
+        "image/png" => ImageFormat::Png,
+        "image/jpeg" => ImageFormat::Jpeg,
+        "image/gif" => ImageFormat::Gif,
+        "image/webp" => ImageFormat::Webp,
+        _ => return None,
+    };
+    Some(ComposerAttachment {
+        preview: Arc::new(Image::from_bytes(format, bytes)),
+        draft,
+    })
+}
+
+fn gpui_image_to_draft(image: Image) -> Option<pi_data::DraftImage> {
+    let draft = pi_data::image_from_bytes(image.bytes).ok()?;
+    matches!(
+        image.format,
+        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::Webp
+    )
+    .then_some(draft)
 }
 
 fn centered_state(
@@ -921,6 +1518,119 @@ mod tests {
     }
 
     #[gpui::test]
+    fn composer_popup_attachment_and_file_prompt_render(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, cx| {
+            panel.slash_commands = vec![pi_rpc::RpcSlashCommand {
+                name: "fixture".into(),
+                description: Some("Fixture command".into()),
+                source: pi_rpc::SlashCommandSource::Prompt,
+                source_info: pi_rpc::SourceInfo {
+                    path: "C:/fixture.md".into(),
+                    source: "fixture".into(),
+                    scope: pi_rpc::SourceScope::Project,
+                    origin: pi_rpc::SourceOrigin::TopLevel,
+                    base_dir: None,
+                },
+            }];
+            let draft = pi_data::image_from_bytes(b"\x89PNG\r\n\x1a\nfixture".to_vec()).unwrap();
+            panel.attachments = vec![attachment_from_draft(draft).unwrap()];
+            panel.popup = Some(ComposerPopup::Slash(panel.slash_commands.clone()));
+            cx.notify();
+        });
+        for _ in 0..2 {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.run_until_parked();
+        }
+        assert!(visual.debug_bounds("composer-popup").is_some());
+        assert!(visual.debug_bounds("composer-popup-item").is_some());
+        assert!(visual.debug_bounds("composer-attachments").is_some());
+
+        let button = visual.debug_bounds("attach-images").unwrap();
+        visual.simulate_click(button.center(), gpui::Modifiers::default());
+        assert!(visual.did_prompt_for_paths());
+        visual.simulate_path_prompt_response(|options| {
+            assert!(options.files && !options.directories && options.multiple);
+            None
+        });
+        visual.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn at_popup_uses_utf8_cursor_and_directory_accept_drills_down(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.composer_cwd = Some(PathBuf::from("C:/fixture"));
+                panel.file_index = Some(pi_data::FileIndex {
+                    entries: vec![
+                        pi_data::FileIndexEntry {
+                            path: "src".into(),
+                            is_dir: true,
+                        },
+                        pi_data::FileIndexEntry {
+                            path: "src/main.rs".into(),
+                            is_dir: false,
+                        },
+                    ],
+                    truncated: false,
+                });
+                let cursor = "前缀 @sr".len();
+                panel.composer.update(cx, |input, cx| {
+                    input.set_value("前缀 @sr 后续", window, cx);
+                    input.set_selected_range(cursor..cursor, cx);
+                });
+                panel.refresh_popup(cx);
+                assert!(panel.accept_popup(&panel.composer.clone(), window, cx));
+                let input = panel.composer.read(cx);
+                assert_eq!(input.value().as_ref(), "前缀 @src/ 后续");
+                assert_eq!(input.cursor(), "前缀 @src/".len());
+                let ComposerPopup::At { query, entries } = panel.popup.as_ref().unwrap() else {
+                    panic!("directory acceptance must immediately reopen @ popup");
+                };
+                assert_eq!(query.query, "src/");
+                assert!(entries.iter().any(|entry| entry.path == "src/main.rs"));
+            });
+        });
+        visual.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn switching_sessions_saves_and_restores_isolated_drafts(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("one".into());
+                panel.composer.update(cx, |input, cx| {
+                    input.set_value("draft one", window, cx);
+                });
+                panel.save_current_draft(cx);
+                panel.draft_key = Some("two".into());
+                panel.prepare_draft_restore();
+                assert_eq!(panel.drafts.get("one").text, "draft one");
+                assert_eq!(panel.drafts.get("two"), pi_data::ComposerDraft::default());
+                panel.drafts.set(
+                    "two",
+                    pi_data::ComposerDraft {
+                        text: "draft two".into(),
+                        images: Vec::new(),
+                    },
+                );
+                panel.prepare_draft_restore();
+                let restored = panel.drafts.get("two");
+                panel.composer.update(cx, |input, cx| {
+                    input.set_value(restored.text, window, cx);
+                });
+                assert_eq!(panel.composer.read(cx).value().as_ref(), "draft two");
+                assert_eq!(panel.drafts.get("one").text, "draft one");
+            });
+        });
+    }
+
+    #[gpui::test]
     fn minimum_chat_keeps_composer_visible(cx: &mut TestAppContext) {
         let mut ready = render_status(cx, ChatStatus::Ready(document("hello")));
         let chat = ready.debug_bounds("chat-workspace").unwrap();
@@ -950,6 +1660,50 @@ mod tests {
             assert!(panel.finish_load(2, "new".to_owned(), Ok(document("new"))));
             assert!(matches!(panel.status, ChatStatus::Ready(_)));
         });
+    }
+
+    #[test]
+    fn composer_popup_queries_and_image_only_submission_are_pure() {
+        assert_eq!(slash_query("/fix"), Some("fix"));
+        assert_eq!(slash_query("/fix now"), None);
+        let draft = pi_data::image_from_bytes(b"\x89PNG\r\n\x1a\nfixture".to_vec()).unwrap();
+        let attachment = attachment_from_draft(draft.clone()).unwrap();
+        let submission = build_submission(String::new(), &[attachment]);
+        assert!(submission.message.is_empty());
+        assert_eq!(submission.images, vec![draft]);
+    }
+
+    #[test]
+    fn explicit_rejection_restores_but_ambiguous_failure_does_not() {
+        let mut drafts = pi_data::DraftStore::default();
+        drafts.set(
+            "session",
+            pi_data::ComposerDraft {
+                text: "new typing".into(),
+                images: Vec::new(),
+            },
+        );
+        let rejected = pi_data::ComposerDraft {
+            text: "rejected".into(),
+            images: Vec::new(),
+        };
+        if should_restore_submission(RequestFailureKind::Rejected) {
+            drafts.restore_submission("session", rejected);
+        }
+        assert_eq!(drafts.get("session").text, "rejected\n\nnew typing");
+        let before = drafts.get("session");
+        if should_restore_submission(RequestFailureKind::Ambiguous) {
+            drafts.restore_submission("session", pi_data::ComposerDraft::default());
+        }
+        assert_eq!(drafts.get("session"), before);
+    }
+
+    #[test]
+    fn failed_submission_only_restores_idle_before_agent_start() {
+        assert!(should_restore_idle_phase(Some(7), 7, LivePhase::Running));
+        assert!(!should_restore_idle_phase(Some(7), 8, LivePhase::Running));
+        assert!(!should_restore_idle_phase(None, 7, LivePhase::Running));
+        assert!(!should_restore_idle_phase(Some(7), 7, LivePhase::Idle));
     }
 
     #[test]
