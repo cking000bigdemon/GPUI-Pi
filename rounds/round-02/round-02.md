@@ -53,7 +53,7 @@
 - 协议静态覆盖以钉死源码为准：32 个 command、23 个 session/agent event name、`extension_error` 与 9 种 `extension_ui_request`；开放的 provider/extension/session payload 使用 `serde_json::Value` 保真，稳定 envelope 与字段强类型。
 - JSONL 单测覆盖 chunk 边界、CRLF、U+2028/U+2029、无尾 LF 和帧上限。
 - fake child 黑盒覆盖并发 request id 关联、stderr drain、进程树强杀、旧 pending 失败、带最近 `get_state.sessionFile` 的自动 restart/resume，以及主动 shutdown 不重启。
-- 真实 pi：`PI_RPC_TEST_BINARY=D:/variFlight_work/GPUI-Pi/vendor/pi.exe cargo test -p pi-rpc --test real_pi -- --ignored --nocapture --test-threads=1`，2 passed，精确版本 0.84.2；覆盖零 token 查询/设置/错误/bash/new session 矩阵和 switch fixture 后 kill/restart/resume。
+- 真实 pi：`PI_RPC_TEST_BINARY=D:/variFlight_work/GPUI-Pi/vendor/pi/pi.exe cargo test -p pi-rpc --test real_pi -- --ignored --nocapture --test-threads=1`（2026-08-17 vendor 结构调整后二进制位于 `vendor/pi/` 子目录），2 passed，精确版本 0.84.2；覆盖零 token 查询/设置/错误/bash/new session 矩阵和 switch fixture 后 kill/restart/resume。
 - T2 隔离：每次真实测试都把 `PI_CODING_AGENT_DIR` 与 `--session-dir` 指到仓库 `target/pi-rpc-tests/` 临时目录，并开启 `--offline --no-extensions --no-skills --no-prompt-templates --no-context-files`；测试前后真实 `~/.pi/agent/settings.json` SHA256 均为 `7298af9b…`。
 - Windows 路径踩坑：真实用户 home 含非 ASCII 时官方 binary 回报的默认 session path 可能不可直接用于 Rust 文件探测；真实 resume 测试改用仓库 `target/` 下显式 fixture 和 `switch_session`，通过 `set_resume_session` 明确交给监督器，再验证同一路径 `--session` 恢复。
 - CI 跨平台修复：Linux 的 procps-ng `kill` 会把裸 `-{pid}` 误解为旧式 signal 参数，导致进程组未终止和测试等待 60 秒；Unix 调用改为 `kill -TERM -- -<pgid>`，用 `--` 明确结束选项。

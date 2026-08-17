@@ -33,11 +33,20 @@ try {
     $got = (Get-FileHash (Join-Path $Tmp $Asset) -Algorithm SHA256).Hash.ToLower()
     if ($got -ne $want.ToLower()) { throw "SHA256 不符：期望 $want，实得 $got" }
 
-    Write-Host "==> 解包到 vendor\"
-    if (Test-Path (Join-Path $Vendor "pi")) { Remove-Item -Recurse -Force (Join-Path $Vendor "pi") }
+    # 官方 zip 根目录直接是内容（pi.exe 在根、无顶层目录）；若未来包结构带顶层
+    # 目录则自动改用该目录。解包目录建在 vendor 下、与目标同卷，保证最终
+    # Move-Item 是原子 rename，不会跨卷退化成复制。
     New-Item -ItemType Directory -Path $Vendor -Force | Out-Null
-    Expand-Archive -Path (Join-Path $Tmp $Asset) -DestinationPath $Vendor -Force
-    if (-not (Test-Path (Join-Path $Vendor "pi\pi.exe"))) { throw "解包后没有 vendor\pi\pi.exe" }
+    $Extract = Join-Path $Vendor (".fetch-pi-extract-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Path $Extract | Out-Null
+    Expand-Archive -Path (Join-Path $Tmp $Asset) -DestinationPath $Extract -Force
+    $Payload = Join-Path $Extract "pi"
+    if (-not (Test-Path (Join-Path $Payload "pi.exe"))) { $Payload = $Extract }
+    if (-not (Test-Path (Join-Path $Payload "pi.exe"))) { throw "解包后找不到 pi.exe" }
+
+    Write-Host "==> 发布到 vendor\pi\"
+    if (Test-Path (Join-Path $Vendor "pi")) { Remove-Item -Recurse -Force (Join-Path $Vendor "pi") }
+    Move-Item -Path $Payload -Destination (Join-Path $Vendor "pi")
 
     Write-Host "==> 自检"
     $gotVer = (& (Join-Path $Vendor "pi\pi.exe") --version).Trim()
@@ -48,4 +57,5 @@ try {
 }
 finally {
     Remove-Item -Recurse -Force $Tmp -ErrorAction SilentlyContinue
+    if ($Extract) { Remove-Item -Recurse -Force $Extract -ErrorAction SilentlyContinue }
 }
