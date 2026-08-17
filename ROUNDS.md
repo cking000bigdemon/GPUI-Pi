@@ -14,15 +14,16 @@
 | **R6** | 历史消息渲染（静态） | Windows | ✅ 已完成 | [#10](https://github.com/cking000bigdemon/GPUI-Pi/pull/10) | 2026-08-17 |
 | **R7** | 活会话流式 | Windows | ✅ 已完成 | [#13](https://github.com/cking000bigdemon/GPUI-Pi/pull/13) | 2026-08-17 |
 | **R8** | 输入框 / 附件 / slash 面板 | Windows | ✅ 已完成 | [#14](https://github.com/cking000bigdemon/GPUI-Pi/pull/14) | 2026-08-17 |
-| **R9** | 模型 · 思考级别 · 工具预设 | Windows | ⬜ | — | — |
-| **R10** | 文件浏览器 + 查看器 | Windows | ⬜ | — | — |
-| **R11** | git diff / worktree / 本轮改动文件 | Windows | ⬜ | — | — |
-| **R12** | 分支树 · compaction · retry · 导出 | Windows | ⬜ | — | — |
-| **R13** | Extension UI Protocol | Windows | ⬜ | — | — |
-| **R14** | 项目命令环境 bash 扩展（`.ts`） | Windows | ⬜ | — | — |
-| **R15** | 模型配置面板 + 登录 | Windows | ⬜ | — | — |
-| **R16** | 打包分发 | Windows | ⬜ | — | — |
-| **R17** | 1:1 验收 + 文档定稿 | Windows | ⬜ | — | — |
+| **R9** | 前端视觉打磨（依据 [`docs/UI设计规范.md`](docs/UI设计规范.md)，源自 Zed Agent Panel 设计语言调研） | Windows | ⬜ | — | — |
+| **R10** | 模型 · 思考级别 · 工具预设 | Windows | ⬜ | — | — |
+| **R11** | 文件浏览器 + 查看器 | Windows | ⬜ | — | — |
+| **R12** | git diff / worktree / 本轮改动文件 | Windows | ⬜ | — | — |
+| **R13** | 分支树 · compaction · retry · 导出 | Windows | ⬜ | — | — |
+| **R14** | Extension UI Protocol | Windows | ⬜ | — | — |
+| **R15** | 项目命令环境 bash 扩展（`.ts`） | Windows | ⬜ | — | — |
+| **R16** | 模型配置面板 + 登录 | Windows | ⬜ | — | — |
+| **R17** | 打包分发 | Windows | ⬜ | — | — |
+| **R18** | 1:1 验收 + 文档定稿 | Windows | ⬜ | — | — |
 
 ## 里程碑
 
@@ -31,5 +32,5 @@
 | **M0** | R0–R1 | 骨架 + 风险门禁 | R1 四条任一不过 → **停项** |
 | **M1** | R2–R3 | 两个纯逻辑 crate 打通真实 pi | — |
 | **M2** | R4–R8 | **可日用** | 到此为止也是稳定终态 |
-| **M3** | R9–R14 | 功能追平 | — |
-| **M4** | R15–R17 | 交付 | 附录 A 不全绿不发版 |
+| **M3** | R10–R15 | 功能追平 | — |
+| **M4** | R16–R18 | 交付 | 附录 A 不全绿不发版 |
