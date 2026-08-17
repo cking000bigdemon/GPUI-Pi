@@ -15,7 +15,7 @@ use gpui_component::{
     input::{InputEvent, Textarea, TextareaState},
     v_flex,
 };
-use pi_render::{ConversationDocument, LivePhase};
+use pi_render::{ConversationDocument, ConversationItem, LivePhase};
 
 use crate::{
     live_session::{ActiveSession, ComposerMode, PumpMessage, RpcIntent, official_binary},
@@ -30,11 +30,12 @@ pub struct ChatPanel {
     composer: gpui::Entity<TextareaState>,
     composer_mode: ComposerMode,
     list_state: ListState,
-    list_message_ids: Vec<String>,
+    list_item_ids: Vec<String>,
     tail_attached: bool,
     follow_requested: bool,
     minimap_visible: bool,
     expanded_tools: HashSet<String>,
+    expanded_processes: HashSet<String>,
     rpc_error: Option<String>,
     activity_generation: u64,
     calibration_generation: u64,
@@ -96,7 +97,6 @@ impl ChatPanel {
             }
         });
         let list_state = ListState::new(0, ListAlignment::Top, px(1200.));
-        list_state.set_follow_mode(FollowMode::Tail);
         let scroll_state = list_state.clone();
         let panel = cx.weak_entity();
         list_state.set_scroll_handler(move |event, _, cx| {
@@ -122,11 +122,12 @@ impl ChatPanel {
             composer,
             composer_mode: ComposerMode::Steer,
             list_state,
-            list_message_ids: Vec::new(),
+            list_item_ids: Vec::new(),
             tail_attached: true,
             follow_requested: false,
             minimap_visible: true,
             expanded_tools: HashSet::new(),
+            expanded_processes: HashSet::new(),
             rpc_error: None,
             activity_generation: 0,
             calibration_generation: 0,
@@ -157,8 +158,8 @@ impl ChatPanel {
         self.follow_requested = false;
         self.minimap_visible = true;
         self.expanded_tools.clear();
+        self.expanded_processes.clear();
         self.list_state = ListState::new(0, ListAlignment::Top, px(1200.));
-        self.list_state.set_follow_mode(FollowMode::Tail);
         let scroll_state = self.list_state.clone();
         let panel = cx.weak_entity();
         self.list_state.set_scroll_handler(move |event, _, cx| {
@@ -175,7 +176,7 @@ impl ChatPanel {
                 });
             });
         });
-        self.list_message_ids.clear();
+        self.list_item_ids.clear();
         cx.notify();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |panel, cx| {
@@ -209,6 +210,7 @@ impl ChatPanel {
         self.status = match result {
             Ok(document) => {
                 self.sync_list_document(&document);
+                self.list_state.scroll_to_end();
                 ChatStatus::Ready(document)
             }
             Err(message) => ChatStatus::Error { title, message },
@@ -410,18 +412,20 @@ impl ChatPanel {
 
     fn sync_list_document(&mut self, document: &ConversationDocument) {
         let next_ids = document
-            .messages
+            .items
             .iter()
-            .map(|message| message.id.clone())
+            .map(|item| item.id().to_owned())
             .collect::<Vec<_>>();
-        let old_len = self.list_message_ids.len();
+        let old_len = self.list_item_ids.len();
         let shared_prefix = self
-            .list_message_ids
+            .list_item_ids
             .iter()
             .zip(&next_ids)
             .take_while(|(old, new)| old == new)
             .count();
-        if shared_prefix == old_len && next_ids.len() >= old_len {
+        if old_len == 0 {
+            self.list_state.reset(next_ids.len());
+        } else if shared_prefix == old_len && next_ids.len() >= old_len {
             if next_ids.len() > old_len {
                 self.list_state
                     .splice(old_len..old_len, next_ids.len() - old_len);
@@ -437,7 +441,7 @@ impl ChatPanel {
         } else {
             self.list_state.reset(next_ids.len());
         }
-        self.list_message_ids = next_ids;
+        self.list_item_ids = next_ids;
     }
 
     fn toggle_minimap(&mut self, cx: &mut Context<Self>) {
@@ -445,13 +449,28 @@ impl ChatPanel {
         cx.notify();
     }
 
-    fn toggle_tool(&mut self, key: String, cx: &mut Context<Self>) {
+    fn toggle_tool(&mut self, key: String, item_id: String, cx: &mut Context<Self>) {
         if !self.expanded_tools.insert(key.clone()) {
             self.expanded_tools.remove(&key);
         }
-        if let Some((message_id, _)) = key.split_once(':')
-            && let Some(index) = self.list_message_ids.iter().position(|id| id == message_id)
+        if let ChatStatus::Ready(document) = &self.status
+            && let Some(index) = document.items.iter().position(|item| match item {
+                ConversationItem::Message(message) => message.id == item_id,
+                ConversationItem::Process(group) => {
+                    group.messages.iter().any(|message| message.id == item_id)
+                }
+            })
         {
+            self.list_state.remeasure_items(index..index + 1);
+        }
+        cx.notify();
+    }
+
+    fn toggle_process(&mut self, key: String, cx: &mut Context<Self>) {
+        if !self.expanded_processes.insert(key.clone()) {
+            self.expanded_processes.remove(&key);
+        }
+        if let Some(index) = self.list_item_ids.iter().position(|id| id == &key) {
             self.list_state.remeasure_items(index..index + 1);
         }
         cx.notify();
@@ -540,10 +559,19 @@ impl Render for ChatPanel {
                 gpui_pi_ui::ChatWindow::new(document.clone(), self.list_state.clone())
                     .show_minimap(self.minimap_visible)
                     .expanded_tools(Arc::new(self.expanded_tools.clone()))
+                    .expanded_processes(Arc::new(self.expanded_processes.clone()))
                     .on_toggle_tool({
                         let panel = cx.entity();
+                        move |key, item_id, cx| {
+                            panel.update(cx, |panel, cx| {
+                                panel.toggle_tool(key, item_id, cx);
+                            });
+                        }
+                    })
+                    .on_toggle_process({
+                        let panel = cx.entity();
                         move |key, cx| {
-                            panel.update(cx, |panel, cx| panel.toggle_tool(key, cx));
+                            panel.update(cx, |panel, cx| panel.toggle_process(key, cx));
                         }
                     })
                     .on_toggle_minimap({
@@ -763,19 +791,25 @@ mod tests {
             concat!(
                 "{\"type\":\"session\",\"id\":\"rich\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"C:/fixture\"}\n",
                 "{\"type\":\"message\",\"id\":\"u\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"---\\ntitle: Fixture\\ntags: [ui]\\n---\\nhello\"},{\"type\":\"image\",\"data\":\"<redacted>\",\"mimeType\":\"image/png\"}]}}\n",
-                "{\"type\":\"message\",\"id\":\"a\",\"parentId\":\"u\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"# Answer\\n```rust\\nfn main() {}\\n```\\n```mermaid\\ngraph TD; A-->B\\n```\"},{\"type\":\"toolCall\",\"id\":\"tool\",\"name\":\"bash\",\"arguments\":{\"command\":\"cargo test\"}}]}}\n",
-                "{\"type\":\"message\",\"id\":\"r\",\"parentId\":\"a\",\"message\":{\"role\":\"toolResult\",\"toolCallId\":\"tool\",\"toolName\":\"bash\",\"content\":[{\"type\":\"text\",\"text\":\"\\u001b[31mfailed\\u001b[0m\"}],\"details\":{\"patch\":\"--- a/a.rs\\n+++ b/a.rs\\n@@ -1 +1 @@\\n-old\\n+new\"},\"isError\":true}}\n"
+                "{\"type\":\"message\",\"id\":\"trace\",\"parentId\":\"u\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"inspect the fixture\"},{\"type\":\"toolCall\",\"id\":\"tool\",\"name\":\"bash\",\"arguments\":{\"command\":\"cargo test\"}}]}}\n",
+                "{\"type\":\"message\",\"id\":\"r\",\"parentId\":\"trace\",\"message\":{\"role\":\"toolResult\",\"toolCallId\":\"tool\",\"toolName\":\"bash\",\"content\":[{\"type\":\"text\",\"text\":\"\\u001b[31mfailed\\u001b[0m\"}],\"details\":{\"patch\":\"--- a/a.rs\\n+++ b/a.rs\\n@@ -1 +1 @@\\n-old\\n+new\"},\"isError\":true}}\n",
+                "{\"type\":\"message\",\"id\":\"answer\",\"parentId\":\"r\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"# Answer\\n```rust\\nfn main() {}\\n```\\n```mermaid\\ngraph TD; A-->B\\n```\"}]}}\n"
             ),
         )
         .unwrap();
         Arc::new(pi_render::render_path(path).unwrap())
     }
 
-    fn render_status(cx: &mut TestAppContext, status: ChatStatus) -> VisualTestContext {
+    fn render_status_with_panel(
+        cx: &mut TestAppContext,
+        status: ChatStatus,
+    ) -> (VisualTestContext, gpui::Entity<ChatPanel>) {
         cx.update(|cx| {
             gpui_component::init(cx);
             gpui_pi_ui::theme::init_fonts(cx).expect("font init failed");
         });
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let result = captured.clone();
         let handle = cx.open_window(size(gpui::px(520.), gpui::px(480.)), move |window, cx| {
             let panel = cx.new(|cx| {
                 let mut panel = ChatPanel::new(window, cx);
@@ -785,6 +819,7 @@ mod tests {
                 panel.status = status;
                 panel
             });
+            *result.borrow_mut() = Some(panel.clone());
             Root::new(panel, window, cx)
         });
         let mut visual = VisualTestContext::from_window(handle.into(), cx);
@@ -792,7 +827,12 @@ mod tests {
             visual.update(|window, cx| window.draw(cx).clear(cx));
             visual.run_until_parked();
         }
-        visual
+        let panel = captured.borrow().clone().unwrap();
+        (visual, panel)
+    }
+
+    fn render_status(cx: &mut TestAppContext, status: ChatStatus) -> VisualTestContext {
+        render_status_with_panel(cx, status).0
     }
 
     #[gpui::test]
@@ -803,11 +843,51 @@ mod tests {
     }
 
     #[gpui::test]
-    fn ready_chat_renders_virtualized_shell_and_minimap(cx: &mut TestAppContext) {
-        let mut ready = render_status(cx, ChatStatus::Ready(rich_document()));
-        for selector in ["chat-window", "chat-minimap", "live-composer"] {
+    fn ready_chat_folds_completed_process_trace(cx: &mut TestAppContext) {
+        let (mut ready, panel) = render_status_with_panel(cx, ChatStatus::Ready(rich_document()));
+        let scroll = ready.debug_bounds("chat-message-scroll").unwrap();
+        assert!(scroll.size.height > px(0.), "message viewport collapsed");
+        for selector in [
+            "chat-window",
+            "chat-message",
+            "chat-minimap",
+            "process-group",
+            "live-composer",
+        ] {
             assert!(ready.debug_bounds(selector).is_some(), "missing {selector}");
         }
+        for hidden in [
+            "process-group-details",
+            "thinking-card",
+            "thinking-card-details",
+            "tool-card",
+            "tool-card-details",
+        ] {
+            assert!(
+                ready.debug_bounds(hidden).is_none(),
+                "{hidden} must stay lazy while process is collapsed"
+            );
+        }
+        let bounds = ready.debug_bounds("process-group-toggle").unwrap();
+        ready.simulate_click(bounds.center(), gpui::Modifiers::default());
+        for _ in 0..3 {
+            ready.update(|window, cx| window.draw(cx).clear(cx));
+            ready.run_until_parked();
+        }
+        for selector in ["process-group-details", "thinking-card", "tool-card"] {
+            assert!(ready.debug_bounds(selector).is_some(), "missing {selector}");
+        }
+        assert!(ready.debug_bounds("thinking-card-details").is_none());
+        assert!(ready.debug_bounds("tool-card-details").is_none());
+
+        panel.update(cx, |panel, cx| {
+            panel.toggle_tool("trace:thinking:0".to_owned(), "trace".to_owned(), cx);
+        });
+        for _ in 0..2 {
+            ready.update(|window, cx| window.draw(cx).clear(cx));
+            ready.run_until_parked();
+        }
+        assert!(ready.debug_bounds("thinking-card-details").is_some());
     }
 
     #[gpui::test]

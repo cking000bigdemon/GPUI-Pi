@@ -22,14 +22,19 @@ use gpui_component::{
 
 type TailAttachmentHandler = Arc<dyn Fn(bool, &mut Window, &mut App)>;
 type TailDetachHandler = Arc<dyn Fn(&mut Window, &mut App)>;
-type ToolToggleHandler = Arc<dyn Fn(String, &mut App)>;
+type DetailToggleHandler = Arc<dyn Fn(String, String, &mut App)>;
+type ProcessToggleHandler = Arc<dyn Fn(String, &mut App)>;
 type MinimapToggleHandler = Arc<dyn Fn(&mut App)>;
 
 use pi_render::{
-    AnsiColor, AnsiStyle, AnsiText, Block, CodeBlock, ConversationDocument, DiffBlock,
-    DiffLineKind, FrontmatterCard, ImageBlock, ImageState, Message, MessageRole, ToolCard,
-    ToolOutput, ToolStatus,
+    AnsiColor, AnsiStyle, AnsiText, Block, CodeBlock, ConversationDocument, ConversationItem,
+    DiffBlock, DiffLineKind, FrontmatterCard, ImageBlock, ImageState, Message, MessageRole,
+    ProcessGroup, ToolCard, ToolOutput, ToolStatus,
 };
+
+fn detail_key(message_id: &str, block_index: usize, kind: &str) -> String {
+    format!("{message_id}:{kind}:{block_index}")
+}
 
 #[derive(Clone, IntoElement)]
 pub struct ChatWindow {
@@ -38,7 +43,9 @@ pub struct ChatWindow {
     selected_message: Option<String>,
     show_minimap: bool,
     expanded_tools: Arc<HashSet<String>>,
-    on_toggle_tool: Option<ToolToggleHandler>,
+    expanded_processes: Arc<HashSet<String>>,
+    on_toggle_tool: Option<DetailToggleHandler>,
+    on_toggle_process: Option<ProcessToggleHandler>,
     on_toggle_minimap: Option<MinimapToggleHandler>,
     on_tail_attachment_change: Option<TailAttachmentHandler>,
     on_tail_detach: Option<TailDetachHandler>,
@@ -52,7 +59,9 @@ impl ChatWindow {
             selected_message: None,
             show_minimap: true,
             expanded_tools: Arc::new(HashSet::new()),
+            expanded_processes: Arc::new(HashSet::new()),
             on_toggle_tool: None,
+            on_toggle_process: None,
             on_toggle_minimap: None,
             on_tail_attachment_change: None,
             on_tail_detach: None,
@@ -69,8 +78,18 @@ impl ChatWindow {
         self
     }
 
-    pub fn on_toggle_tool(mut self, handler: impl Fn(String, &mut App) + 'static) -> Self {
+    pub fn expanded_processes(mut self, expanded: Arc<HashSet<String>>) -> Self {
+        self.expanded_processes = expanded;
+        self
+    }
+
+    pub fn on_toggle_tool(mut self, handler: impl Fn(String, String, &mut App) + 'static) -> Self {
         self.on_toggle_tool = Some(Arc::new(handler));
+        self
+    }
+
+    pub fn on_toggle_process(mut self, handler: impl Fn(String, &mut App) + 'static) -> Self {
+        self.on_toggle_process = Some(Arc::new(handler));
         self
     }
 
@@ -101,14 +120,16 @@ impl ChatWindow {
 impl gpui::RenderOnce for ChatWindow {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let document = self.document.clone();
-        let message_count = document.messages.len();
+        let item_count = document.items.len();
         let selected_message = self.selected_message.clone();
         let expanded_tools = self.expanded_tools.clone();
+        let expanded_processes = self.expanded_processes.clone();
         let on_toggle_tool = self.on_toggle_tool.clone();
+        let on_toggle_process = self.on_toggle_process.clone();
         let minimap_detach = self.on_tail_detach.clone();
         let minimap_toggle = self.on_toggle_minimap.clone();
         let list_state = self.list_state.clone();
-        let messages = document.messages.clone();
+        let items = document.items.clone();
 
         h_flex()
             .debug_selector(|| "chat-window".into())
@@ -121,22 +142,40 @@ impl gpui::RenderOnce for ChatWindow {
                     .id("chat-message-list-area")
                     .debug_selector(|| "chat-message-scroll".into())
                     .relative()
+                    .h_full()
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
                     .child(
                         list(list_state.clone(), move |index, _, _| {
-                            messages.get(index).map_or_else(
+                            items.get(index).map_or_else(
                                 || div().into_any_element(),
-                                |message| {
-                                    MessageView::new(index, message.clone())
-                                        .selected(selected_message.as_deref() == Some(&message.id))
-                                        .expanded_tools(expanded_tools.clone())
-                                        .on_toggle_tool(on_toggle_tool.clone())
-                                        .into_any_element()
+                                |item| match item {
+                                    ConversationItem::Message(message) => {
+                                        MessageView::new(index, message.clone())
+                                            .selected(
+                                                selected_message.as_deref() == Some(&message.id),
+                                            )
+                                            .expanded_tools(expanded_tools.clone())
+                                            .on_toggle_tool(on_toggle_tool.clone())
+                                            .into_any_element()
+                                    }
+                                    ConversationItem::Process(group) => {
+                                        ProcessGroupView::new(index, group.clone())
+                                            .expanded(
+                                                !group.collapsible
+                                                    || expanded_processes.contains(&group.id),
+                                            )
+                                            .expanded_tools(expanded_tools.clone())
+                                            .on_toggle_tool(on_toggle_tool.clone())
+                                            .on_toggle_process(on_toggle_process.clone())
+                                            .into_any_element()
+                                    }
                                 },
                             )
                         })
+                        .with_sizing_behavior(gpui::ListSizingBehavior::Infer)
+                        .flex_grow_1()
                         .size_full(),
                     )
                     .child(
@@ -147,7 +186,7 @@ impl gpui::RenderOnce for ChatWindow {
             )
             .when(self.show_minimap && !document.minimap.is_empty(), |this| {
                 this.child(
-                    ChatMinimap::new(document.clone(), self.list_state.clone(), message_count)
+                    ChatMinimap::new(document.clone(), self.list_state.clone(), item_count)
                         .selected(self.selected_message)
                         .on_navigate(move |window, cx| {
                             if let Some(handler) = &minimap_detach {
@@ -198,7 +237,7 @@ pub struct MessageView {
     message: Arc<Message>,
     selected: bool,
     expanded_tools: Arc<HashSet<String>>,
-    on_toggle_tool: Option<ToolToggleHandler>,
+    on_toggle_tool: Option<DetailToggleHandler>,
 }
 
 impl MessageView {
@@ -222,7 +261,7 @@ impl MessageView {
         self
     }
 
-    pub fn on_toggle_tool(mut self, handler: Option<ToolToggleHandler>) -> Self {
+    pub fn on_toggle_tool(mut self, handler: Option<DetailToggleHandler>) -> Self {
         self.on_toggle_tool = handler;
         self
     }
@@ -239,6 +278,7 @@ impl gpui::RenderOnce for MessageView {
             MessageRole::Custom => cx.theme().muted_foreground,
         };
         let message_id = self.message.id.clone();
+        let expanded_tools = self.expanded_tools.clone();
         v_flex()
             .id(SharedString::from(format!("message-{message_id}")))
             .debug_selector(|| "chat-message".into())
@@ -288,12 +328,119 @@ impl gpui::RenderOnce for MessageView {
                             block_index,
                             &message_id,
                             block,
-                            &self.expanded_tools,
+                            &expanded_tools,
                             self.on_toggle_tool.clone(),
                             cx,
                         )
                     }),
             )
+    }
+}
+
+#[derive(Clone, IntoElement)]
+pub struct ProcessGroupView {
+    index: usize,
+    group: ProcessGroup,
+    expanded: bool,
+    expanded_tools: Arc<HashSet<String>>,
+    on_toggle_tool: Option<DetailToggleHandler>,
+    on_toggle_process: Option<ProcessToggleHandler>,
+}
+
+impl ProcessGroupView {
+    pub fn new(index: usize, group: ProcessGroup) -> Self {
+        Self {
+            index,
+            group,
+            expanded: false,
+            expanded_tools: Arc::new(HashSet::new()),
+            on_toggle_tool: None,
+            on_toggle_process: None,
+        }
+    }
+
+    pub fn expanded(mut self, expanded: bool) -> Self {
+        self.expanded = expanded;
+        self
+    }
+
+    pub fn expanded_tools(mut self, expanded: Arc<HashSet<String>>) -> Self {
+        self.expanded_tools = expanded;
+        self
+    }
+
+    pub fn on_toggle_tool(mut self, handler: Option<DetailToggleHandler>) -> Self {
+        self.on_toggle_tool = handler;
+        self
+    }
+
+    pub fn on_toggle_process(mut self, handler: Option<ProcessToggleHandler>) -> Self {
+        self.on_toggle_process = handler;
+        self
+    }
+}
+
+impl gpui::RenderOnce for ProcessGroupView {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let group_id = self.group.id.clone();
+        let toggle_id = group_id.clone();
+        let summary = if self.group.tool_call_count == 0 {
+            format!("处理详情 · {} 条消息", self.group.message_count)
+        } else {
+            format!(
+                "处理详情 · {} 条消息 · {} 次工具调用",
+                self.group.message_count, self.group.tool_call_count
+            )
+        };
+        let toggle = self.on_toggle_process.clone();
+        v_flex()
+            .id(SharedString::from(format!("process-group-{group_id}")))
+            .debug_selector(|| "process-group".into())
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .mx_3()
+            .my_1()
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("process-toggle-{toggle_id}")))
+                    .debug_selector(|| "process-group-toggle".into())
+                    .gap_2()
+                    .py_1()
+                    .text_color(cx.theme().muted_foreground)
+                    .when(self.group.collapsible, |row| {
+                        row.cursor_pointer().on_click(move |_, _, cx| {
+                            if let Some(handler) = &toggle {
+                                handler(group_id.clone(), cx);
+                            }
+                        })
+                    })
+                    .child(if self.expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .child(div().text_xs().child(summary)),
+            )
+            .when(self.expanded, |view| {
+                let expanded_tools = self.expanded_tools.clone();
+                let on_toggle_tool = self.on_toggle_tool.clone();
+                view.child(
+                    v_flex()
+                        .debug_selector(|| "process-group-details".into())
+                        .gap_2()
+                        .children(self.group.messages.iter().enumerate().map(
+                            move |(message_index, message)| {
+                                MessageView::new(
+                                    self.index.saturating_mul(10_000) + message_index,
+                                    message.clone(),
+                                )
+                                .expanded_tools(expanded_tools.clone())
+                                .on_toggle_tool(on_toggle_tool.clone())
+                            },
+                        )),
+                )
+            })
     }
 }
 
@@ -396,10 +543,10 @@ impl gpui::RenderOnce for ChatMinimap {
         let message_count = self.message_count;
         let message_indexes = self
             .document
-            .messages
+            .items
             .iter()
             .enumerate()
-            .map(|(index, message)| (message.id.as_str(), index))
+            .map(|(index, item)| (item.id(), index))
             .collect::<HashMap<_, _>>();
         let on_toggle = self.on_toggle.clone();
         v_flex()
@@ -476,7 +623,7 @@ fn render_block(
     message_id: &str,
     block: &Block,
     expanded_tools: &HashSet<String>,
-    on_toggle_tool: Option<ToolToggleHandler>,
+    on_toggle_tool: Option<DetailToggleHandler>,
     cx: &App,
 ) -> gpui::AnyElement {
     match block {
@@ -486,20 +633,18 @@ fn render_block(
         )
         .into_any_element(),
         Block::Code(code) => render_code(index, block_index, code.clone(), cx),
-        Block::Thinking(text) => v_flex()
-            .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("思考"),
-            )
-            .child(safe_markdown(
-                format!("thinking-{index}-{block_index}"),
+        Block::Thinking(text) => {
+            let key = detail_key(message_id, block_index, "thinking");
+            render_thinking(
+                index,
+                block_index,
                 text.clone(),
-            ))
-            .into_any_element(),
+                key.clone(),
+                expanded_tools.contains(&key),
+                on_toggle_tool,
+                cx,
+            )
+        }
         Block::Tool(tool) => {
             let key = tool_key(message_id, block_index, &tool.id);
             render_tool(
@@ -551,12 +696,74 @@ fn render_block(
     }
 }
 
+fn message_item_id(detail_key: &str) -> String {
+    detail_key.split(':').next().unwrap_or_default().to_owned()
+}
+
 fn tool_key(message_id: &str, block_index: usize, tool_id: &str) -> String {
     if tool_id.is_empty() {
-        format!("{message_id}:{block_index}")
+        detail_key(message_id, block_index, "tool")
     } else {
-        format!("{message_id}:{tool_id}")
+        format!("{message_id}:tool:{tool_id}")
     }
+}
+
+fn render_thinking(
+    index: usize,
+    block_index: usize,
+    text: String,
+    key: String,
+    expanded: bool,
+    on_toggle: Option<DetailToggleHandler>,
+    cx: &App,
+) -> gpui::AnyElement {
+    let toggle_key = key.clone();
+    let item_id = message_item_id(&toggle_key);
+    v_flex()
+        .id(SharedString::from(format!("thinking-card-{key}")))
+        .debug_selector(|| "thinking-card".into())
+        .min_w_0()
+        .gap_2()
+        .p_2()
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().border)
+        .child(
+            h_flex()
+                .id(SharedString::from(format!("thinking-toggle-{key}")))
+                .debug_selector(|| "thinking-card-toggle".into())
+                .gap_2()
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    if let Some(handler) = &on_toggle {
+                        handler(toggle_key.clone(), item_id.clone(), cx);
+                    }
+                })
+                .child(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .child(div().text_sm().font_semibold().child("思考"))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if expanded { "收起" } else { "展开" }),
+                ),
+        )
+        .when(expanded, |view| {
+            view.child(
+                div()
+                    .debug_selector(|| "thinking-card-details".into())
+                    .child(safe_markdown(
+                        format!("thinking-{index}-{block_index}"),
+                        text,
+                    )),
+            )
+        })
+        .into_any_element()
 }
 
 fn render_code(index: usize, block_index: usize, code: CodeBlock, cx: &App) -> gpui::AnyElement {
@@ -616,7 +823,7 @@ fn render_tool(
     tool: ToolCard,
     key: String,
     expanded: bool,
-    on_toggle_tool: Option<ToolToggleHandler>,
+    on_toggle_tool: Option<DetailToggleHandler>,
     cx: &App,
 ) -> gpui::AnyElement {
     let (status, color) = match tool.status {
@@ -626,6 +833,7 @@ fn render_tool(
         ToolStatus::Empty => ("empty", cx.theme().muted_foreground),
     };
     let toggle_key = key.clone();
+    let item_id = message_item_id(&toggle_key);
     v_flex()
         .id(SharedString::from(format!("tool-card-{key}")))
         .debug_selector(|| "tool-card".into())
@@ -643,7 +851,7 @@ fn render_tool(
                 .cursor_pointer()
                 .on_click(move |_, _, cx| {
                     if let Some(handler) = &on_toggle_tool {
-                        handler(toggle_key.clone(), cx);
+                        handler(toggle_key.clone(), item_id.clone(), cx);
                     }
                 })
                 .child(if expanded {
@@ -921,8 +1129,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_keys_are_stable_and_fallback_for_missing_ids() {
-        assert_eq!(tool_key("m", 2, "call"), "m:call");
-        assert_eq!(tool_key("m", 2, ""), "m:2");
+    fn detail_keys_are_stable_and_separate_thinking_from_tools() {
+        assert_eq!(tool_key("m", 2, "call"), "m:tool:call");
+        assert_eq!(tool_key("m", 2, ""), "m:tool:2");
+        assert_eq!(detail_key("m", 2, "thinking"), "m:thinking:2");
     }
 }

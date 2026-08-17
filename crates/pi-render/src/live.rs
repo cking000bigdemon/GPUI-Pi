@@ -7,8 +7,9 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use serde_json::Value;
 
 use crate::{
-    Block, ConversationDocument, Message, MessageRole, MinimapNode, NoticeBlock, RenderDiagnostic,
-    ToolCard, ToolOutput, ToolStatus, parse_ansi, parse_unified_diff,
+    Block, ConversationDocument, ConversationItem, Message, MessageRole, MinimapNode, NoticeBlock,
+    RenderDiagnostic, ToolCard, ToolOutput, ToolStatus, parse_ansi, parse_unified_diff,
+    project_conversation,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +213,7 @@ pub struct LiveSessionReducer {
     follow_up: Vec<String>,
     diagnostics: Vec<RenderDiagnostic>,
     cached_messages: Arc<[Arc<Message>]>,
+    cached_items: Arc<[ConversationItem]>,
     cached_minimap: Arc<[MinimapNode]>,
     cached_diagnostics: Arc<[RenderDiagnostic]>,
     structure_dirty: bool,
@@ -226,6 +228,7 @@ impl LiveSessionReducer {
             session_id: history.session_id.clone(),
             source_path: history.source_path.clone(),
             cached_messages: history.messages.clone(),
+            cached_items: history.items.clone(),
             cached_minimap: history.minimap.clone(),
             cached_diagnostics: history.diagnostics.clone(),
             history,
@@ -251,6 +254,7 @@ impl LiveSessionReducer {
             session_id,
             source_path,
             messages: Arc::from([]),
+            items: Arc::from([]),
             minimap: Arc::from([]),
             diagnostics: Arc::from([]),
         })
@@ -338,6 +342,8 @@ impl LiveSessionReducer {
             LiveEvent::AgentEnd => {}
             LiveEvent::AgentSettled => {
                 self.phase = LivePhase::Idle;
+                // 活跃尾 turn 在 settled 后需要从展开态切换为已完成折叠态。
+                self.structure_dirty = true;
                 outcome.settled = true;
             }
             LiveEvent::MessageStart { message } => {
@@ -536,13 +542,9 @@ impl LiveSessionReducer {
     pub fn document(&mut self) -> ConversationDocument {
         let needs_messages = self.structure_dirty || self.draft_dirty;
         if needs_messages {
-            let mut messages = Vec::with_capacity(
-                self.history.messages.len()
-                    + self.completed.len()
-                    + usize::from(self.draft.is_some()),
-            );
-            messages.extend(self.history.messages.iter().cloned());
-            messages.extend(
+            let mut live_messages =
+                Vec::with_capacity(self.completed.len() + usize::from(self.draft.is_some()));
+            live_messages.extend(
                 self.completed
                     .iter()
                     .map(|message| message.rendered.clone()),
@@ -551,9 +553,36 @@ impl LiveSessionReducer {
                 && let Some(message) =
                     render_live_message(&draft.snapshot(), self.completed.len() as u64, &self.tools)
             {
-                messages.push(Arc::new(message));
+                live_messages.push(Arc::new(message));
             }
-            self.cached_minimap = live_minimap(&messages).into();
+
+            // 已校准历史的 turn 投影直接复用；流式帧只重算当前活动片段，
+            // 避免每 20ms 扫描并克隆整段长会话。
+            let active_tail = self.phase != LivePhase::Idle;
+            let (live_items, mut live_minimap) = project_conversation(&live_messages, active_tail);
+            let turn_offset = self
+                .history
+                .minimap
+                .iter()
+                .map(|node| node.turn)
+                .max()
+                .unwrap_or(0);
+            for node in &mut live_minimap {
+                node.turn += turn_offset;
+            }
+            let mut items = Vec::with_capacity(self.history.items.len() + live_items.len());
+            items.extend(self.history.items.iter().cloned());
+            items.extend(live_items);
+            let mut minimap = Vec::with_capacity(self.history.minimap.len() + live_minimap.len());
+            minimap.extend(self.history.minimap.iter().cloned());
+            minimap.extend(live_minimap);
+            let mut messages =
+                Vec::with_capacity(self.history.messages.len() + live_messages.len());
+            messages.extend(self.history.messages.iter().cloned());
+            messages.extend(live_messages);
+
+            self.cached_items = items.into();
+            self.cached_minimap = minimap.into();
             self.cached_messages = messages.into();
             self.structure_dirty = false;
             self.draft_dirty = false;
@@ -570,6 +599,7 @@ impl LiveSessionReducer {
             session_id: self.session_id.clone(),
             source_path: self.source_path.clone(),
             messages: self.cached_messages.clone(),
+            items: self.cached_items.clone(),
             minimap: self.cached_minimap.clone(),
             diagnostics: self.cached_diagnostics.clone(),
         }
@@ -727,32 +757,4 @@ fn append_live_tool_content(content: &Value, name: &str, output: &mut Vec<ToolOu
         Value::Null => {}
         other => output.push(ToolOutput::Text(other.to_string())),
     }
-}
-
-fn live_minimap(messages: &[Arc<Message>]) -> Vec<MinimapNode> {
-    let mut turn = 0;
-    messages
-        .iter()
-        .filter_map(|message| {
-            if message.role == MessageRole::User {
-                turn += 1;
-            }
-            let label = message.blocks.iter().find_map(|block| match block {
-                Block::Markdown(markdown) => markdown
-                    .source
-                    .lines()
-                    .find(|line| !line.trim().is_empty())
-                    .map(str::to_owned),
-                Block::Thinking(text) => Some(text.clone()),
-                _ => None,
-            })?;
-            Some(MinimapNode {
-                message_id: message.id.clone(),
-                turn,
-                role: message.role,
-                label: label.chars().take(80).collect(),
-                level: None,
-            })
-        })
-        .collect()
 }

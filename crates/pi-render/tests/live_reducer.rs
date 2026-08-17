@@ -1,6 +1,6 @@
 use pi_render::{
-    Block, LiveAssistantUpdate, LiveBlockKind, LiveEvent, LivePhase, LiveSessionReducer,
-    ToolOutput, ToolStatus,
+    Block, ConversationItem, LiveAssistantUpdate, LiveBlockKind, LiveEvent, LivePhase,
+    LiveSessionReducer, ToolOutput, ToolStatus,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -189,6 +189,43 @@ fn tool_progress_replaces_accumulated_result_and_queue_snapshot_replaces() {
     };
     assert_eq!(tool.status, ToolStatus::Pending);
     assert!(matches!(&tool.output[0], ToolOutput::Ansi(output) if output.text == "new cumulative"));
+}
+
+#[test]
+fn active_tail_process_stays_expanded_until_settled() {
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.apply(LiveEvent::AgentStart);
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({"id":"u","role":"user","content":"question"}),
+    });
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({
+            "id":"mixed",
+            "role":"assistant",
+            "content":[
+                {"type":"thinking","thinking":"reasoning"},
+                {"type":"text","text":"provisional answer"}
+            ]
+        }),
+    });
+    let running = reducer.document();
+    assert!(matches!(
+        &running.items[1],
+        ConversationItem::Process(group) if !group.collapsible && group.message_count == 1
+    ));
+    assert_eq!(running.minimap.len(), 1);
+
+    reducer.apply(LiveEvent::AgentSettled);
+    let settled = reducer.document();
+    assert!(matches!(
+        &settled.items[1],
+        ConversationItem::Process(group) if group.collapsible
+    ));
+    assert!(matches!(
+        &settled.items[2],
+        ConversationItem::Message(message) if message.id == "mixed"
+    ));
+    assert_eq!(settled.minimap.len(), 2);
 }
 
 #[test]
