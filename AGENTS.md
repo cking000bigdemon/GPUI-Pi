@@ -42,14 +42,9 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
                               commit + 更新 ROUNDS.md + 回填任务卡「本轮实测」
 ```
 
-```bash
-./scripts/validate.sh            # 全量（含 GPUI 编译，慢）
-./scripts/validate.sh --logic    # 只跑 pi-rpc / pi-data / pi-render（快）
-```
-
 ```powershell
-.\scripts\validate.ps1
-.\scripts\validate.ps1 -Logic
+.\scripts\validate.ps1              # 全量（含 GPUI 编译，慢）
+.\scripts\validate.ps1 -Logic       # 只跑 pi-rpc / pi-data / pi-render（快）
 ```
 
 **任何一次迭代结束都必须跑 validate**，不许"看起来对了就下一步"。
@@ -75,11 +70,11 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 
 | 范围 | 执行方 |
 |---|---|
-| R0 工程骨架 | 130 Arch |
+| R0 工程骨架 | 130 Arch（历史；已迁移） |
 | **R1–R18 全部实现、测试、打包** | **Windows** |
-| CI | `windows-latest` 阻断；`ubuntu-latest` 只跑纯逻辑 crate 且非阻断 |
+| CI | `windows-latest` 阻断（唯一 job） |
 
-从 Linux 交叉编译 Windows 的 GPUI 目标**不可行**（DirectX + COM + MSVC 链接器）。R1 起 130 端只做只读工作。
+**项目已迁移为 Windows solo**：不再维护 Linux 构建、不再跑 Linux CI，`ubuntu-latest` 相关 job 已从 `.github/workflows/ci.yml` 移除。所有 `.sh` 脚本与 Linux 分支说明仅为历史遗留，不再维护更新。从 Linux 交叉编译 Windows 的 GPUI 目标**不可行**（DirectX + COM + MSVC 链接器）。
 
 ## crate 分层
 
@@ -105,7 +100,7 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 | 颜色/字体 | 颜色一律走 gpui-component 的 `Theme` 变量，禁止硬编码；字体族按平台条件编译（Windows 微软雅黑/Segoe UI，其余 Noto Sans CJK SC） |
 | 注释 | 中文。写**为什么**，不复述代码在做什么 |
 | clippy | `-D warnings`，不许 `#[allow]` 糊过去；确有必要时必须写明理由 |
-| PowerShell 脚本 | 改完**必须验证**，不许"照 sh 版翻译完就提交"（R0 因此红过一次 CI）。130 上已装 pwsh 7.6.5（`~/.local/bin/pwsh`）：能跑的直接跑，跑不了的至少过一遍语法解析（`[Parser]::ParseFile`） |
+| PowerShell 脚本 | 改完**必须验证**，不许"照 sh 版翻译完就提交"（R0 因此红过一次 CI）：能跑的直接跑，跑不了的至少过一遍语法解析（`[Parser]::ParseFile`） |
 | `$LASTEXITCODE` | PowerShell 只有跑过**外部程序**才写它 —— 调 `.ps1` 且它正常结束时该变量保持旧值、首次调用时是空的。判断成败前先 `$global:LASTEXITCODE = 0`，且被调脚本成功时要显式 `exit 0` |
 
 ## UI 设计规范（每轮必守）
@@ -125,15 +120,15 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 
 | 用途 | 位置 |
 |---|---|
-| 功能对照基线 pi-web 0.8.9 | 固定 `vendor/upstream/pi-web-0.8.9/`；运行 `./scripts/fetch-pi-web.sh` 或 `.\\scripts\\fetch-pi-web.ps1` 准备，身份钉 `v0.8.9` / `2a6e53710f6409e0cceb3de839a62f8cdf3ca3ca`（`pins/pi-web-0.8.9.manifest` 全量校验） |
-| pi 0.84.2 源码（协议、trust 等实现权威参考） | 固定使用 `vendor/upstream/pi-0.84.2/`；运行 `./scripts/fetch-pi-source.sh` 或 `.\\scripts\\fetch-pi-source.ps1` 准备，身份钉 `v0.84.2` / `914cf1472e715297caa30db4b9535d534a9eb718`；禁止引用会自动更新的 Pi Agent 安装目录 |
+| 功能对照基线 pi-web 0.8.9 | 固定 `vendor/upstream/pi-web-0.8.9/`；运行 `.\\scripts\\fetch-pi-web.ps1` 准备，身份钉 `v0.8.9` / `2a6e53710f6409e0cceb3de839a62f8cdf3ca3ca`（`pins/pi-web-0.8.9.manifest` 全量校验） |
+| pi 0.84.2 源码（协议、trust 等实现权威参考） | 固定使用 `vendor/upstream/pi-0.84.2/`；运行 `.\\scripts\\fetch-pi-source.ps1` 准备，身份钉 `v0.84.2` / `914cf1472e715297caa30db4b9535d534a9eb718`；禁止引用会自动更新的 Pi Agent 安装目录 |
 | RPC 协议权威文档 | `vendor/upstream/pi-0.84.2/packages/coding-agent/docs/rpc.md`，或 pi 发布包内 `vendor/pi/docs/rpc.md` |
 | 会话文件格式 | `vendor/upstream/pi-0.84.2/packages/coding-agent/docs/session-format.md`，或 pi 发布包内 `vendor/pi/docs/session-format.md` |
 | 组件库用法 | `git clone --depth 1 https://github.com/longbridge/gpui-component`，看 `crates/story/src/stories/` |
 
 ## 协作
 
-- worktree + PR，分支 `WinClaude/round-NN`（130 端用 `ArchLinuxClaude/round-NN`）；
+- worktree + PR，分支 `WinClaude/round-NN`；
 - `main` 只接 PR，不直推；
 - PR 描述必须贴 validation 的实际回显，不贴不审；
 - **合并后必须验证 main 真的包含那些 commit**（`git log main --oneline` 或 `git branch --contains <sha>`）。R0 合并时踩过：最后一个 commit 已经 push 成功（remote-tracking reflog 有记录），但 `gh pr merge` 用的是 GitHub 侧尚未刷新的 PR head，那个 commit 被静默漏掉，而分支随即被 `--delete-branch` 删了。
