@@ -46,7 +46,7 @@ pub struct ChatPanel {
     composer_cwd: Option<PathBuf>,
     pending_draft_restore: bool,
     list_state: ListState,
-    list_item_ids: Vec<String>,
+    list_items: Vec<ListItemSnapshot>,
     tail_attached: bool,
     follow_requested: bool,
     minimap_visible: bool,
@@ -80,6 +80,37 @@ pub enum ChatStatus {
     Loading { title: String },
     Ready(Arc<ConversationDocument>),
     Error { title: String, message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListItemSnapshot {
+    id: String,
+    is_process: bool,
+    content_identity: usize,
+    collapsible: bool,
+}
+
+impl ListItemSnapshot {
+    fn from_item(item: &ConversationItem) -> Self {
+        match item {
+            ConversationItem::Message(message) => Self {
+                id: message.id.clone(),
+                is_process: false,
+                content_identity: Arc::as_ptr(message) as usize,
+                collapsible: false,
+            },
+            ConversationItem::Process(group) => Self {
+                id: group.id.clone(),
+                is_process: true,
+                content_identity: group.messages.as_ptr() as usize,
+                collapsible: group.collapsible,
+            },
+        }
+    }
+
+    fn same_identity(&self, other: &Self) -> bool {
+        self.id == other.id && self.is_process == other.is_process
+    }
 }
 
 #[cfg(test)]
@@ -136,7 +167,8 @@ impl ChatPanel {
                     _ => {}
                 },
             );
-        let list_state = ListState::new(0, ListAlignment::Top, px(1200.));
+        // 首次静态会话允许一次全量测量，确保长列表首次出现时 scrollbar 即为精确高度。
+        let list_state = ListState::new(0, ListAlignment::Top, px(1200.)).measure_all();
         let scroll_state = list_state.clone();
         let panel = cx.weak_entity();
         list_state.set_scroll_handler(move |event, _, cx| {
@@ -171,7 +203,7 @@ impl ChatPanel {
             composer_cwd: None,
             pending_draft_restore: false,
             list_state,
-            list_item_ids: Vec::new(),
+            list_items: Vec::new(),
             tail_attached: true,
             follow_requested: false,
             minimap_visible: true,
@@ -265,7 +297,8 @@ impl ChatPanel {
         self.minimap_visible = true;
         self.expanded_tools.clear();
         self.expanded_processes.clear();
-        self.list_state = ListState::new(0, ListAlignment::Top, px(1200.));
+        // 新会话使用独立 ListState；首次加载仍只执行一次静态全量测量。
+        self.list_state = ListState::new(0, ListAlignment::Top, px(1200.)).measure_all();
         let scroll_state = self.list_state.clone();
         let panel = cx.weak_entity();
         self.list_state.set_scroll_handler(move |event, _, cx| {
@@ -282,7 +315,7 @@ impl ChatPanel {
                 });
             });
         });
-        self.list_item_ids.clear();
+        self.list_items.clear();
         cx.notify();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |panel, cx| {
@@ -315,7 +348,7 @@ impl ChatPanel {
         }
         self.status = match result {
             Ok(document) => {
-                self.sync_list_document(&document);
+                self.sync_list_document(&document, true);
                 self.list_state.scroll_to_end();
                 ChatStatus::Ready(document)
             }
@@ -408,7 +441,7 @@ impl ChatPanel {
                     self.follow_requested = true;
                 }
                 let document = Arc::new(active.document());
-                self.sync_list_document(&document);
+                self.sync_list_document(&document, outcome.settled);
                 self.status = ChatStatus::Ready(document);
             }
             PumpMessage::RequestFinished {
@@ -484,7 +517,7 @@ impl ChatPanel {
                     Ok(document) => {
                         active.calibrate(document);
                         let document = Arc::new(active.document());
-                        self.sync_list_document(&document);
+                        self.sync_list_document(&document, true);
                         self.status = ChatStatus::Ready(document);
                     }
                     Err(error) => self.rpc_error = Some(format!("会话落盘校准失败：{error}")),
@@ -816,38 +849,44 @@ impl ChatPanel {
         cx.notify();
     }
 
-    fn sync_list_document(&mut self, document: &ConversationDocument) {
-        let next_ids = document
+    fn sync_list_document(&mut self, document: &ConversationDocument, settled: bool) {
+        let next_items = document
             .items
             .iter()
-            .map(|item| item.id().to_owned())
+            .map(ListItemSnapshot::from_item)
             .collect::<Vec<_>>();
-        let old_len = self.list_item_ids.len();
+        let old_len = self.list_items.len();
         let shared_prefix = self
-            .list_item_ids
+            .list_items
             .iter()
-            .zip(&next_ids)
-            .take_while(|(old, new)| old == new)
+            .zip(&next_items)
+            .take_while(|(old, new)| old.same_identity(new))
             .count();
+        let structure_changed =
+            old_len != next_items.len() || shared_prefix < old_len.min(next_items.len());
+
         if old_len == 0 {
-            self.list_state.reset(next_ids.len());
-        } else if shared_prefix == old_len && next_ids.len() >= old_len {
-            if next_ids.len() > old_len {
-                self.list_state
-                    .splice(old_len..old_len, next_ids.len() - old_len);
-            } else if old_len > 0
-                && self
-                    .active
-                    .as_ref()
-                    .is_some_and(|active| active.phase() != LivePhase::Idle)
-            {
-                // 只有流式草稿会改变尾部高度；静态重绘不应反复废弃布局缓存。
-                self.list_state.remeasure_items(old_len - 1..old_len);
-            }
-        } else {
-            self.list_state.reset(next_ids.len());
+            self.list_state.reset(next_items.len());
+        } else if structure_changed {
+            self.list_state.splice(
+                shared_prefix..old_len,
+                next_items.len().saturating_sub(shared_prefix),
+            );
         }
-        self.list_item_ids = next_ids;
+        for (index, (old, new)) in self.list_items.iter().zip(&next_items).enumerate() {
+            if old.same_identity(new)
+                && (old.content_identity != new.content_identity
+                    || old.collapsible != new.collapsible)
+            {
+                self.list_state.splice(index..index + 1, 1);
+            }
+        }
+        self.list_items = next_items;
+
+        if (settled || structure_changed) && self.list_state.is_scrolled_to_end().is_none() {
+            // settled/结构变化后只补齐一次离屏 unknown，流式同项更新不做周期全表测量。
+            let _ = self.list_state.clone().measure_all();
+        }
     }
 
     fn toggle_minimap(&mut self, cx: &mut Context<Self>) {
@@ -867,7 +906,8 @@ impl ChatPanel {
                 }
             })
         {
-            self.list_state.remeasure_items(index..index + 1);
+            // 原位替换只废弃该项，不会重开全量测量。
+            self.list_state.splice(index..index + 1, 1);
         }
         cx.notify();
     }
@@ -876,8 +916,8 @@ impl ChatPanel {
         if !self.expanded_processes.insert(key.clone()) {
             self.expanded_processes.remove(&key);
         }
-        if let Some(index) = self.list_item_ids.iter().position(|id| id == &key) {
-            self.list_state.remeasure_items(index..index + 1);
+        if let Some(index) = self.list_items.iter().position(|item| item.id == key) {
+            self.list_state.splice(index..index + 1, 1);
         }
         cx.notify();
     }
@@ -1360,10 +1400,14 @@ fn session_cwd(path: &std::path::Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{io::Write as _, path::PathBuf};
 
-    use gpui::{AppContext as _, TestAppContext, VisualTestContext, size};
+    use gpui::{
+        AppContext as _, Modifiers, MouseButton, Pixels, Point, TestAppContext, VisualTestContext,
+        point, size,
+    };
     use gpui_component::Root;
+    use pi_render::MessageRole;
 
     use super::*;
 
@@ -1397,6 +1441,278 @@ mod tests {
         Arc::new(pi_render::render_path(path).unwrap())
     }
 
+    fn long_scroll_document() -> Arc<ConversationDocument> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long-scroll.jsonl");
+        let mut fixture = std::fs::File::create(&path).unwrap();
+        writeln!(
+            fixture,
+            r#"{{"type":"session","id":"long-scroll","timestamp":"2026-01-01T00:00:00Z","cwd":"C:/fixture"}}"#
+        )
+        .unwrap();
+
+        let mut parent_id: Option<String> = None;
+        for turn in 0..32 {
+            let user_id = format!("scroll-user-{turn}");
+            let parent = parent_id
+                .as_deref()
+                .map_or_else(|| "null".to_owned(), |id| format!(r#""{id}""#));
+            writeln!(
+                fixture,
+                r#"{{"type":"message","id":"{user_id}","parentId":{parent},"message":{{"role":"user","content":"User turn {turn}"}}}}"#
+            )
+            .unwrap();
+
+            let assistant_id = format!("scroll-assistant-{turn}");
+            let line_count = if turn == 0 { 120 } else { 8 };
+            let content = (0..line_count)
+                .map(|line| format!("Assistant turn {turn}, line {line}"))
+                .collect::<Vec<_>>()
+                .join(r"\n\n");
+            writeln!(
+                fixture,
+                r#"{{"type":"message","id":"{assistant_id}","parentId":"{user_id}","message":{{"role":"assistant","content":"{content}"}}}}"#
+            )
+            .unwrap();
+            parent_id = Some(assistant_id);
+        }
+        drop(fixture);
+
+        Arc::new(pi_render::render_path(path).unwrap())
+    }
+
+    fn markdown_message(
+        id: &str,
+        role: MessageRole,
+        prefix: &str,
+        line_count: usize,
+    ) -> Arc<pi_render::Message> {
+        Arc::new(pi_render::Message {
+            id: id.to_owned(),
+            role,
+            timestamp: None,
+            label: None,
+            blocks: vec![pi_render::Block::Markdown(pi_render::MarkdownBlock {
+                source: (0..line_count)
+                    .map(|line| format!("{prefix} line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            })],
+        })
+    }
+
+    fn replace_message_item(
+        document: &ConversationDocument,
+        index: usize,
+        id: &str,
+        line_count: usize,
+    ) -> Arc<ConversationDocument> {
+        let message = markdown_message(id, MessageRole::Assistant, "Streamed", line_count);
+        let mut messages = document.messages.to_vec();
+        if let ConversationItem::Message(previous) = &document.items[index]
+            && let Some(message_index) = messages
+                .iter()
+                .position(|candidate| candidate.id == previous.id)
+        {
+            messages[message_index] = message.clone();
+        }
+        let mut items = document.items.to_vec();
+        items[index] = ConversationItem::Message(message);
+        Arc::new(ConversationDocument {
+            session_id: document.session_id.clone(),
+            source_path: document.source_path.clone(),
+            messages: messages.into(),
+            items: items.into(),
+            minimap: document.minimap.clone(),
+            diagnostics: document.diagnostics.clone(),
+        })
+    }
+
+    fn active_tail_document() -> Arc<ConversationDocument> {
+        let user = markdown_message("tail-user", MessageRole::User, "Question", 1);
+        let process_message = Arc::new(pi_render::Message {
+            id: "tail-trace".to_owned(),
+            role: MessageRole::Assistant,
+            timestamp: None,
+            label: None,
+            blocks: vec![pi_render::Block::Thinking(
+                (0..160)
+                    .map(|line| format!("Expanded process detail {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            )],
+        });
+        let process = pi_render::ProcessGroup {
+            id: "process-tail-user".to_owned(),
+            messages: Arc::from([process_message.clone()]),
+            message_count: 1,
+            tool_call_count: 0,
+            collapsible: false,
+        };
+        Arc::new(ConversationDocument {
+            session_id: "active-tail".to_owned(),
+            source_path: PathBuf::from("active-tail.jsonl"),
+            messages: Arc::from([user.clone(), process_message]),
+            items: Arc::from([
+                ConversationItem::Message(user),
+                ConversationItem::Process(process),
+            ]),
+            minimap: Arc::from([]),
+            diagnostics: Arc::from([]),
+        })
+    }
+
+    fn settled_tail_document() -> Arc<ConversationDocument> {
+        let active = active_tail_document();
+        let user = match &active.items[0] {
+            ConversationItem::Message(message) => message.clone(),
+            ConversationItem::Process(_) => unreachable!(),
+        };
+        let process = match &active.items[1] {
+            ConversationItem::Process(group) => pi_render::ProcessGroup {
+                collapsible: true,
+                ..group.clone()
+            },
+            ConversationItem::Message(_) => unreachable!(),
+        };
+        let answer = markdown_message("tail-answer", MessageRole::Assistant, "Final answer", 40);
+        let mut messages = active.messages.to_vec();
+        messages.push(answer.clone());
+        Arc::new(ConversationDocument {
+            session_id: active.session_id.clone(),
+            source_path: active.source_path.clone(),
+            messages: messages.into(),
+            items: Arc::from([
+                ConversationItem::Message(user),
+                ConversationItem::Process(process),
+                ConversationItem::Message(answer),
+            ]),
+            minimap: Arc::from([]),
+            diagnostics: Arc::from([]),
+        })
+    }
+
+    fn draw_frames(visual: &mut VisualTestContext, count: usize) {
+        for _ in 0..count {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.run_until_parked();
+        }
+    }
+
+    fn start_scrollbar_thumb_drag(
+        visual: &mut VisualTestContext,
+        panel: &gpui::Entity<ChatPanel>,
+        cx: &mut TestAppContext,
+    ) -> Point<Pixels> {
+        let scroll_bounds = visual.debug_bounds("chat-message-scroll").unwrap();
+        let (scroll_max, offset_before_down) = panel.read_with(cx, |panel, _| {
+            (
+                panel.list_state.max_offset_for_scrollbar().y,
+                panel.list_state.scroll_px_offset_for_scrollbar().y,
+            )
+        });
+        assert!(scroll_max > px(0.), "fixture must be scrollable");
+        let viewport_height = scroll_bounds.size.height;
+        let content_height = viewport_height + scroll_max;
+        let thumb_height = (viewport_height / content_height * viewport_height).max(px(48.));
+        let thumb_travel = viewport_height - thumb_height;
+        let scroll_percentage = (-offset_before_down / scroll_max).clamp(0., 1.);
+        let thumb = point(
+            scroll_bounds.right() - px(8.),
+            scroll_bounds.top() + thumb_travel * scroll_percentage + thumb_height / 2.,
+        );
+
+        visual.simulate_mouse_move(thumb, None, Modifiers::default());
+        visual.simulate_mouse_down(thumb, MouseButton::Left, Modifiers::default());
+        let offset_after_down = panel.read_with(cx, |panel, _| {
+            panel.list_state.scroll_px_offset_for_scrollbar().y
+        });
+        assert_eq!(
+            offset_after_down, offset_before_down,
+            "pressing the thumb must not trigger a scrollbar track jump"
+        );
+
+        point(
+            scroll_bounds.right() - px(8.),
+            scroll_bounds.bottom() - px(4.),
+        )
+    }
+
+    fn finish_scrollbar_drag_to_bottom(
+        visual: &mut VisualTestContext,
+        panel: &gpui::Entity<ChatPanel>,
+        cx: &mut TestAppContext,
+        near_track_bottom: Point<Pixels>,
+    ) {
+        draw_frames(visual, 1);
+        let offset_before_move = panel.read_with(cx, |panel, _| {
+            panel.list_state.scroll_px_offset_for_scrollbar().y
+        });
+        visual.simulate_mouse_move(
+            near_track_bottom,
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        let offset_after_first_move = panel.read_with(cx, |panel, _| {
+            panel.list_state.scroll_px_offset_for_scrollbar().y
+        });
+        // 首次 move 可能被 Scrollbar 帧率限制挡住；补发一次不同位置的 pressed move，
+        // 但不在按住期间额外 draw，避免拖拽几何被中途重建。
+        let second_drag_position =
+            point(near_track_bottom.x - px(1.), near_track_bottom.y + px(16.));
+        visual.simulate_mouse_move(
+            second_drag_position,
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        visual.run_until_parked();
+        let offset_after_move = panel.read_with(cx, |panel, _| {
+            panel.list_state.scroll_px_offset_for_scrollbar().y
+        });
+        assert!(
+            offset_after_first_move != offset_before_move
+                || offset_after_move != offset_before_move,
+            "pressed mouse move must drag the thumb rather than act as a track click"
+        );
+
+        visual.simulate_mouse_up(near_track_bottom, MouseButton::Left, Modifiers::default());
+        panel.update(cx, |panel, _| {
+            assert!(!panel.list_state.is_scrollbar_dragging());
+        });
+        draw_frames(visual, 4);
+    }
+
+    fn drag_scrollbar_to_bottom(
+        visual: &mut VisualTestContext,
+        panel: &gpui::Entity<ChatPanel>,
+        cx: &mut TestAppContext,
+    ) {
+        let near_track_bottom = start_scrollbar_thumb_drag(visual, panel, cx);
+        finish_scrollbar_drag_to_bottom(visual, panel, cx, near_track_bottom);
+        if panel.read_with(cx, |panel, _| panel.list_state.is_scrolled_to_end()) != Some(true) {
+            // unknown 高度在首个拖拽跨帧补测后可能增长；用新几何再拖一次即可到真实底部。
+            let near_track_bottom = start_scrollbar_thumb_drag(visual, panel, cx);
+            finish_scrollbar_drag_to_bottom(visual, panel, cx, near_track_bottom);
+        }
+    }
+
+    fn assert_drag_reached_last_item(
+        panel: &gpui::Entity<ChatPanel>,
+        last_item_index: usize,
+        cx: &mut TestAppContext,
+    ) {
+        panel.update(cx, |panel, _| {
+            assert_eq!(panel.list_state.is_scrolled_to_end(), Some(true));
+            let last_bounds = panel
+                .list_state
+                .bounds_for_item(last_item_index)
+                .expect("last item must be laid out after dragging to the bottom");
+            let viewport = panel.list_state.viewport_bounds();
+            assert!(last_bounds.top() < viewport.bottom());
+            assert!(last_bounds.bottom() > viewport.top());
+        });
+    }
+
     fn render_status_with_panel(
         cx: &mut TestAppContext,
         status: ChatStatus,
@@ -1411,7 +1727,7 @@ mod tests {
             let panel = cx.new(|cx| {
                 let mut panel = ChatPanel::new(window, cx);
                 if let ChatStatus::Ready(document) = &status {
-                    panel.sync_list_document(document);
+                    panel.sync_list_document(document, true);
                 }
                 panel.status = status;
                 panel
@@ -1437,6 +1753,123 @@ mod tests {
         let mut empty = render_status(cx, ChatStatus::Empty);
         assert!(empty.debug_bounds("chat-empty-or-loading").is_some());
         assert!(empty.debug_bounds("live-composer").is_some());
+    }
+
+    #[gpui::test]
+    fn scrollbar_thumb_drag_reaches_end_of_long_variable_height_chat(cx: &mut TestAppContext) {
+        let document = long_scroll_document();
+        let last_item_index = document.items.len() - 1;
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document));
+        panel.update(cx, |panel, _| {
+            // 未修复时这里允许 None，确保测试仍执行真实 drag，并在最终到不了底时失败。
+            assert_ne!(panel.list_state.is_scrolled_to_end(), Some(true));
+            assert_ne!(
+                panel.list_state.item_is_below_viewport(last_item_index),
+                Some(false),
+                "last message must begin outside the viewport or remain unknown"
+            );
+        });
+
+        let near_track_bottom = start_scrollbar_thumb_drag(&mut visual, &panel, cx);
+        panel.update(cx, |panel, _| {
+            assert!(panel.list_state.is_scrollbar_dragging());
+        });
+        finish_scrollbar_drag_to_bottom(&mut visual, &panel, cx, near_track_bottom);
+        assert_drag_reached_last_item(&panel, last_item_index, cx);
+    }
+
+    #[gpui::test]
+    fn offscreen_same_id_growth_is_measured_when_scrollbar_drag_starts(cx: &mut TestAppContext) {
+        let document = long_scroll_document();
+        let last_item_index = document.items.len() - 1;
+        let last_item_id = document.items[last_item_index].id().to_owned();
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document.clone()));
+        let grown = replace_message_item(&document, last_item_index, &last_item_id, 160);
+        panel.update(cx, |panel, cx| {
+            panel.sync_list_document(&grown, false);
+            panel.status = ChatStatus::Ready(grown.clone());
+            assert_eq!(panel.list_state.is_scrolled_to_end(), None);
+            cx.notify();
+        });
+        draw_frames(&mut visual, 1);
+
+        drag_scrollbar_to_bottom(&mut visual, &panel, cx);
+        assert_drag_reached_last_item(&panel, last_item_index, cx);
+    }
+
+    #[gpui::test]
+    fn settled_active_tail_invalidates_retained_process_and_measures_new_answer(
+        cx: &mut TestAppContext,
+    ) {
+        let history = long_scroll_document();
+        let active_tail = active_tail_document();
+        let settled_tail = settled_tail_document();
+        let mut active_items = history.items.to_vec();
+        active_items.extend(active_tail.items.iter().cloned());
+        let active = Arc::new(ConversationDocument {
+            session_id: history.session_id.clone(),
+            source_path: history.source_path.clone(),
+            messages: history.messages.clone(),
+            items: active_items.into(),
+            minimap: history.minimap.clone(),
+            diagnostics: history.diagnostics.clone(),
+        });
+        let mut settled_items = history.items.to_vec();
+        // settled 投影保留同一个 User Arc；Process 身份保留但折叠，并新增 Answer。
+        settled_items.push(active_tail.items[0].clone());
+        settled_items.extend(settled_tail.items[1..].iter().cloned());
+        let settled = Arc::new(ConversationDocument {
+            session_id: history.session_id.clone(),
+            source_path: history.source_path.clone(),
+            messages: history.messages.clone(),
+            items: settled_items.into(),
+            minimap: history.minimap.clone(),
+            diagnostics: history.diagnostics.clone(),
+        });
+        let process_index = history.items.len() + 1;
+        let last_item_index = settled.items.len() - 1;
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(active));
+        panel.update(cx, |panel, cx| {
+            panel.sync_list_document(&settled, true);
+            panel.status = ChatStatus::Ready(settled.clone());
+            assert!(panel.list_items[process_index].collapsible);
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        panel.update(cx, |panel, _| {
+            assert_eq!(
+                panel.list_state.item_is_below_viewport(last_item_index),
+                Some(true)
+            );
+        });
+
+        drag_scrollbar_to_bottom(&mut visual, &panel, cx);
+        assert_drag_reached_last_item(&panel, last_item_index, cx);
+    }
+
+    #[gpui::test]
+    fn real_process_and_detail_toggles_render_details(cx: &mut TestAppContext) {
+        let document = rich_document();
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document));
+
+        let process_toggle = visual.debug_bounds("process-group-toggle").unwrap();
+        visual.simulate_click(process_toggle.center(), Modifiers::default());
+        draw_frames(&mut visual, 2);
+        assert!(visual.debug_bounds("process-group-details").is_some());
+        assert!(visual.debug_bounds("thinking-card").is_some());
+        assert!(visual.debug_bounds("tool-card").is_some());
+
+        panel.update(cx, |panel, cx| {
+            panel.toggle_tool("trace:thinking:0".to_owned(), "trace".to_owned(), cx);
+        });
+        draw_frames(&mut visual, 2);
+        assert!(visual.debug_bounds("thinking-card-details").is_some());
+
+        panel.update(cx, |panel, cx| {
+            panel.toggle_tool("trace:tool:tool".to_owned(), "trace".to_owned(), cx);
+        });
+        draw_frames(&mut visual, 2);
+        assert!(visual.debug_bounds("tool-card-details").is_some());
     }
 
     #[gpui::test]
@@ -1499,7 +1932,7 @@ mod tests {
             let panel = cx.new(|cx| {
                 let mut panel = ChatPanel::new(window, cx);
                 let document = rich_document();
-                panel.sync_list_document(&document);
+                panel.sync_list_document(&document, true);
                 panel.status = ChatStatus::Ready(document);
                 *result.borrow_mut() = Some(cx.entity());
                 panel
