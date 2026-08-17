@@ -9,6 +9,14 @@ use gpui_component::{
     ActiveTheme as _, StyledExt as _, WindowExt as _, dialog::DialogButtonProps, h_flex,
     scroll::ScrollableElement as _, text::TextView, v_flex,
 };
+type TailAttachmentHandler = Arc<dyn Fn(bool, &mut Window, &mut App)>;
+
+type TailDetachHandler = Arc<dyn Fn(&mut Window, &mut App)>;
+
+fn tail_attached_after_wheel(current: bool, delta_y: gpui::Pixels) -> bool {
+    current && delta_y <= px(0.)
+}
+
 use pi_render::{
     AnsiColor, AnsiStyle, AnsiText, Block, CodeBlock, ConversationDocument, DiffBlock,
     DiffLineKind, FrontmatterCard, ImageBlock, ImageState, Message, MessageRole, ToolCard,
@@ -20,6 +28,9 @@ pub struct ChatWindow {
     document: Arc<ConversationDocument>,
     scroll_handle: ScrollHandle,
     selected_message: Option<String>,
+    follow_tail: bool,
+    on_tail_attachment_change: Option<TailAttachmentHandler>,
+    on_tail_detach: Option<TailDetachHandler>,
 }
 
 impl ChatWindow {
@@ -28,7 +39,33 @@ impl ChatWindow {
             document,
             scroll_handle: ScrollHandle::new(),
             selected_message: None,
+            follow_tail: false,
+            on_tail_attachment_change: None,
+            on_tail_detach: None,
         }
+    }
+
+    pub fn with_scroll_handle(mut self, scroll_handle: ScrollHandle) -> Self {
+        self.scroll_handle = scroll_handle;
+        self
+    }
+
+    pub fn follow_tail(mut self, follow: bool) -> Self {
+        self.follow_tail = follow;
+        self
+    }
+
+    pub fn on_tail_attachment_change(
+        mut self,
+        handler: impl Fn(bool, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_tail_attachment_change = Some(Arc::new(handler));
+        self
+    }
+
+    pub fn on_tail_detach(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_tail_detach = Some(Arc::new(handler));
+        self
     }
 
     pub fn selected_message(mut self, id: impl Into<String>) -> Self {
@@ -42,6 +79,13 @@ impl gpui::RenderOnce for ChatWindow {
         let document = self.document.clone();
         let message_count = document.messages.len();
         let minimap_scroll = self.scroll_handle.clone();
+        let follow_scroll = self.scroll_handle.clone();
+        if self.follow_tail && message_count > 0 {
+            follow_scroll.scroll_to_bottom();
+        }
+        let attachment_scroll = self.scroll_handle.clone();
+        let attachment_handler = self.on_tail_attachment_change.clone();
+        let minimap_detach = self.on_tail_detach.clone();
         h_flex()
             .debug_selector(|| "chat-window".into())
             .size_full()
@@ -57,6 +101,26 @@ impl gpui::RenderOnce for ChatWindow {
                     .min_h_0()
                     .gap_3()
                     .track_scroll(&self.scroll_handle)
+                    .on_scroll_wheel(move |event, window, cx| {
+                        if let Some(handler) = &attachment_handler {
+                            let attached =
+                                tail_attached_after_wheel(true, event.delta.pixel_delta(px(20.)).y);
+                            if !attached {
+                                handler(false, window, cx);
+                            } else {
+                                window.defer(cx, {
+                                    let scroll = attachment_scroll.clone();
+                                    let handler = handler.clone();
+                                    move |window, cx| {
+                                        let attached = (scroll.offset().y - scroll.max_offset().y)
+                                            .abs()
+                                            <= px(2.);
+                                        handler(attached, window, cx);
+                                    }
+                                });
+                            }
+                        }
+                    })
                     .overflow_y_scrollbar()
                     .p_3()
                     .children(
@@ -73,7 +137,12 @@ impl gpui::RenderOnce for ChatWindow {
             .when(!document.minimap.is_empty(), |this| {
                 this.child(
                     ChatMinimap::new(document.clone(), minimap_scroll, message_count)
-                        .selected(self.selected_message),
+                        .selected(self.selected_message)
+                        .on_navigate(move |window, cx| {
+                            if let Some(handler) = &minimap_detach {
+                                handler(window, cx);
+                            }
+                        }),
                 )
             })
     }
@@ -82,12 +151,12 @@ impl gpui::RenderOnce for ChatWindow {
 #[derive(Clone, IntoElement)]
 pub struct MessageView {
     index: usize,
-    message: Message,
+    message: Arc<Message>,
     selected: bool,
 }
 
 impl MessageView {
-    pub fn new(index: usize, message: Message) -> Self {
+    pub fn new(index: usize, message: Arc<Message>) -> Self {
         Self {
             index,
             message,
@@ -151,7 +220,8 @@ impl gpui::RenderOnce for MessageView {
             .children(
                 self.message
                     .blocks
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .enumerate()
                     .map(|(block_index, block)| render_block(self.index, block_index, block, cx)),
             )
@@ -217,6 +287,7 @@ pub struct ChatMinimap {
     scroll_handle: ScrollHandle,
     message_count: usize,
     selected_message: Option<String>,
+    on_navigate: Option<TailDetachHandler>,
 }
 
 impl ChatMinimap {
@@ -230,11 +301,17 @@ impl ChatMinimap {
             scroll_handle,
             message_count,
             selected_message: None,
+            on_navigate: None,
         }
     }
 
     pub fn selected(mut self, selected: Option<String>) -> Self {
         self.selected_message = selected;
+        self
+    }
+
+    pub fn on_navigate(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_navigate = Some(Arc::new(handler));
         self
     }
 }
@@ -265,6 +342,7 @@ impl gpui::RenderOnce for ChatMinimap {
                     .unwrap_or(0)
                     .min(message_count.saturating_sub(1));
                 let scroll = self.scroll_handle.clone();
+                let on_navigate = self.on_navigate.clone();
                 div()
                     .id(SharedString::from(format!("minimap-{id}")))
                     .debug_selector(|| "chat-minimap-node".into())
@@ -277,7 +355,12 @@ impl gpui::RenderOnce for ChatMinimap {
                     .cursor_pointer()
                     .when(selected, |item| item.bg(cx.theme().accent.opacity(0.16)))
                     .hover(|item| item.bg(cx.theme().muted))
-                    .on_click(move |_, _, _| scroll.scroll_to_top_of_item(message_index))
+                    .on_click(move |_, window, cx| {
+                        scroll.scroll_to_top_of_item(message_index);
+                        if let Some(handler) = &on_navigate {
+                            handler(window, cx);
+                        }
+                    })
                     .child(node.label.clone())
             }))
     }
@@ -670,5 +753,17 @@ fn role_label(role: MessageRole) -> &'static str {
         MessageRole::Compaction => "Compaction",
         MessageRole::BranchSummary => "Branch summary",
         MessageRole::Unknown => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upward_wheel_detaches_tail_but_downward_wheel_keeps_it() {
+        assert!(!tail_attached_after_wheel(true, px(1.)));
+        assert!(tail_attached_after_wheel(true, px(-1.)));
+        assert!(!tail_attached_after_wheel(false, px(-1.)));
     }
 }

@@ -31,7 +31,70 @@ fn main() {
         let id = value.get("id").cloned().unwrap_or(Value::Null);
         let command = value["type"].as_str().unwrap();
         if command == "prompt" {
+            let message = value["message"].as_str().unwrap_or_default();
+            if message == "stream" {
+                writeln!(stdout, "{}", json!({"type":"agent_start"})).unwrap();
+                writeln!(
+                    stdout,
+                    "{}",
+                    json!({"type":"message_start","message":{"role":"assistant","content":[]}})
+                )
+                .unwrap();
+                for index in 0..1500 {
+                    writeln!(stdout, "{}", json!({
+                        "type":"message_update",
+                        "usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},
+                        "assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":if index == 1499 {"done"} else {"x"}}
+                    })).unwrap();
+                }
+                writeln!(stdout, "{}", json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"authoritative"}]}})).unwrap();
+                writeln!(
+                    stdout,
+                    "{}",
+                    json!({"type":"agent_end","messages":[],"willRetry":false})
+                )
+                .unwrap();
+                writeln!(stdout, "{}", json!({"type":"agent_settled"})).unwrap();
+                let response = json!({"id":id,"type":"response","command":command,"success":true});
+                writeln!(stdout, "{response}").unwrap();
+                stdout.flush().unwrap();
+                continue;
+            }
+            if message == "queue" {
+                writeln!(stdout, "{}", json!({"type":"agent_start"})).unwrap();
+                writeln!(
+                    stdout,
+                    "{}",
+                    json!({"type":"queue_update","steering":["first"],"followUp":["later"]})
+                )
+                .unwrap();
+                writeln!(
+                    stdout,
+                    "{}",
+                    json!({"type":"queue_update","steering":["replacement"],"followUp":[]})
+                )
+                .unwrap();
+                writeln!(stdout, "{}", json!({"type":"agent_settled"})).unwrap();
+                let response = json!({"id":id,"type":"response","command":command,"success":true});
+                writeln!(stdout, "{response}").unwrap();
+                stdout.flush().unwrap();
+                continue;
+            }
             thread::sleep(Duration::from_secs(60));
+            continue;
+        }
+        if command == "abort" {
+            writeln!(stdout, "{}", json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"aborted tail"}],"stopReason":"aborted"}})).unwrap();
+            writeln!(
+                stdout,
+                "{}",
+                json!({"type":"agent_end","messages":[],"willRetry":false})
+            )
+            .unwrap();
+            writeln!(stdout, "{}", json!({"type":"agent_settled"})).unwrap();
+            let response = json!({"id":id,"type":"response","command":command,"success":true});
+            writeln!(stdout, "{response}").unwrap();
+            stdout.flush().unwrap();
             continue;
         }
         if command == "set_session_name" && value["name"] == "emit_many" {

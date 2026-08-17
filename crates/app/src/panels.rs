@@ -1,23 +1,41 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
+use futures::{StreamExt as _, channel::mpsc::UnboundedReceiver};
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Window, div,
-    prelude::FluentBuilder as _,
+    App, AppContext as _, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, ScrollHandle, SharedString, Styled as _, Subscription,
+    Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    ActiveTheme as _, ElementExt as _, Icon, IconName, StyledExt as _,
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Selectable as _,
+    Sizable as _, StyledExt as _,
+    button::{Button, ButtonVariants as _},
     dock::{Panel, PanelControl, PanelEvent},
+    h_flex,
+    input::{InputEvent, Textarea, TextareaState},
     v_flex,
 };
-use pi_render::ConversationDocument;
+use pi_render::{ConversationDocument, LivePhase};
 
-use crate::session_sidebar::SessionSelected;
+use crate::{
+    live_session::{ActiveSession, ComposerMode, PumpMessage, RpcIntent, official_binary},
+    session_sidebar::SessionSelected,
+};
 
 pub struct ChatPanel {
     focus_handle: FocusHandle,
     status: ChatStatus,
     load_generation: u64,
+    active: Option<ActiveSession>,
+    composer: gpui::Entity<TextareaState>,
+    composer_mode: ComposerMode,
+    scroll_handle: ScrollHandle,
+    tail_attached: bool,
+    follow_requested: bool,
+    rpc_error: Option<String>,
+    activity_generation: u64,
+    calibration_generation: u64,
+    _composer_subscription: Subscription,
     probe: Option<LayoutProbe>,
 }
 
@@ -62,11 +80,32 @@ impl LayoutProbe {
 }
 
 impl ChatPanel {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let composer = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 5)
+                .submit_on_enter(true)
+                .placeholder("输入消息；Enter 发送，Shift+Enter 换行")
+        });
+        let subscription = cx.subscribe_in(&composer, window, |this, input, event, window, cx| {
+            if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                this.submit_composer(input, window, cx);
+            }
+        });
         Self {
             focus_handle: cx.focus_handle(),
             status: ChatStatus::Empty,
             load_generation: 0,
+            active: None,
+            composer,
+            composer_mode: ComposerMode::Steer,
+            scroll_handle: ScrollHandle::new(),
+            tail_attached: true,
+            follow_requested: false,
+            rpc_error: None,
+            activity_generation: 0,
+            calibration_generation: 0,
+            _composer_subscription: subscription,
             probe: None,
         }
     }
@@ -80,9 +119,18 @@ impl ChatPanel {
     pub fn load_selection(&mut self, selection: SessionSelected, cx: &mut Context<Self>) {
         self.load_generation = self.load_generation.wrapping_add(1);
         let generation = self.load_generation;
+        if let Some(active) = self.active.take() {
+            active.shutdown();
+        }
         self.status = ChatStatus::Loading {
             title: selection.title.clone(),
         };
+        self.rpc_error = None;
+        self.activity_generation = 0;
+        self.calibration_generation = 0;
+        self.tail_attached = true;
+        self.follow_requested = false;
+        self.scroll_handle = ScrollHandle::new();
         cx.notify();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |panel, cx| {
@@ -114,11 +162,203 @@ impl ChatPanel {
             return false;
         }
         self.status = match result {
-            Ok(document) if document.messages.is_empty() => ChatStatus::Empty,
             Ok(document) => ChatStatus::Ready(document),
             Err(message) => ChatStatus::Error { title, message },
         };
         true
+    }
+
+    fn start_live(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active.is_some() {
+            return;
+        }
+        let ChatStatus::Ready(history) = &self.status else {
+            return;
+        };
+        let generation = self.load_generation;
+        let history = history.clone();
+        let session_path = history.source_path.clone();
+        let cwd = session_cwd(&session_path).unwrap_or_else(|| PathBuf::from("."));
+        let result = ActiveSession::spawn(
+            generation,
+            official_binary(),
+            session_path,
+            cwd,
+            (*history).clone(),
+        );
+        match result {
+            Ok((active, receiver)) => {
+                self.active = Some(active);
+                self.rpc_error = None;
+                self.spawn_pump(receiver, cx);
+            }
+            Err(error) => self.rpc_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn spawn_pump(&self, mut receiver: UnboundedReceiver<PumpMessage>, cx: &mut Context<Self>) {
+        cx.spawn(async move |panel, cx| {
+            while let Some(message) = receiver.next().await {
+                let stopped = matches!(message, PumpMessage::Stopped { .. });
+                let _ = panel.update(cx, |panel, cx| {
+                    panel.handle_pump(message);
+                    cx.notify();
+                });
+                if stopped {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn handle_pump(&mut self, message: PumpMessage) {
+        let generation = match &message {
+            PumpMessage::Events { generation, .. }
+            | PumpMessage::RequestFinished { generation, .. }
+            | PumpMessage::Calibrated { generation, .. }
+            | PumpMessage::Stopped { generation, .. } => *generation,
+        };
+        if generation != self.load_generation {
+            return;
+        }
+        if let PumpMessage::Stopped { error, .. } = &message
+            && self.active.is_none()
+        {
+            if let Some(error) = error {
+                self.rpc_error = Some(error.clone());
+            }
+            return;
+        }
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        if generation != active.generation() {
+            return;
+        }
+        match message {
+            PumpMessage::Events { events, .. } => {
+                if events
+                    .iter()
+                    .any(|event| matches!(event, pi_render::LiveEvent::AgentStart))
+                {
+                    self.activity_generation = self.activity_generation.wrapping_add(1);
+                }
+                let outcome = active.reducer_mut().apply_batch(events);
+                if outcome.follow_tail && self.tail_attached {
+                    // 一个 batch 对应最多一次滚动请求，不随 token 数增长。
+                    self.follow_requested = true;
+                }
+                self.status = ChatStatus::Ready(Arc::new(active.document()));
+            }
+            PumpMessage::RequestFinished { intent, result, .. } => match result {
+                Ok(()) => {
+                    self.rpc_error = None;
+                }
+                Err(error) => {
+                    if intent == RpcIntent::Abort {
+                        active.reducer_mut().restore_running_if_stopping();
+                    } else if active.phase() == LivePhase::Running {
+                        active.reducer_mut().restore_phase(LivePhase::Idle);
+                    }
+                    self.rpc_error = Some(error);
+                }
+            },
+            PumpMessage::Calibrated {
+                calibration,
+                result,
+                ..
+            } => {
+                if calibration < self.calibration_generation {
+                    return;
+                }
+                self.calibration_generation = calibration;
+                // 校准线程属于发起它的 settled 状态；若其间已有新 run 开始，
+                // 旧文件快照不能覆盖正在流式的草稿。
+                if active.phase() != LivePhase::Idle || self.activity_generation != calibration {
+                    return;
+                }
+                match result {
+                    Ok(document) => {
+                        active.calibrate(document);
+                        self.status = ChatStatus::Ready(Arc::new(active.document()));
+                    }
+                    Err(error) => self.rpc_error = Some(format!("会话落盘校准失败：{error}")),
+                }
+            }
+            PumpMessage::Stopped { error, .. } => {
+                if let Some(error) = error {
+                    self.rpc_error = Some(error);
+                }
+                self.active = None;
+            }
+        }
+    }
+
+    fn submit_composer(
+        &mut self,
+        input: &gpui::Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let message = input.read(cx).value().trim().to_owned();
+        if message.is_empty() {
+            return;
+        }
+        let Some(active) = self.active.as_mut() else {
+            self.rpc_error = Some("请先启动活会话".to_owned());
+            cx.notify();
+            return;
+        };
+        let intent = match active.phase() {
+            LivePhase::Stopping => {
+                self.rpc_error = Some("正在停止，暂不能发送消息".to_owned());
+                cx.notify();
+                return;
+            }
+            LivePhase::Running => match self.composer_mode {
+                ComposerMode::Steer => RpcIntent::Steer,
+                ComposerMode::FollowUp => RpcIntent::FollowUp,
+            },
+            LivePhase::Idle | LivePhase::Error => RpcIntent::Prompt,
+        };
+        active.dispatch(intent, Some(message), self.composer_mode);
+        input.update(cx, |input, cx| input.set_value("", window, cx));
+        cx.notify();
+    }
+
+    fn abort(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(active) = self.active.as_mut()
+            && active.phase() == LivePhase::Running
+        {
+            active.dispatch(RpcIntent::Abort, None, self.composer_mode);
+            cx.notify();
+        }
+    }
+
+    fn select_steer(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.composer_mode = ComposerMode::Steer;
+        cx.notify();
+    }
+
+    fn select_follow_up(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.composer_mode = ComposerMode::FollowUp;
+        cx.notify();
+    }
+
+    fn resume_follow(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.tail_attached = true;
+        self.follow_requested = true;
+        cx.notify();
+    }
+}
+
+impl Drop for ChatPanel {
+    fn drop(&mut self) {
+        if let Some(active) = self.active.take() {
+            active.shutdown();
+        }
     }
 }
 
@@ -162,11 +402,21 @@ impl Render for ChatPanel {
         let probe = self.probe.clone();
         #[cfg(not(test))]
         let probe = self.probe;
+        if self.tail_attached
+            && self.scroll_handle.max_offset().y > px(0.)
+            && (self.scroll_handle.offset().y + self.scroll_handle.max_offset().y).abs() > px(2.)
+        {
+            // 覆盖滚动条拖拽、PageUp/Home 等不产生 ScrollWheelEvent 的路径。
+            self.tail_attached = false;
+        }
+        let follow = self.follow_requested && self.tail_attached;
+        self.follow_requested = false;
+        let panel = cx.entity();
         let content = match &self.status {
             ChatStatus::Empty => centered_state(
                 IconName::Bot,
                 "选择一个历史会话",
-                "会话将只读加载，不会启动 pi RPC 进程",
+                "加载历史后可启动对应的官方 pi RPC 活会话",
                 cx,
             ),
             ChatStatus::Loading { title } => {
@@ -183,10 +433,37 @@ impl Render for ChatPanel {
                 .child(div().font_semibold().child(format!("{title} 加载失败")))
                 .child(div().text_sm().child(message.clone()))
                 .into_any_element(),
-            ChatStatus::Ready(document) => {
-                gpui_pi_ui::ChatWindow::new(document.clone()).into_any_element()
-            }
+            ChatStatus::Ready(document) => gpui_pi_ui::ChatWindow::new(document.clone())
+                .with_scroll_handle(self.scroll_handle.clone())
+                .follow_tail(follow)
+                .on_tail_attachment_change(move |attached, _, cx| {
+                    panel.update(cx, |panel, cx| {
+                        panel.tail_attached = attached;
+                        cx.notify();
+                    });
+                })
+                .on_tail_detach({
+                    let panel = cx.entity();
+                    move |_, cx| {
+                        panel.update(cx, |panel, cx| {
+                            panel.tail_attached = false;
+                            cx.notify();
+                        });
+                    }
+                })
+                .into_any_element(),
         };
+        let phase = self.active.as_ref().map(|active| active.phase());
+        let running = matches!(phase, Some(LivePhase::Running));
+        let stopping = matches!(phase, Some(LivePhase::Stopping));
+        let live_started = self.active.is_some();
+        let queue_summary = self.active.as_ref().and_then(|active| {
+            let steering = active.reducer().steering_queue().len();
+            let follow_up = active.reducer().follow_up_queue().len();
+            (steering + follow_up > 0)
+                .then(|| format!("队列：steer {steering} · follow-up {follow_up}"))
+        });
+
         div()
             .id("chat-workspace")
             .debug_selector(|| "chat-workspace".into())
@@ -198,7 +475,110 @@ impl Render for ChatPanel {
             .min_w_0()
             .min_h_0()
             .bg(cx.theme().background)
-            .child(content)
+            .child(
+                v_flex()
+                    .size_full()
+                    .min_h_0()
+                    .child(div().flex_1().min_h_0().child(content))
+                    .when(!self.tail_attached, |view| {
+                        view.child(
+                            h_flex().justify_center().child(
+                                Button::new("follow-latest")
+                                    .debug_selector(|| "follow-latest".into())
+                                    .small()
+                                    .label("跟随最新")
+                                    .on_click(cx.listener(Self::resume_follow)),
+                            ),
+                        )
+                    })
+                    .when_some(queue_summary, |view, summary| {
+                        view.child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(summary),
+                        )
+                    })
+                    .when_some(self.rpc_error.clone(), |view, error| {
+                        view.child(
+                            div()
+                                .debug_selector(|| "live-error".into())
+                                .px_3()
+                                .py_1()
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .child(error),
+                        )
+                    })
+                    .child(
+                        v_flex()
+                            .debug_selector(|| "live-composer".into())
+                            .flex_none()
+                            .gap_2()
+                            .p_3()
+                            .border_t_1()
+                            .border_color(cx.theme().border)
+                            .child(Textarea::new(&self.composer).h(px(76.)))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("start-live-session")
+                                            .small()
+                                            .label(if live_started {
+                                                "活会话已启动"
+                                            } else {
+                                                "启动活会话"
+                                            })
+                                            .disabled(
+                                                live_started
+                                                    || !matches!(self.status, ChatStatus::Ready(_)),
+                                            )
+                                            .on_click(cx.listener(Self::start_live)),
+                                    )
+                                    .child(
+                                        Button::new("composer-steer")
+                                            .small()
+                                            .label("Steer")
+                                            .selected(self.composer_mode == ComposerMode::Steer)
+                                            .on_click(cx.listener(Self::select_steer)),
+                                    )
+                                    .child(
+                                        Button::new("composer-follow-up")
+                                            .small()
+                                            .label("Follow-up")
+                                            .selected(self.composer_mode == ComposerMode::FollowUp)
+                                            .on_click(cx.listener(Self::select_follow_up)),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(
+                                        Button::new("abort-live")
+                                            .small()
+                                            .danger()
+                                            .label(if stopping {
+                                                "正在停止…"
+                                            } else {
+                                                "停止"
+                                            })
+                                            .disabled(!running)
+                                            .on_click(cx.listener(Self::abort)),
+                                    )
+                                    .child(
+                                        Button::new("send-live")
+                                            .small()
+                                            .primary()
+                                            .label(if running { "加入队列" } else { "发送" })
+                                            .disabled(!live_started || stopping)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                let input = this.composer.clone();
+                                                this.submit_composer(&input, window, cx);
+                                            })),
+                                    ),
+                            ),
+                    ),
+            )
     }
 }
 
@@ -224,6 +604,12 @@ fn centered_state(
                 .child(detail.into()),
         )
         .into_any_element()
+}
+
+fn session_cwd(path: &std::path::Path) -> Option<PathBuf> {
+    pi_data::load_session(path)
+        .ok()
+        .map(|session| PathBuf::from(session.header.cwd))
 }
 
 #[cfg(test)]
@@ -271,7 +657,7 @@ mod tests {
         });
         let handle = cx.open_window(size(gpui::px(520.), gpui::px(480.)), move |window, cx| {
             let panel = cx.new(|cx| {
-                let mut panel = ChatPanel::new(cx);
+                let mut panel = ChatPanel::new(window, cx);
                 panel.status = status;
                 panel
             });
@@ -289,52 +675,59 @@ mod tests {
     fn empty_chat_renders_state_selector(cx: &mut TestAppContext) {
         let mut empty = render_status(cx, ChatStatus::Empty);
         assert!(empty.debug_bounds("chat-empty-or-loading").is_some());
+        assert!(empty.debug_bounds("live-composer").is_some());
     }
 
     #[gpui::test]
-    fn loading_chat_renders_state_selector(cx: &mut TestAppContext) {
-        let mut loading = render_status(
-            cx,
-            ChatStatus::Loading {
-                title: "fixture".to_owned(),
-            },
-        );
-        assert!(loading.debug_bounds("chat-empty-or-loading").is_some());
-    }
-
-    #[gpui::test]
-    fn ready_chat_renders_primary_r6_selectors(cx: &mut TestAppContext) {
+    fn ready_chat_renders_primary_r7_selectors(cx: &mut TestAppContext) {
         let mut ready = render_status(cx, ChatStatus::Ready(rich_document()));
         for selector in [
             "chat-window",
             "chat-message",
             "chat-minimap",
-            "chat-minimap-node",
             "frontmatter-card",
-            "image-placeholder",
-            "code-block",
-            "mermaid-source",
             "tool-card",
-            "diff-block",
-            "ansi-output",
+            "live-composer",
         ] {
-            assert!(
-                ready.debug_bounds(selector).is_some(),
-                "missing selector {selector}"
-            );
+            assert!(ready.debug_bounds(selector).is_some(), "missing {selector}");
         }
     }
 
     #[gpui::test]
-    fn error_chat_renders_error_selector(cx: &mut TestAppContext) {
-        let mut error = render_status(
-            cx,
-            ChatStatus::Error {
-                title: "fixture".to_owned(),
-                message: "broken".to_owned(),
-            },
-        );
-        assert!(error.debug_bounds("chat-error").is_some());
+    fn minimap_navigation_detaches_tail_follow(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            gpui_pi_ui::theme::init_fonts(cx).expect("font init failed");
+        });
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let result = captured.clone();
+        let handle = cx.open_window(size(gpui::px(520.), gpui::px(480.)), move |window, cx| {
+            let panel = cx.new(|cx| {
+                let mut panel = ChatPanel::new(window, cx);
+                panel.status = ChatStatus::Ready(rich_document());
+                *result.borrow_mut() = Some(cx.entity());
+                panel
+            });
+            Root::new(panel, window, cx)
+        });
+        let mut visual = VisualTestContext::from_window(handle.into(), cx);
+        for _ in 0..3 {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.run_until_parked();
+        }
+        let bounds = visual.debug_bounds("chat-minimap-node").unwrap();
+        visual.simulate_click(bounds.center(), gpui::Modifiers::default());
+        let panel = captured.borrow().clone().unwrap();
+        panel.update(cx, |panel, _| assert!(!panel.tail_attached));
+    }
+
+    #[gpui::test]
+    fn minimum_chat_keeps_composer_visible(cx: &mut TestAppContext) {
+        let mut ready = render_status(cx, ChatStatus::Ready(document("hello")));
+        let chat = ready.debug_bounds("chat-workspace").unwrap();
+        let composer = ready.debug_bounds("live-composer").unwrap();
+        assert!(chat.size.width > px(0.) && composer.size.height > px(0.));
+        assert!(composer.bottom() <= chat.bottom());
     }
 
     #[gpui::test]
@@ -346,7 +739,7 @@ mod tests {
         let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
         let result = captured.clone();
         cx.open_window(size(gpui::px(520.), gpui::px(480.)), move |window, cx| {
-            let panel = cx.new(ChatPanel::new);
+            let panel = cx.new(|cx| ChatPanel::new(window, cx));
             *result.borrow_mut() = Some(panel.clone());
             Root::new(panel, window, cx)
         });

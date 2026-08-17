@@ -2468,6 +2468,7 @@ name = "gpui-pi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
@@ -2475,6 +2476,7 @@ dependencies = [
  "gpui_platform",
  "pi-data",
  "pi-render",
+ "pi-rpc",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -4789,6 +4791,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
 ]

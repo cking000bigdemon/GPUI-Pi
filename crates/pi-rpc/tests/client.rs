@@ -59,6 +59,26 @@ fn correlates_concurrent_requests_and_drains_stderr() {
 }
 
 #[test]
+fn initial_session_is_used_by_the_first_spawn() {
+    let initial = std::env::temp_dir().join(format!(
+        "pi-rpc-initial-session-{}.jsonl",
+        std::process::id()
+    ));
+    let mut child_config = config();
+    child_config.initial_session = Some(initial.clone());
+    let client = Client::spawn(child_config).unwrap();
+    let state: RpcSessionState = client
+        .request_data(Command::GetState, Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(
+        state.session_file.as_deref().map(PathBuf::from),
+        Some(initial.clone())
+    );
+    assert_eq!(client.resume_session(), Some(initial));
+    client.shutdown().unwrap();
+}
+
+#[test]
 fn crash_fails_old_pending_then_restarts_with_session() {
     let client = Client::spawn(config()).unwrap();
     let events = client.subscribe();
@@ -181,29 +201,91 @@ fn shutdown_kills_a_child_that_does_not_handle_stdin_eof() {
 }
 
 #[test]
-fn slow_event_subscribers_are_disconnected() {
+fn burst_subscription_keeps_authoritative_tail_events() {
     let client = Client::spawn(config()).unwrap();
-    let slow = client.subscribe();
+    let events = client.subscribe();
     let response = client
         .request(
-            Command::SetSessionName {
-                name: "emit_many".into(),
+            Command::Prompt {
+                message: "stream".into(),
+                images: None,
+                streaming_behavior: None,
             },
             Duration::from_secs(5),
         )
         .unwrap();
     assert!(response.success);
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        match slow.recv_timeout(Duration::from_millis(20)) {
-            Ok(_) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                client.shutdown().unwrap();
-                return;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut updates = 0;
+    let mut saw_message_end = false;
+    let mut saw_agent_end = false;
+    let mut saw_settled = false;
+    while Instant::now() < deadline && !saw_settled {
+        if let Ok(ClientEvent::Rpc(event)) = events.recv_timeout(Duration::from_millis(50)) {
+            match *event {
+                pi_rpc::RpcEvent::MessageUpdate { .. } => updates += 1,
+                pi_rpc::RpcEvent::MessageEnd { .. } => saw_message_end = true,
+                pi_rpc::RpcEvent::AgentEnd { .. } => saw_agent_end = true,
+                pi_rpc::RpcEvent::AgentSettled => saw_settled = true,
+                _ => {}
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
-    panic!("slow subscriber was not disconnected after its bounded buffer filled");
+    assert_eq!(updates, 1500);
+    assert!(saw_message_end && saw_agent_end && saw_settled);
+    client.shutdown().unwrap();
+}
+
+#[test]
+fn fake_queue_and_abort_emit_settled_tails() {
+    let client = Client::spawn(config()).unwrap();
+    let events = client.subscribe();
+    client
+        .request(
+            Command::Prompt {
+                message: "queue".into(),
+                images: None,
+                streaming_behavior: Some(pi_rpc::StreamingBehavior::FollowUp),
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    let mut queue_snapshots = Vec::new();
+    let mut settled = 0;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && settled == 0 {
+        if let Ok(ClientEvent::Rpc(event)) = events.recv_timeout(Duration::from_millis(50)) {
+            match *event {
+                pi_rpc::RpcEvent::QueueUpdate {
+                    steering,
+                    follow_up,
+                } => {
+                    queue_snapshots.push((steering, follow_up));
+                }
+                pi_rpc::RpcEvent::AgentSettled => settled += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(queue_snapshots.len(), 2);
+    assert_eq!(queue_snapshots[1].0, ["replacement"]);
+    assert!(queue_snapshots[1].1.is_empty());
+
+    client
+        .request(Command::Abort, Duration::from_secs(2))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut abort_message_end = false;
+    while Instant::now() < deadline {
+        if let Ok(ClientEvent::Rpc(event)) = events.recv_timeout(Duration::from_millis(50)) {
+            match *event {
+                pi_rpc::RpcEvent::MessageEnd { .. } => abort_message_end = true,
+                pi_rpc::RpcEvent::AgentSettled => break,
+                _ => {}
+            }
+        }
+    }
+    assert!(abort_message_end);
+    client.shutdown().unwrap();
 }

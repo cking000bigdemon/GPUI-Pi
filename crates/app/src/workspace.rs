@@ -66,7 +66,7 @@ impl Workspace {
             panel
         });
         let workspace = cx.new(|cx| {
-            let panel = ChatPanel::new(cx);
+            let panel = ChatPanel::new(window, cx);
             #[cfg(test)]
             if let Some(probe) = probe.clone() {
                 return panel.with_probe(probe);

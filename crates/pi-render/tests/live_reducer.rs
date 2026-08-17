@@ -1,0 +1,240 @@
+use pi_render::{
+    Block, LiveAssistantUpdate, LiveBlockKind, LiveEvent, LivePhase, LiveSessionReducer,
+    ToolOutput, ToolStatus,
+};
+use serde_json::json;
+use std::sync::Arc;
+
+#[test]
+fn assembles_multiple_blocks_and_message_end_is_authoritative() {
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.apply_batch([
+        LiveEvent::AgentStart,
+        LiveEvent::MessageStart {
+            message: json!({"role":"assistant","content":[]}),
+        },
+        LiveEvent::MessageUpdate(LiveAssistantUpdate::BlockStart {
+            index: 1,
+            kind: LiveBlockKind::Text,
+        }),
+        LiveEvent::MessageUpdate(LiveAssistantUpdate::BlockDelta {
+            index: 1,
+            kind: LiveBlockKind::Text,
+            delta: "draft".into(),
+        }),
+        LiveEvent::MessageUpdate(LiveAssistantUpdate::BlockStart {
+            index: 0,
+            kind: LiveBlockKind::Thinking,
+        }),
+        LiveEvent::MessageUpdate(LiveAssistantUpdate::BlockEnd {
+            index: 0,
+            kind: LiveBlockKind::Thinking,
+            content: json!("final thought"),
+        }),
+    ]);
+    let draft = reducer.document();
+    assert!(
+        matches!(&draft.messages[0].blocks[0], Block::Thinking(text) if text == "final thought")
+    );
+    assert!(
+        matches!(&draft.messages[0].blocks[1], Block::Markdown(text) if text.source == "draft")
+    );
+
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({
+            "id":"authoritative",
+            "role":"assistant",
+            "content":[{"type":"text","text":"final snapshot"}]
+        }),
+    });
+    let final_document = reducer.document();
+    assert_eq!(final_document.messages[0].id, "authoritative");
+    assert!(
+        matches!(&final_document.messages[0].blocks[0], Block::Markdown(text) if text.source == "final snapshot")
+    );
+}
+
+#[test]
+fn user_start_and_end_upsert_by_stable_run_identity() {
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.apply(LiveEvent::AgentStart);
+    reducer.apply(LiveEvent::MessageStart {
+        message: json!({
+            "role":"user",
+            "content":"hello",
+            "timestamp":"start-only"
+        }),
+    });
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({
+            "role":"user",
+            "content":[{"type":"text","text":"hello"}],
+            "timestamp":"authoritative",
+            "providerMetadata":{"different":true}
+        }),
+    });
+    let document = reducer.document();
+    assert_eq!(document.messages.len(), 1);
+    assert_eq!(
+        document.messages[0].timestamp.as_deref(),
+        Some("authoritative")
+    );
+}
+
+#[test]
+fn optimistic_running_then_agent_start_still_advances_run_identity() {
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.set_running();
+    reducer.apply(LiveEvent::AgentStart);
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({"role":"user","content":"first"}),
+    });
+    reducer.apply(LiveEvent::AgentSettled);
+
+    reducer.set_running();
+    reducer.apply(LiveEvent::AgentStart);
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({"role":"user","content":"second"}),
+    });
+
+    let document = reducer.document();
+    assert_eq!(document.messages.len(), 2);
+    assert!(
+        matches!(&document.messages[0].blocks[0], Block::Markdown(text) if text.source == "first")
+    );
+    assert!(
+        matches!(&document.messages[1].blocks[0], Block::Markdown(text) if text.source == "second")
+    );
+}
+
+#[test]
+fn same_run_distinct_user_messages_do_not_overwrite_each_other() {
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.set_running();
+    reducer.apply(LiveEvent::AgentStart);
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({"role":"user","content":"original prompt"}),
+    });
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({"role":"user","content":"steer message"}),
+    });
+
+    let document = reducer.document();
+    assert_eq!(document.messages.len(), 2);
+}
+
+#[test]
+fn completed_history_is_arc_cached_across_draft_frames() {
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.apply(LiveEvent::AgentStart);
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({
+            "id":"completed",
+            "role":"assistant",
+            "content":[{"type":"text","text":"fixed"}]
+        }),
+    });
+    let completed = reducer.document().messages[0].clone();
+    for delta in ["a", "b", "c"] {
+        reducer.apply(LiveEvent::MessageUpdate(LiveAssistantUpdate::BlockDelta {
+            index: 0,
+            kind: LiveBlockKind::Text,
+            delta: delta.to_owned(),
+        }));
+        let frame = reducer.document();
+        assert!(Arc::ptr_eq(&completed, &frame.messages[0]));
+    }
+}
+
+#[test]
+fn tool_progress_replaces_accumulated_result_and_queue_snapshot_replaces() {
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({
+            "role":"assistant",
+            "content":[{"type":"toolCall","id":"call","name":"bash","arguments":{"command":"test"}}]
+        }),
+    });
+    reducer.apply(LiveEvent::ToolExecutionStart {
+        id: "call".into(),
+        name: "bash".into(),
+        arguments: json!({"command":"test"}),
+    });
+    reducer.apply(LiveEvent::ToolExecutionUpdate {
+        id: "call".into(),
+        name: "bash".into(),
+        arguments: json!({"command":"test"}),
+        partial_result: json!({"content":[{"type":"text","text":"old"}]}),
+    });
+    reducer.apply(LiveEvent::ToolExecutionUpdate {
+        id: "call".into(),
+        name: "bash".into(),
+        arguments: json!({"command":"test"}),
+        partial_result: json!({"content":[{"type":"text","text":"new cumulative"}]}),
+    });
+    reducer.apply(LiveEvent::QueueUpdate {
+        steering: vec!["one".into(), "two".into()],
+        follow_up: vec!["later".into()],
+    });
+    reducer.apply(LiveEvent::QueueUpdate {
+        steering: vec!["replacement".into()],
+        follow_up: Vec::new(),
+    });
+
+    assert_eq!(reducer.steering_queue(), ["replacement"]);
+    assert!(reducer.follow_up_queue().is_empty());
+    let document = reducer.document();
+    let Block::Tool(tool) = &document.messages[0].blocks[0] else {
+        panic!("expected tool")
+    };
+    assert_eq!(tool.status, ToolStatus::Pending);
+    assert!(matches!(&tool.output[0], ToolOutput::Ansi(output) if output.text == "new cumulative"));
+}
+
+#[test]
+fn agent_end_is_not_idle_abort_waits_for_settled() {
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.apply(LiveEvent::AgentStart);
+    assert_eq!(reducer.phase(), LivePhase::Running);
+    reducer.set_stopping();
+    reducer.apply(LiveEvent::AgentEnd);
+    assert_eq!(reducer.phase(), LivePhase::Stopping);
+    let outcome = reducer.apply(LiveEvent::AgentSettled);
+    assert!(outcome.settled);
+    assert_eq!(reducer.phase(), LivePhase::Idle);
+}
+
+#[test]
+fn abort_error_restores_running_only_while_stopping() {
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.set_stopping();
+    assert!(reducer.restore_running_if_stopping());
+    assert_eq!(reducer.phase(), LivePhase::Running);
+
+    reducer.apply(LiveEvent::AgentSettled);
+    assert!(!reducer.restore_running_if_stopping());
+    assert_eq!(reducer.phase(), LivePhase::Idle);
+}
+
+#[test]
+fn out_of_order_and_burst_updates_degrade_safely() {
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    let mut events = Vec::new();
+    for _ in 0..2048 {
+        events.push(LiveEvent::MessageUpdate(LiveAssistantUpdate::BlockDelta {
+            index: 0,
+            kind: LiveBlockKind::Text,
+            delta: "x".into(),
+        }));
+    }
+    events.push(LiveEvent::AgentEnd);
+    events.push(LiveEvent::AgentSettled);
+    let outcome = reducer.apply_batch(events);
+    assert!(outcome.settled);
+    assert_eq!(reducer.phase(), LivePhase::Idle);
+    let document = reducer.document();
+    assert!(
+        matches!(&document.messages[0].blocks[0], Block::Markdown(text) if text.source.len() == 2048)
+    );
+    assert!(!document.diagnostics.is_empty());
+}

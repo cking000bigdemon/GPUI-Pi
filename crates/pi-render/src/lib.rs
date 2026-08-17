@@ -5,10 +5,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use pi_data::{EntryBase, SessionEntry, SessionFile};
 use serde_json::Value;
+
+mod live;
+pub use live::{
+    LiveAssistantUpdate, LiveBlockKind, LiveEvent, LivePhase, LiveSessionReducer, ReduceOutcome,
+};
 
 const MAX_TEXT_CHARS: usize = 512 * 1024;
 const MAX_IMAGE_BASE64_CHARS: usize = 8 * 1024 * 1024;
@@ -19,9 +25,10 @@ const PREVIEW_CHARS: usize = 240;
 pub struct ConversationDocument {
     pub session_id: String,
     pub source_path: PathBuf,
-    pub messages: Vec<Message>,
-    pub minimap: Vec<MinimapNode>,
-    pub diagnostics: Vec<RenderDiagnostic>,
+    /// 文档快照共享已定稿历史，流式帧只复制 Arc 与当前草稿，不深拷贝全部消息。
+    pub messages: Arc<[Arc<Message>]>,
+    pub minimap: Arc<[MinimapNode]>,
+    pub diagnostics: Arc<[RenderDiagnostic]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,7 +237,7 @@ impl ConversationDocument {
             diagnostics: self.diagnostics.len(),
             ..DocumentStats::default()
         };
-        for message in &self.messages {
+        for message in self.messages.iter() {
             stats.blocks += message.blocks.len();
             for block in &message.blocks {
                 match block {
@@ -252,7 +259,7 @@ impl ConversationDocument {
 
     pub fn text_snapshot(&self) -> String {
         let mut out = String::new();
-        for message in &self.messages {
+        for message in self.messages.iter() {
             out.push_str(&format!("[{:#?}] {}\n", message.role, message.id));
             for block in &message.blocks {
                 snapshot_block(block, &mut out);
@@ -260,7 +267,7 @@ impl ConversationDocument {
         }
         if !self.minimap.is_empty() {
             out.push_str("[Minimap]\n");
-            for node in &self.minimap {
+            for node in self.minimap.iter() {
                 out.push_str(&format!(
                     "{}:{}:{}\n",
                     node.turn, node.message_id, node.label
@@ -419,9 +426,13 @@ pub fn render_session(session: &SessionFile) -> ConversationDocument {
     ConversationDocument {
         session_id: session.header.id.clone(),
         source_path: session.path.clone(),
-        messages,
-        minimap,
-        diagnostics,
+        messages: messages
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>()
+            .into(),
+        minimap: minimap.into(),
+        diagnostics: diagnostics.into(),
     }
 }
 
