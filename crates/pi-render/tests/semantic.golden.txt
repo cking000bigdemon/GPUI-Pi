@@ -1,0 +1,33 @@
+[User] user
+  frontmatter:title=Some("R6 semantic"),tags=["render", "static"],rows=[("author", "Pi")]
+  markdown:Hello **Markdown**
+  image:Redacted:图片数据已脱敏
+[Custom] custom
+  markdown:custom visible
+[Compaction] compact
+  notice:上下文压缩 · 120 tokens:compact summary
+[BranchSummary] branch
+  notice:分支摘要 · from user:branch summary
+[Assistant] assistant
+  thinking:reasoning
+  markdown:# Answer
+Body
+  code:rust:fn main() {}
+  code:mermaid(source):graph TD; A-->B
+  tool:edit:edit-1:Success:src/main.rs
+    diff:parsed:1 files
+    output:edited
+  tool:bash:bash-1:Error:cargo test
+    ansi:failed
+    image:Remote:远程图片未自动联网加载
+  tool:read:pending-1:Pending:missing
+  tool:bash:bash-execution:Success:echo direct
+    ansi:direct
+[Unknown] orphan
+  tool:future:orphan-1:Success:未找到对应 assistant toolCall
+    output:orphan visible
+[Unknown] future
+  unknown:future_entry:{"id":"future","parentId":"orphan","payload":{"visible":true},"type":"future_entry"}
+[Minimap]
+1:user:Hello **Markdown**
+1:assistant:Answer

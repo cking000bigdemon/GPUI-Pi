@@ -12,9 +12,9 @@ use gpui_component::{
 };
 use gpui_pi_ui::{AppShell, WorkspaceTabBar, theme};
 
+use crate::panels::ChatPanel;
 #[cfg(test)]
 use crate::panels::LayoutProbe;
-use crate::panels::PlaceholderPanel;
 use crate::session_sidebar::{SessionSelected, SessionSidebar};
 use crate::trust_prompt::prompt_project_trust;
 
@@ -66,7 +66,7 @@ impl Workspace {
             panel
         });
         let workspace = cx.new(|cx| {
-            let panel = PlaceholderPanel::workspace(cx);
+            let panel = ChatPanel::new(cx);
             #[cfg(test)]
             if let Some(probe) = probe.clone() {
                 return panel.with_probe(probe);
@@ -75,7 +75,7 @@ impl Workspace {
         });
 
         dock_area.update(cx, |dock_area, cx| {
-            dock_area.set_center(DockItem::panel(Arc::new(workspace)), window, cx);
+            dock_area.set_center(DockItem::panel(Arc::new(workspace.clone())), window, cx);
             dock_area.set_left_dock(
                 DockItem::panel(Arc::new(sidebar.clone())),
                 Some(px(SIDEBAR_WIDTH)),
@@ -99,12 +99,18 @@ impl Workspace {
             theme::sync_system_theme(window, cx);
             cx.notify();
         });
-        let session_subscription =
-            cx.subscribe(&sidebar, |workspace, _, event: &SessionSelected, cx| {
+        let chat_panel = workspace.clone();
+        let session_subscription = cx.subscribe(
+            &sidebar,
+            move |workspace, _, event: &SessionSelected, cx| {
                 workspace.selected_directory = Some(event.cwd.clone());
                 workspace.selected_session = Some(event.clone());
+                chat_panel.update(cx, |panel, cx| {
+                    panel.load_selection(event.clone(), cx);
+                });
                 cx.notify();
-            });
+            },
+        );
 
         Self {
             dock_area,
