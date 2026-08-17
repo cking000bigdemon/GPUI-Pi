@@ -4,12 +4,12 @@ use std::{
 };
 
 use gpui::{
-    App, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat, InteractiveElement as _,
-    IntoElement, ListOffset, ListState, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, StyledText, Window, div, img, list,
-    prelude::FluentBuilder as _, px,
+    App, Bounds, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat,
+    InteractiveElement as _, IntoElement, ListOffset, ListState, ParentElement as _, Pixels, Point,
+    SharedString, Size, StatefulInteractiveElement as _, Styled as _, StyledText, Window, div, img,
+    list, prelude::FluentBuilder as _, px,
 };
-use gpui_base::{Scrollbar, ScrollbarMode};
+use gpui_base::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 use gpui_component::{
     ActiveTheme as _, IconName, Sizable as _, StyledExt as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
@@ -34,6 +34,40 @@ use pi_render::{
 
 fn detail_key(message_id: &str, block_index: usize, kind: &str) -> String {
     format!("{message_id}:{kind}:{block_index}")
+}
+
+#[derive(Clone)]
+struct ChatScrollbarHandle(ListState);
+
+impl ScrollbarHandle for ChatScrollbarHandle {
+    fn viewport_bounds(&self) -> Bounds<Pixels> {
+        self.0.viewport_bounds()
+    }
+
+    fn offset(&self) -> Point<Pixels> {
+        self.0.scroll_px_offset_for_scrollbar()
+    }
+
+    fn set_offset(&self, offset: Point<Pixels>) {
+        self.0.set_offset_from_scrollbar(offset);
+    }
+
+    fn content_size(&self) -> Size<Pixels> {
+        self.0.viewport_bounds().size + self.0.max_offset_for_scrollbar().into()
+    }
+
+    fn start_drag(&self) {
+        if self.0.is_scrolled_to_end().is_none() {
+            // 未知总高度不能被冻结；下一帧先补齐测量，拖拽沿用新的几何。
+            let _ = self.0.clone().measure_all();
+        } else {
+            self.0.scrollbar_drag_started();
+        }
+    }
+
+    fn end_drag(&self) {
+        self.0.scrollbar_drag_ended();
+    }
 }
 
 #[derive(Clone, IntoElement)]
@@ -179,7 +213,7 @@ impl gpui::RenderOnce for ChatWindow {
                         .size_full(),
                     )
                     .child(
-                        Scrollbar::vertical(&self.list_state)
+                        Scrollbar::vertical(&ChatScrollbarHandle(self.list_state.clone()))
                             .id("chat-message-scrollbar")
                             .mode(ScrollbarMode::Hover),
                     ),
