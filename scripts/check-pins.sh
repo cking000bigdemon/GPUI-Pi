@@ -46,4 +46,8 @@ check "gpui-component"             "git+https://github.com/longbridge/gpui-compo
 check_no_stray "zed"            "https://github\.com/zed-industries/zed"      "$ZED_SHA"
 check_no_stray "gpui-component" "https://github\.com/longbridge/gpui-component" "$GPUIC_SHA"
 
+if ! "$ROOT/scripts/check-pi-source-pin.sh"; then
+  fail=1
+fi
+
 exit "$fail"

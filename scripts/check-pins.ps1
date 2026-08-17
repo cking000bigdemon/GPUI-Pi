@@ -1,4 +1,4 @@
-# 校验 Cargo.lock 里的上游 sha 与立项文档 § 二 钉死的一致（check-pins.sh 的 Windows 版）。
+﻿# 校验 Cargo.lock 里的上游 sha 与立项文档 § 二 钉死的一致（check-pins.sh 的 Windows 版）。
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
@@ -33,6 +33,10 @@ Check "zed (gpui / gpui_platform)" "git+https://github.com/zed-industries/zed#$Z
 Check "gpui-component"             "git+https://github.com/longbridge/gpui-component#$GpuicSha"
 CheckNoStray "zed"            "https://github.com/zed-industries/zed"        $ZedSha
 CheckNoStray "gpui-component" "https://github.com/longbridge/gpui-component" $GpuicSha
+
+$global:LASTEXITCODE = 0
+& "$Root\scripts\check-pi-source-pin.ps1"
+if ($LASTEXITCODE -ne 0) { $fail = $true }
 
 # 成功也要显式 exit 0：调用方（validate.ps1）靠 $LASTEXITCODE 判断，
 # 而 .ps1 正常落地时并不会写这个变量。

@@ -19,6 +19,9 @@ jobs:
       - name: 工具链（由 rust-toolchain.toml 决定版本）
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
+      - name: 准备钉死的 pi 0.84.2 源码参考
+        shell: pwsh
+        run: .\scripts\fetch-pi-source.ps1
       - name: T1 全量验收
         shell: pwsh
         run: .\scripts\validate.ps1
@@ -34,5 +37,7 @@ jobs:
       - name: 工具链（由 rust-toolchain.toml 决定版本）
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
+      - name: 准备钉死的 pi 0.84.2 源码参考
+        run: ./scripts/fetch-pi-source.sh
       - name: T1 纯逻辑验收
         run: ./scripts/validate.sh --logic

@@ -32,9 +32,10 @@ v1 开发期间锁死，不追上游：
 18 轮拆解开发中，进度见 [`ROUNDS.md`](ROUNDS.md)，设计见 [`docs/立项文档.md`](docs/立项文档.md)。
 
 ```bash
-./scripts/fetch-pi.sh      # 拉 pi v0.84.2 独立二进制到 vendor/pi/
-./scripts/validate.sh      # T1 验收（--logic 只跑纯逻辑 crate）
-cargo run -p gpui-pi       # 环境自检（R0 阶段尚未开窗口）
+./scripts/fetch-pi.sh          # 拉 pi v0.84.2 独立二进制到 vendor/pi/
+./scripts/fetch-pi-source.sh   # 拉同版本钉死源码到 vendor/upstream/pi-0.84.2/（含 manifest 全量校验）
+./scripts/validate.sh          # T1 验收（--logic 只跑纯逻辑 crate）
+cargo run -p gpui-pi           # 启动原生桌面客户端
 ```
 
 ## License

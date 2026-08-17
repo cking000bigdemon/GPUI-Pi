@@ -11,7 +11,7 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 ## 五条红线
 
 1. **不引入 web 技术栈** —— 不加 WebView（含 `gpui-wry`）、不嵌 HTML 页面。Mermaid 按立项文档 § 一 直出源码。
-2. **不动上游钉版本** —— `Cargo.lock` 与 `PINNED_PI_VERSION` 是钉死点，`cargo update` 会被 `scripts/check-pins.*` 判红。要改版本先改立项文档 § 二。
+2. **不动上游钉版本** —— `Cargo.lock`、`PINNED_PI_VERSION` 与 `vendor/upstream/pi-0.84.2/`（`.gpui-pi-source-pin` marker + `pins/pi-0.84.2.manifest` 全量基线）是钉死点，`cargo update` 或源码身份漂移会被 `scripts/check-pins.*` 判红。要改版本先改立项文档 § 二。
 3. **不跨轮次改动** —— 发现前面轮次的问题写进 `rounds/BACKLOG.md`，不当场顺手改。
 4. **不放宽验收** —— 连续 2 次 validation 不过，写 `rounds/round-NN/BLOCKED.md` 停下呼人，禁止改标准让自己通过。
 5. **不写 `~/.pi` 的破坏性操作** —— 数据目录与终端 pi、pi-web-desktop 共享。能只读就只读，必须写走「临时文件 + rename」。
@@ -95,8 +95,9 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 | 用途 | 位置 |
 |---|---|
 | 功能对照基线 pi-web 0.8.9 | `git clone --depth 1 https://github.com/agegr/pi-web`（钉 `2a6e5371`） |
-| RPC 协议权威文档 | pi 发布包内 `docs/rpc.md`（1589 行），或 `vendor/pi/docs/` |
-| 会话文件格式 | 同上 `docs/session-format.md` |
+| pi 0.84.2 源码（协议、trust 等实现权威参考） | 固定使用 `vendor/upstream/pi-0.84.2/`；运行 `./scripts/fetch-pi-source.sh` 或 `.\\scripts\\fetch-pi-source.ps1` 准备，身份钉 `v0.84.2` / `914cf1472e715297caa30db4b9535d534a9eb718`；禁止引用会自动更新的 Pi Agent 安装目录 |
+| RPC 协议权威文档 | `vendor/upstream/pi-0.84.2/packages/coding-agent/docs/rpc.md`，或 pi 发布包内 `vendor/pi/docs/rpc.md` |
+| 会话文件格式 | `vendor/upstream/pi-0.84.2/packages/coding-agent/docs/session-format.md`，或 pi 发布包内 `vendor/pi/docs/session-format.md` |
 | 组件库用法 | `git clone --depth 1 https://github.com/longbridge/gpui-component`，看 `crates/story/src/stories/` |
 
 ## 协作
