@@ -7,7 +7,8 @@ use std::{
 };
 
 use pi_rpc::{
-    Client, ClientConfig, ClientError, ClientEvent, Command, LifecycleEvent, RpcSessionState,
+    Client, ClientConfig, ClientError, ClientEvent, Command, CommandsData, ImageContent, ImageKind,
+    LifecycleEvent, RpcSessionState, SlashCommandSource,
 };
 
 fn fake_binary() -> PathBuf {
@@ -234,6 +235,35 @@ fn burst_subscription_keeps_authoritative_tail_events() {
     }
     assert_eq!(updates, 1500);
     assert!(saw_message_end && saw_agent_end && saw_settled);
+    client.shutdown().unwrap();
+}
+
+#[test]
+fn get_commands_decodes_typed_sources_and_image_prompt_preserves_wire() {
+    let client = Client::spawn(config()).unwrap();
+    let commands: CommandsData = client
+        .request_data(Command::GetCommands, Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(commands.commands.len(), 3);
+    assert_eq!(commands.commands[0].source, SlashCommandSource::Extension);
+    assert_eq!(commands.commands[1].source, SlashCommandSource::Prompt);
+    assert_eq!(commands.commands[2].source, SlashCommandSource::Skill);
+
+    let response = client
+        .request(
+            Command::Prompt {
+                message: "wire-image".into(),
+                images: Some(vec![ImageContent {
+                    kind: ImageKind::Image,
+                    data: "iVBORw0KGgo=".into(),
+                    mime_type: "image/png".into(),
+                }]),
+                streaming_behavior: Some(pi_rpc::StreamingBehavior::Steer),
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    assert!(response.success);
     client.shutdown().unwrap();
 }
 

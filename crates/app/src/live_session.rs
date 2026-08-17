@@ -12,7 +12,8 @@ use pi_render::{
 };
 
 use pi_rpc::{
-    AssistantMessageEvent, Client, ClientConfig, ClientEvent, Command, RpcEvent, StreamingBehavior,
+    AssistantMessageEvent, Client, ClientConfig, ClientEvent, Command, CommandsData, ImageContent,
+    ImageKind, RpcEvent, RpcSlashCommand, StreamingBehavior,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -42,6 +43,33 @@ pub enum RpcIntent {
     Abort,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ComposerSubmission {
+    pub message: String,
+    pub images: Vec<pi_data::DraftImage>,
+}
+
+impl ComposerSubmission {
+    fn rpc_images(&self) -> Option<Vec<ImageContent>> {
+        (!self.images.is_empty()).then(|| {
+            self.images
+                .iter()
+                .map(|image| ImageContent {
+                    kind: ImageKind::Image,
+                    data: image.data.clone(),
+                    mime_type: image.mime_type.clone(),
+                })
+                .collect()
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestFailureKind {
+    Rejected,
+    Ambiguous,
+}
+
 #[derive(Debug)]
 pub enum PumpMessage {
     Events {
@@ -51,7 +79,13 @@ pub enum PumpMessage {
     RequestFinished {
         generation: u64,
         intent: RpcIntent,
-        result: Result<(), String>,
+        submission: Option<ComposerSubmission>,
+        pending_activity_generation: Option<u64>,
+        result: Result<(), (RequestFailureKind, String)>,
+    },
+    CommandsLoaded {
+        generation: u64,
+        result: Result<Vec<RpcSlashCommand>, String>,
     },
     Calibrated {
         generation: u64,
@@ -82,12 +116,7 @@ impl ActiveSession {
         let mut config = ClientConfig::new(binary);
         config.current_dir = Some(cwd);
         config.initial_session = Some(session_path);
-        config.args = vec![
-            "--no-extensions".into(),
-            "--no-skills".into(),
-            "--no-prompt-templates".into(),
-            "--no-context-files".into(),
-        ];
+        config.args = vec!["--no-context-files".into()];
         let session_path = config
             .initial_session
             .clone()
@@ -96,6 +125,7 @@ impl ActiveSession {
         let events = client.subscribe();
         let (pump, receiver) = mpsc::unbounded();
         spawn_event_pump(generation, session_path, events, pump.clone());
+        spawn_commands_request(generation, client.clone(), pump.clone());
         Ok((
             Self {
                 generation,
@@ -131,24 +161,39 @@ impl ActiveSession {
         self.reducer.calibrate(document);
     }
 
-    pub fn dispatch(&mut self, intent: RpcIntent, message: Option<String>, mode: ComposerMode) {
+    pub fn dispatch(
+        &mut self,
+        intent: RpcIntent,
+        submission: Option<ComposerSubmission>,
+        mode: ComposerMode,
+        activity_generation: u64,
+    ) {
         debug_assert!(
             self.phase() != LivePhase::Stopping,
             "stopping session must reject new RPC intents"
         );
+        let pending_activity_generation = (intent != RpcIntent::Abort
+            && self.phase() != LivePhase::Running)
+            .then_some(activity_generation);
         match intent {
             RpcIntent::Abort => self.reducer.set_stopping(),
             _ => self.reducer.set_running(),
         }
         let command = match intent {
             RpcIntent::Prompt => Command::Prompt {
-                message: message.unwrap_or_default(),
-                images: None,
+                message: submission
+                    .as_ref()
+                    .map(|submission| submission.message.clone())
+                    .unwrap_or_default(),
+                images: submission.as_ref().and_then(ComposerSubmission::rpc_images),
                 streaming_behavior: None,
             },
             RpcIntent::Steer | RpcIntent::FollowUp => Command::Prompt {
-                message: message.unwrap_or_default(),
-                images: None,
+                message: submission
+                    .as_ref()
+                    .map(|submission| submission.message.clone())
+                    .unwrap_or_default(),
+                images: submission.as_ref().and_then(ComposerSubmission::rpc_images),
                 streaming_behavior: Some(mode.streaming_behavior()),
             },
             RpcIntent::Abort => Command::Abort,
@@ -159,25 +204,19 @@ impl ActiveSession {
         thread::Builder::new()
             .name(format!("pi-rpc-request-{generation}"))
             .spawn(move || {
-                let result = client
-                    .request(command, REQUEST_TIMEOUT)
-                    .and_then(|response| {
-                        if response.success {
-                            Ok(response)
-                        } else {
-                            Err(pi_rpc::ClientError::Rpc {
-                                command: response.command,
-                                message: response
-                                    .error
-                                    .unwrap_or_else(|| "unknown RPC error".into()),
-                            })
-                        }
-                    })
-                    .map(|_| ())
-                    .map_err(|error| error.to_string());
+                let result = match client.request(command, REQUEST_TIMEOUT) {
+                    Ok(response) if response.success => Ok(()),
+                    Ok(response) => Err((
+                        RequestFailureKind::Rejected,
+                        response.error.unwrap_or_else(|| "unknown RPC error".into()),
+                    )),
+                    Err(error) => Err((RequestFailureKind::Ambiguous, error.to_string())),
+                };
                 let _ = pump.unbounded_send(PumpMessage::RequestFinished {
                     generation,
                     intent,
+                    submission,
+                    pending_activity_generation,
                     result,
                 });
             })
@@ -197,6 +236,34 @@ impl ActiveSession {
                 });
             })
             .expect("failed to spawn RPC shutdown thread");
+    }
+}
+
+fn spawn_commands_request(generation: u64, client: Client, pump: UnboundedSender<PumpMessage>) {
+    thread::Builder::new()
+        .name(format!("pi-rpc-commands-{generation}"))
+        .spawn(move || {
+            let result = client
+                .request_data::<CommandsData>(Command::GetCommands, REQUEST_TIMEOUT)
+                .map(|mut data| {
+                    data.commands.sort_by(|left, right| {
+                        slash_source_order(left.source)
+                            .cmp(&slash_source_order(right.source))
+                            .then_with(|| left.name.cmp(&right.name))
+                    });
+                    data.commands
+                })
+                .map_err(|error| error.to_string());
+            let _ = pump.unbounded_send(PumpMessage::CommandsLoaded { generation, result });
+        })
+        .expect("failed to spawn RPC commands thread");
+}
+
+const fn slash_source_order(source: pi_rpc::SlashCommandSource) -> u8 {
+    match source {
+        pi_rpc::SlashCommandSource::Extension => 0,
+        pi_rpc::SlashCommandSource::Prompt => 1,
+        pi_rpc::SlashCommandSource::Skill => 2,
     }
 }
 

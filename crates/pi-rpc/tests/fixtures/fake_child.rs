@@ -60,6 +60,20 @@ fn main() {
                 stdout.flush().unwrap();
                 continue;
             }
+            if message == "wire-image" {
+                let valid = value["streamingBehavior"] == "steer"
+                    && value["images"][0]["type"] == "image"
+                    && value["images"][0]["data"] == "iVBORw0KGgo="
+                    && value["images"][0]["mimeType"] == "image/png";
+                let response = if valid {
+                    json!({"id":id,"type":"response","command":command,"success":true})
+                } else {
+                    json!({"id":id,"type":"response","command":command,"success":false,"error":"image wire mismatch"})
+                };
+                writeln!(stdout, "{response}").unwrap();
+                stdout.flush().unwrap();
+                continue;
+            }
             if message == "queue" {
                 writeln!(stdout, "{}", json!({"type":"agent_start"})).unwrap();
                 writeln!(
@@ -131,6 +145,17 @@ fn main() {
             "get_messages" => {
                 json!({"id":id,"type":"response","command":"get_messages","success":true,"data":{"messages":[]}})
             }
+            "get_commands" => json!({
+                "id":id,
+                "type":"response",
+                "command":"get_commands",
+                "success":true,
+                "data":{"commands":[
+                    {"name":"fixture-extension","description":"Extension fixture","source":"extension","sourceInfo":{"path":"/fixture/ext.ts","source":"fixture","scope":"user","origin":"top-level"}},
+                    {"name":"fixture-prompt","description":"Prompt fixture","source":"prompt","sourceInfo":{"path":"/fixture/prompt.md","source":"fixture","scope":"project","origin":"top-level"}},
+                    {"name":"skill:fixture","description":"Skill fixture","source":"skill","sourceInfo":{"path":"/fixture/SKILL.md","source":"fixture","scope":"user","origin":"top-level"}}
+                ]}
+            }),
             _ => json!({"id":id,"type":"response","command":command,"success":true}),
         };
         writeln!(stdout, "{response}").unwrap();
