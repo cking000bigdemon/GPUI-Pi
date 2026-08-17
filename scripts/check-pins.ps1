@@ -38,6 +38,10 @@ $global:LASTEXITCODE = 0
 & "$Root\scripts\check-pi-source-pin.ps1"
 if ($LASTEXITCODE -ne 0) { $fail = $true }
 
+$global:LASTEXITCODE = 0
+& "$Root\scripts\check-pi-web-pin.ps1"
+if ($LASTEXITCODE -ne 0) { $fail = $true }
+
 # 成功也要显式 exit 0：调用方（validate.ps1）靠 $LASTEXITCODE 判断，
 # 而 .ps1 正常落地时并不会写这个变量。
 if ($fail) { exit 1 } else { exit 0 }

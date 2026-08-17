@@ -24,10 +24,13 @@
 | `crates/ui/` | 依赖 gpui + gpui-component，验证依赖链可编译 |
 | `crates/app/` | 可执行文件，打印环境自检（**不开窗口**） |
 | `scripts/fetch-pi.{sh,ps1}` | 按平台拉 pi v0.84.2 + SHA256 校验 + 版本自检 |
-| `scripts/fetch-pi-source.{sh,ps1}` | 拉 `v0.84.2` / `914cf1472e715297caa30db4b9535d534a9eb718` 源码到稳定目录 `vendor/upstream/pi-0.84.2/`（归档 SHA256 + API tag 验证 + 全量 manifest 比对），避免引用会自动更新的桌面应用安装目录 |
+| `scripts/fetch-pi-source.{sh,ps1}` | 拉 `v0.84.2` / `914cf1472e715297caa30db4b9535d534a9eb718` 源码到稳定目录 `vendor/upstream/pi-0.84.2/`（API tag 验证 + 归档 SHA256 + 全量 manifest 比对），避免引用会自动更新的桌面应用安装目录 |
 | `scripts/check-pi-source-pin.{sh,ps1}` | 校验固定源码目录与 `pins/pi-0.84.2.manifest` 基线逐文件一致，由 check-pins 调用 |
-| `scripts/check-pins.{sh,ps1}` | 校验 `Cargo.lock` 上游 sha + 固定源码目录身份 |
-| `pins/pi-0.84.2.manifest` | 源码参考的 1373 文件 SHA256 + 大小基线（提交进 git） |
+| `pins/pi-0.84.2.manifest` | pi 源码参考的 1373 文件 SHA256 + 大小基线（提交进 git） |
+| `scripts/fetch-pi-web.{sh,ps1}` | 拉 `v0.8.9` / `2a6e53710f6409e0cceb3de839a62f8cdf3ca3ca` 功能对照基线到 `vendor/upstream/pi-web-0.8.9/`（API tag 两级验证 + 归档 SHA256 + 全量 manifest 比对） |
+| `scripts/check-pi-web-pin.{sh,ps1}` | 校验 pi-web 参考目录与 `pins/pi-web-0.8.9.manifest` 基线逐文件一致，由 check-pins 调用 |
+| `pins/pi-web-0.8.9.manifest` | pi-web 参考的 380 文件 SHA256 + 大小基线（提交进 git） |
+| `scripts/check-pins.{sh,ps1}` | 校验 `Cargo.lock` 上游 sha + 两个固定参考目录身份 |
 | `scripts/validate.{sh,ps1}` | T1 五步验收，支持 `--logic` 快速模式 |
 | `.github/workflows/ci.yml` | windows 阻断 + linux 纯逻辑非阻断 |
 | `CLAUDE.md` / `AGENTS.md` | 每轮必守的操作约定 |
@@ -49,7 +52,8 @@ gpui-component 自己对 zed 的依赖是**不带 rev 的 git 依赖**。如果�
 | T1 | 格式 / lint / 测试 / 构建 | `./scripts/validate.sh --logic` → `VALIDATE OK` |
 | T2 | pi 二进制供给 | `./scripts/fetch-pi.sh` → `OK vendor/pi/pi (0.84.2)` |
 | T2 | pi 源码供给 | `./scripts/fetch-pi-source.sh` / `.\\scripts\\fetch-pi-source.ps1` → 固定目录存在，远端 tag→commit 验证、归档 SHA256、marker 与 coding-agent package 版本、manifest 全量比对均通过 |
-| T2 | 源码防漂移 | 篡改任意源码文件或 marker 字段 → `check-pins` 失败并定位差异；恢复后通过 |
+| T2 | pi-web 基线供给 | `./scripts/fetch-pi-web.sh` / `.\\scripts\\fetch-pi-web.ps1` → 固定目录存在，注解 tag 两级解析验证、归档 SHA256、marker、manifest 全量比对均通过 |
+| T2 | 源码防漂移 | 篡改任意参考目录的源码文件或 marker 字段 → `check-pins` 失败并定位差异；恢复后通过 |
 | T2 | 版本同源 | `cargo test -p pi-rpc` 的 `pinned_version_matches_fetch_scripts` 通过 |
 | T3 | CI | PR 上 windows job 绿 |
 
@@ -77,6 +81,7 @@ gpui-component 自己对 zed 的依赖是**不带 rev 的 git 依赖**。如果�
 | `./scripts/validate.sh`（**全量，含 GPUI**） | `VALIDATE OK` —— release 编译 853 个包耗时 **2m28s** |
 | `./scripts/fetch-pi.sh` | `OK vendor/pi/pi (0.84.2)`，SHA256 校验通过 |
 | `./scripts/fetch-pi-source.sh` / `.\\scripts\\fetch-pi-source.ps1` | 补充于 2026-08-17：固定源码目录 `vendor/upstream/pi-0.84.2/`，身份为 `v0.84.2` / `914cf1472e715297caa30db4b9535d534a9eb718`；详见 [`pinned-pi-source.md`](pinned-pi-source.md) |
+| `./scripts/fetch-pi-web.sh` / `.\\scripts\\fetch-pi-web.ps1` | 补充于 2026-08-17：固定功能对照基线 `vendor/upstream/pi-web-0.8.9/`，身份为 `v0.8.9` / `2a6e53710f6409e0cceb3de839a62f8cdf3ca3ca`；详见 [`pinned-pi-web.md`](pinned-pi-web.md) |
 | `cargo run -p gpui-pi` | 环境自检输出正常 |
 
 ### 踩到的坑：`cargo update --precise` 会把同一 git 源劈成两半

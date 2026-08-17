@@ -34,6 +34,7 @@ v1 开发期间锁死，不追上游：
 ```bash
 ./scripts/fetch-pi.sh          # 拉 pi v0.84.2 独立二进制到 vendor/pi/
 ./scripts/fetch-pi-source.sh   # 拉同版本钉死源码到 vendor/upstream/pi-0.84.2/（含 manifest 全量校验）
+./scripts/fetch-pi-web.sh      # 拉功能对照基线到 vendor/upstream/pi-web-0.8.9/（含 manifest 全量校验）
 ./scripts/validate.sh          # T1 验收（--logic 只跑纯逻辑 crate）
 cargo run -p gpui-pi           # 启动原生桌面客户端
 ```

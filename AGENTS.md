@@ -96,7 +96,7 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 
 | 用途 | 位置 |
 |---|---|
-| 功能对照基线 pi-web 0.8.9 | `git clone --depth 1 https://github.com/agegr/pi-web`（钉 `2a6e5371`） |
+| 功能对照基线 pi-web 0.8.9 | 固定 `vendor/upstream/pi-web-0.8.9/`；运行 `./scripts/fetch-pi-web.sh` 或 `.\\scripts\\fetch-pi-web.ps1` 准备，身份钉 `v0.8.9` / `2a6e53710f6409e0cceb3de839a62f8cdf3ca3ca`（`pins/pi-web-0.8.9.manifest` 全量校验） |
 | pi 0.84.2 源码（协议、trust 等实现权威参考） | 固定使用 `vendor/upstream/pi-0.84.2/`；运行 `./scripts/fetch-pi-source.sh` 或 `.\\scripts\\fetch-pi-source.ps1` 准备，身份钉 `v0.84.2` / `914cf1472e715297caa30db4b9535d534a9eb718`；禁止引用会自动更新的 Pi Agent 安装目录 |
 | RPC 协议权威文档 | `vendor/upstream/pi-0.84.2/packages/coding-agent/docs/rpc.md`，或 pi 发布包内 `vendor/pi/docs/rpc.md` |
 | 会话文件格式 | `vendor/upstream/pi-0.84.2/packages/coding-agent/docs/session-format.md`，或 pi 发布包内 `vendor/pi/docs/session-format.md` |

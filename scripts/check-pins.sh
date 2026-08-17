@@ -49,5 +49,8 @@ check_no_stray "gpui-component" "https://github\.com/longbridge/gpui-component" 
 if ! "$ROOT/scripts/check-pi-source-pin.sh"; then
   fail=1
 fi
+if ! "$ROOT/scripts/check-pi-web-pin.sh"; then
+  fail=1
+fi
 
 exit "$fail"
