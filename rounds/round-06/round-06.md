@@ -68,7 +68,7 @@
 - `cargo test -p gpui-pi -- --nocapture`：exit 0；14 个 app tests 全过，含 800×560 最小窗口布局。
 - `./scripts/validate.sh`：最终 exit 0，`VALIDATE OK`；pins、fmt、workspace clippy `-D warnings`、全量 tests 与 release build 全绿。日志：`.pi/round-06-final-validate-bash.log`。
 - Windows PowerShell 5.1：原 `validate.ps1` 无 BOM，直接调用会被 Windows PowerShell 按本地代码页误读中文并 parser error；未修改上轮脚本。为实际验证，生成同目录临时 UTF-8 BOM `validate` 副本，并复用已有 BOM 的 `check-pins.ps1` 临时副本，最终 validation exit 0、`VALIDATE OK`，finally 删除临时文件。日志：`.pi/round-06-final-validate-powershell.log`。
-- 真实共享目录只读渲染：`PI_DATA_TEST_REAL_AGENT_DIR="$HOME/.pi/agent" cargo test -p pi-render --test real_agent_render -- --nocapture` exit 0；**scanned=176, rendered=176, blocks=15059**，测试比较全部 JSONL 的 size/modified 前后相同。日志：`.pi/round-06-review-fixes-real-agent-render.log`。
+- 真实共享目录只读渲染：`PI_DATA_TEST_REAL_AGENT_DIR="$HOME/.pi/agent" cargo test -p pi-render --test real_agent_render -- --nocapture` 最终 exit 0；**scanned=176, rendered=176, blocks=15104**，测试比较全部 JSONL 的 size/modified 前后相同。日志：`.pi/round-06-post-commit-real-agent-render.log`。
 - DSV4 Pro 审查发现并已修：Markdown 链接点击前使用原生 dialog 二次确认；v1 无 id 消息 fallback id 唯一；未知 ESC 后多字节 UTF-8 不再落到非法边界并补回归；普通工具与 bashExecution 的 `input_json`/output 均限长；code `TextView` id 加消息/块索引；parsed diff 显示文件路径；空白 patch/diff 不生成空块；生产加载统一走 `pi_render::render_path`；未知 JSON 的文本快照递归 canonicalize，避免 serde map feature 导致 key 顺序漂移。
 - 与设计的窄化：frontmatter 仅接受文首完整 fence 与简单顶层 YAML scalar / inline tags 数组；复杂嵌套 YAML 视为坏 YAML，完整保留在 Markdown 正文。ANSI truecolor 在逻辑层完整保留 RGB，UI 为遵守“颜色全部 theme 映射”将任意 RGB 投影到 semantic theme token。图片在逻辑层限制 8 MiB base64 / 6 MiB decoded bytes并校验 MIME magic；完整像素解码仍由 GPUI image cache 异步执行，坏图显示组件 fallback，不写临时文件、不自动联网。
 - 本轮仍不实现 R7 流式、R8 输入、R10 文件 tab、R11 git 面板或 R12 分支操作；Mermaid 只显示源码。
