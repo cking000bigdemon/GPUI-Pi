@@ -1,0 +1,10 @@
+{"type":"session","version":3,"id":"r6-semantic","timestamp":"2026-01-01T00:00:00Z","cwd":"C:/fixture"}
+{"type":"message","id":"user","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"---\ntitle: R6 semantic\ntags: [render, static]\nauthor: Pi\n---\nHello **Markdown**"},{"type":"image","data":"<redacted>","mimeType":"image/png"}]}}
+{"type":"custom_message","id":"custom","parentId":"user","customType":"notice","display":true,"content":"custom visible"}
+{"type":"compaction","id":"compact","parentId":"custom","summary":"compact summary","tokensBefore":120}
+{"type":"branch_summary","id":"branch","parentId":"compact","summary":"branch summary","fromId":"user"}
+{"type":"message","id":"assistant","parentId":"branch","message":{"role":"assistant","content":[{"type":"thinking","thinking":"reasoning"},{"type":"text","text":"# Answer\nBody\n```rust\nfn main() {}\n```\n```mermaid\ngraph TD; A-->B\n```"},{"type":"toolCall","id":"edit-1","name":"edit","arguments":{"path":"src/main.rs"}},{"type":"toolCall","id":"bash-1","name":"bash","arguments":{"command":"cargo test"}},{"type":"toolCall","id":"pending-1","name":"read","arguments":{"path":"missing"}},{"type":"bashExecution","command":"echo direct","output":"\u001b[32mdirect\u001b[0m","exitCode":0}]}}
+{"type":"message","id":"edit-result","parentId":"assistant","message":{"role":"toolResult","toolCallId":"edit-1","toolName":"edit","content":"edited","details":{"patch":"--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new","diff":"ignored"},"isError":false}}
+{"type":"message","id":"bash-result","parentId":"edit-result","message":{"role":"toolResult","toolCallId":"bash-1","toolName":"bash","content":[{"type":"text","text":"\u001b[1;31mfailed\u001b[0m"},{"type":"image","source":{"type":"url","url":"https://example.invalid/image.png"}}],"isError":true}}
+{"type":"message","id":"orphan","parentId":"bash-result","message":{"role":"toolResult","toolCallId":"orphan-1","toolName":"future","content":"orphan visible","isError":false}}
+{"type":"future_entry","id":"future","parentId":"orphan","payload":{"visible":true}}

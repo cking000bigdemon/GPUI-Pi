@@ -11,7 +11,16 @@ rust-version.workspace = true
 anyhow.workspace = true
 gpui.workspace = true
 gpui-base.workspace = true
-gpui-component.workspace = true
+gpui-component = { workspace = true, features = [
+    "tree-sitter-bash",
+    "tree-sitter-diff",
+    "tree-sitter-javascript",
+    "tree-sitter-python",
+    "tree-sitter-rust",
+    "tree-sitter-typescript",
+    "tree-sitter-yaml",
+] }
+pi-render.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

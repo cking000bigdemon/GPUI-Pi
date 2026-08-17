@@ -34,6 +34,7 @@ pub enum SidebarStatus {
 #[derive(Clone)]
 pub struct SessionSelected {
     pub id: String,
+    pub path: PathBuf,
     pub cwd: PathBuf,
     pub title: String,
 }
@@ -182,6 +183,7 @@ impl SessionSidebar {
         self.selected_id = Some(session.id.clone());
         cx.emit(SessionSelected {
             id: session.id.clone(),
+            path: session.path.clone(),
             cwd: session.cwd.clone(),
             title: session.title.clone(),
         });

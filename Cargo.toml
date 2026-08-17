@@ -37,6 +37,7 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 
 # ── 通用 ─────────────────────────────────────────────────────────────────────
 anyhow = "1"
+base64 = "0.22"
 chrono = "0.4"
 dirs = "6"
 dunce = "1"

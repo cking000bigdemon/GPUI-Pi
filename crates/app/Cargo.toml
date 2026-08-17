@@ -19,6 +19,7 @@ gpui-component.workspace = true
 gpui-component-assets.workspace = true
 gpui-pi-ui.workspace = true
 pi-data.workspace = true
+pi-render.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
