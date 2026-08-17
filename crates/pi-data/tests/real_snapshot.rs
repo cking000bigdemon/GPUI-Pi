@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
 
-use pi_data::{group_sessions, list_sessions, load_session, read_session_summary, resolve_project};
+use pi_data::{
+    RunningSessionOverlay, build_session_view, group_sessions, list_sessions, load_session,
+    read_session_summary, resolve_project, session_metrics,
+};
 use tempfile::tempdir;
 
 const FIXTURE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sessions");
@@ -29,6 +32,7 @@ fn all_redacted_real_sessions_parse_without_panicking() {
         assert!(session.header.id.starts_with("fixture-session-"));
         assert!(session.header.cwd.starts_with(r"C:\fixture\project-"));
         let _summary = read_session_summary(path).unwrap();
+        let _metrics = session_metrics(&session);
         let contents = fs::read_to_string(path).unwrap();
         for marker in [
             "ZhuanZ",
@@ -51,6 +55,23 @@ fn all_redacted_real_sessions_parse_without_panicking() {
     // fixture 直接放在扫描根目录；生产目录则是 `<project>/<session>.jsonl`。
     assert!(listed.sessions.is_empty());
     assert!(listed.diagnostics.is_empty());
+}
+
+#[test]
+fn all_real_fixtures_build_metrics_and_views_without_panicking() {
+    let summaries: Vec<_> = fs::read_dir(FIXTURE_ROOT)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .map(|path| read_session_summary(path).unwrap())
+        .collect();
+    assert_eq!(summaries.len(), 24);
+    let views = build_session_view(summaries, &RunningSessionOverlay::default());
+    assert!(!views.is_empty());
 }
 
 #[test]
@@ -181,9 +202,16 @@ fn grouping_merges_main_and_linked_worktree_sessions() {
     worktree.cwd = linked;
     worktree.modified = UNIX_EPOCH + Duration::from_secs(2);
 
-    let groups = group_sessions([main, worktree]);
+    let groups = group_sessions([main.clone(), worktree.clone()]);
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].sessions[0].session.id, "linked");
+
+    let view = build_session_view([main, worktree], &RunningSessionOverlay::default());
+    assert_eq!(
+        view[0].sessions[0].branch.as_deref(),
+        Some("r3"),
+        "linked worktree branch 必须保留到 SessionView"
+    );
 }
 
 fn run<const N: usize>(cwd: &Path, args: [&str; N]) {

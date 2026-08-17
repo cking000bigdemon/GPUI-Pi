@@ -157,9 +157,26 @@ pub struct SessionFile {
     pub diagnostics: Vec<SessionDiagnostic>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionMetrics {
+    /// 所有可识别 usage 的累计 token。坏字段被跳过，不影响其余会话。
+    pub cumulative_tokens: u64,
+    pub cumulative_cost: f64,
+    /// 静态历史可确定的最近 assistant usage.totalTokens。
+    pub recent_context_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRevision {
+    pub len: u64,
+    pub modified: SystemTime,
+    pub fingerprint: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionSummary {
     pub path: PathBuf,
+    pub revision: SessionRevision,
     pub id: String,
     pub cwd: PathBuf,
     pub name: Option<String>,
@@ -169,6 +186,7 @@ pub struct SessionSummary {
     pub first_message: String,
     pub parent_session_path: Option<PathBuf>,
     pub parent_session_id: Option<String>,
+    pub metrics: SessionMetrics,
 }
 
 #[derive(Debug, Default)]
@@ -192,10 +210,22 @@ pub fn load_session(path: impl AsRef<Path>) -> Result<SessionFile, SessionError>
     parse_session_reader(path, BufReader::new(file))
 }
 
+pub(crate) fn load_session_bytes(path: &Path, bytes: &[u8]) -> Result<SessionFile, SessionError> {
+    parse_session_reader(path, io::Cursor::new(bytes))
+}
+
 pub fn read_session_summary(path: impl AsRef<Path>) -> Result<SessionSummary, SessionError> {
     let path = path.as_ref();
-    let session = load_session(path)?;
-    Ok(summary_from_session(&session, file_modified(path)))
+    let bytes = std::fs::read(path).map_err(|source| SessionError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let revision = session_revision(path, &bytes).map_err(|source| SessionError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let session = load_session_bytes(path, &bytes)?;
+    Ok(summary_from_session(&session, revision))
 }
 
 pub fn list_sessions(root: impl AsRef<Path>) -> SessionList {
@@ -206,8 +236,16 @@ pub fn list_sessions(root: impl AsRef<Path>) -> SessionList {
 
     let mut summaries = Vec::new();
     for path in files {
-        match read_session_summary(&path) {
-            Ok(summary) => summaries.push(summary),
+        match read_session_summary_with_diagnostics(&path) {
+            Ok((summary, session_diagnostics)) => {
+                diagnostics.extend(session_diagnostics.into_iter().map(|diagnostic| {
+                    SessionListDiagnostic {
+                        path: path.clone(),
+                        message: format!("第 {} 行：{}", diagnostic.line, diagnostic.message),
+                    }
+                }));
+                summaries.push(summary);
+            }
             Err(error) => diagnostics.push(SessionListDiagnostic {
                 path,
                 message: error.to_string(),
@@ -229,6 +267,22 @@ pub fn list_sessions(root: impl AsRef<Path>) -> SessionList {
         sessions: summaries,
         diagnostics,
     }
+}
+
+fn read_session_summary_with_diagnostics(
+    path: &Path,
+) -> Result<(SessionSummary, Vec<SessionDiagnostic>), SessionError> {
+    let bytes = std::fs::read(path).map_err(|source| SessionError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let revision = session_revision(path, &bytes).map_err(|source| SessionError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let session = load_session_bytes(path, &bytes)?;
+    let diagnostics = session.diagnostics.clone();
+    Ok((summary_from_session(&session, revision), diagnostics))
 }
 
 fn parse_session_reader<R: BufRead>(path: &Path, reader: R) -> Result<SessionFile, SessionError> {
@@ -366,7 +420,7 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
-fn summary_from_session(session: &SessionFile, file_mtime: SystemTime) -> SessionSummary {
+fn summary_from_session(session: &SessionFile, revision: SessionRevision) -> SessionSummary {
     let mut name = None;
     let mut message_count = 0;
     let mut first_message = None;
@@ -379,8 +433,8 @@ fn summary_from_session(session: &SessionFile, file_mtime: SystemTime) -> Sessio
             } => {
                 name = current_name
                     .as_deref()
-                    .and_then(non_empty)
-                    .map(str::to_owned)
+                    .map(normalize_session_name)
+                    .filter(|name| !name.is_empty())
             }
             SessionEntry::Message { base, message } => {
                 message_count += 1;
@@ -408,9 +462,10 @@ fn summary_from_session(session: &SessionFile, file_mtime: SystemTime) -> Sessio
         }
     }
 
-    let created = parse_iso_time(&session.header.timestamp).unwrap_or(file_mtime);
+    let created = parse_iso_time(&session.header.timestamp).unwrap_or(revision.modified);
     SessionSummary {
         path: session.path.clone(),
+        revision,
         id: session.header.id.clone(),
         cwd: PathBuf::from(&session.header.cwd),
         name,
@@ -420,7 +475,49 @@ fn summary_from_session(session: &SessionFile, file_mtime: SystemTime) -> Sessio
         first_message: first_message.unwrap_or_else(|| NO_MESSAGES.to_owned()),
         parent_session_path: session.header.parent_session.clone(),
         parent_session_id: None,
+        metrics: session_metrics(session),
     }
+}
+
+pub fn session_metrics(session: &SessionFile) -> SessionMetrics {
+    let mut metrics = SessionMetrics::default();
+    for entry in &session.entries {
+        let usage = match entry {
+            SessionEntry::Message { message, .. } => {
+                match message.get("role").and_then(Value::as_str) {
+                    Some("assistant") => {
+                        let usage = message.get("usage");
+                        if let Some(tokens) = usage
+                            .and_then(|value| value.get("totalTokens"))
+                            .and_then(Value::as_u64)
+                        {
+                            metrics.recent_context_tokens = Some(tokens);
+                        }
+                        usage
+                    }
+                    Some("toolResult") => message.get("usage"),
+                    _ => None,
+                }
+            }
+            SessionEntry::Compaction { raw, .. } | SessionEntry::BranchSummary { raw, .. } => {
+                raw.get("usage")
+            }
+            _ => None,
+        };
+        let Some(usage) = usage else { continue };
+        if let Some(tokens) = usage_tokens(usage) {
+            metrics.cumulative_tokens = metrics.cumulative_tokens.saturating_add(tokens);
+        }
+        if let Some(cost) = usage
+            .get("cost")
+            .and_then(|cost| cost.get("total"))
+            .and_then(Value::as_f64)
+            .filter(|cost| cost.is_finite() && *cost >= 0.0)
+        {
+            metrics.cumulative_cost += cost;
+        }
+    }
+    metrics
 }
 
 fn session_path_key(path: &Path) -> String {
@@ -450,9 +547,39 @@ fn message_text(message: &Value) -> Option<String> {
     }
 }
 
-fn non_empty(value: &str) -> Option<&str> {
-    let value = value.trim();
-    (!value.is_empty()).then_some(value)
+pub(crate) fn normalize_session_name(value: &str) -> String {
+    value.replace(['\r', '\n'], " ").trim().to_owned()
+}
+
+fn usage_tokens(usage: &Value) -> Option<u64> {
+    if let Some(total) = usage.get("totalTokens").and_then(Value::as_u64) {
+        return Some(total);
+    }
+    let mut found = false;
+    let total = ["input", "output", "cacheRead", "cacheWrite"]
+        .into_iter()
+        .filter_map(|key| usage.get(key).and_then(Value::as_u64))
+        .fold(0_u64, |total, value| {
+            found = true;
+            total.saturating_add(value)
+        });
+    found.then_some(total)
+}
+
+pub(crate) fn session_revision(path: &Path, bytes: &[u8]) -> io::Result<SessionRevision> {
+    let metadata = path.metadata()?;
+    Ok(SessionRevision {
+        len: metadata.len(),
+        modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+        fingerprint: fingerprint(bytes),
+    })
+}
+
+fn fingerprint(bytes: &[u8]) -> u64 {
+    // FNV-1a 只用于并发修改检测，不用于安全边界；固定算法让 revision 可稳定比较。
+    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
 }
 
 fn parse_iso_time(value: &str) -> Option<SystemTime> {
@@ -473,12 +600,6 @@ fn system_time_from_timestamp(seconds: i64, nanos: u32) -> Option<SystemTime> {
 
 fn system_time_from_millis(millis: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(millis)
-}
-
-fn file_modified(path: &Path) -> SystemTime {
-    path.metadata()
-        .and_then(|metadata| metadata.modified())
-        .unwrap_or(UNIX_EPOCH)
 }
 
 fn collect_jsonl(
@@ -581,12 +702,35 @@ mod tests {
         let session = parse(concat!(
             "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n",
             "{\"type\":\"message\",\"id\":\"u\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"image\"},{\"type\":\"text\",\"text\":\"hello\"}]}}\n",
-            "{\"type\":\"session_info\",\"id\":\"n\",\"parentId\":\"u\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"name\":\" title \"}\n"
+            "{\"type\":\"session_info\",\"id\":\"n\",\"parentId\":\"u\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"name\":\" title\\r\\nnext \"}\n"
         ));
-        let summary = summary_from_session(&session, UNIX_EPOCH);
+        let summary = summary_from_session(
+            &session,
+            SessionRevision {
+                len: 0,
+                modified: UNIX_EPOCH,
+                fingerprint: 0,
+            },
+        );
         assert_eq!(summary.first_message, "hello");
-        assert_eq!(summary.name.as_deref(), Some("title"));
+        assert_eq!(summary.name.as_deref(), Some("title  next"));
         assert_eq!(summary.message_count, 1);
+    }
+
+    #[test]
+    fn metrics_accumulate_supported_usage_and_keep_latest_context() {
+        let session = parse(concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n",
+            "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"usage\":{\"totalTokens\":10,\"cost\":{\"total\":0.1}}}}\n",
+            "{\"type\":\"message\",\"message\":{\"role\":\"toolResult\",\"usage\":{\"input\":2,\"output\":3,\"cacheRead\":\"bad\",\"cost\":{\"total\":0.2}}}}\n",
+            "{\"type\":\"compaction\",\"usage\":{\"totalTokens\":20,\"cost\":{\"total\":0.3}}}\n",
+            "{\"type\":\"branch_summary\",\"usage\":{\"totalTokens\":30,\"cost\":{\"total\":0.4}}}\n",
+            "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"usage\":{\"totalTokens\":99,\"cost\":{\"total\":\"bad\"}}}}"
+        ));
+        let metrics = session_metrics(&session);
+        assert_eq!(metrics.cumulative_tokens, 164);
+        assert!((metrics.cumulative_cost - 1.0).abs() < f64::EPSILON);
+        assert_eq!(metrics.recent_context_tokens, Some(99));
     }
 
     #[test]
