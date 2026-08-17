@@ -73,5 +73,6 @@
 - 事件性能路径：RPC 事件泵以 **20ms / 最多 512 events** 合批；已定稿历史和消息改为 `Arc` 共享，流式帧只重建当前草稿与共享指针；settled 后后台重读 session 文件校准，且 activity generation 防旧校准覆盖新 run。
 - 滚动路径：`ScrollHandle` 由 `ChatPanel` 持久持有；wheel 上滚、minimap 跳转以及 render 时检测到的非尾部 offset 都会解除跟随，点击“跟随最新”恢复。800×560 workspace 与 composer 不溢出测试通过。
 - 独立审查按约定显式使用 DeepSeek provider 的 `deepseek/deepseek-v4-pro`。首轮发现首次 spawn 未带 session、abort 竞态、每 batch 深拷贝/重解析、user 去重与滚动缺口；均修复并补回归。终审新增的 run identity、同 run 多 user、旧校准覆盖新 run 和滚动条/PageUp 脱离风险也已由父会话继续修复并重跑全量 validation。
-- T3 长回复真机目视/帧率未由自动化环境完成，需在 PR 审阅时人工启动应用，用已登录 provider 复测长 Markdown、上滚脱离与恢复；这是本轮唯一保留的人工验收项。
+- 首轮人工验收发现 5 项阻断：长会话全量渲染掉帧、工具卡始终展开、右目录不能隐藏、目录点击不能可靠定位、“跟随最新”无响应。已改为 GPUI variable-height `list` + 持久 `ListState`，只构建视口附近消息；工具 input/output/diff/read 正文默认折叠且展开前不进入 element tree；目录支持隐藏/恢复并通过 `ListOffset` 逻辑消息索引跳转；跟随按钮直接 `scroll_to_end()` 后重新进入 Tail 模式。修复后 `./scripts/validate.sh` 再次 `VALIDATE OK`，日志：`.pi/round-07-validate-acceptance-fixes.log`。
+- T3 长回复首轮人工结论为“不通过”，上述修复版已重新拉起等待复验；最终流畅度仍以人工复验结论为准。
 - 范围控制：R7 仅加入完成真实对话所需的基础 `Textarea`、发送/停止、Steer/Follow-up 模式；未实现 R8 附件、`@文件`、slash 面板、草稿持久化或完整 IME 二次验收；未实现 R9 模型/思考/工具预设。

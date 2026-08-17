@@ -1,10 +1,10 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use futures::{StreamExt as _, channel::mpsc::UnboundedReceiver};
 use gpui::{
-    App, AppContext as _, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, ScrollHandle, SharedString, Styled as _, Subscription,
-    Window, div, prelude::FluentBuilder as _, px,
+    App, AppContext as _, Context, EventEmitter, FocusHandle, Focusable, FollowMode,
+    InteractiveElement as _, IntoElement, ListAlignment, ListState, ParentElement as _, Render,
+    SharedString, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Selectable as _,
@@ -29,9 +29,12 @@ pub struct ChatPanel {
     active: Option<ActiveSession>,
     composer: gpui::Entity<TextareaState>,
     composer_mode: ComposerMode,
-    scroll_handle: ScrollHandle,
+    list_state: ListState,
+    list_message_ids: Vec<String>,
     tail_attached: bool,
     follow_requested: bool,
+    minimap_visible: bool,
+    expanded_tools: HashSet<String>,
     rpc_error: Option<String>,
     activity_generation: u64,
     calibration_generation: u64,
@@ -92,6 +95,25 @@ impl ChatPanel {
                 this.submit_composer(input, window, cx);
             }
         });
+        let list_state = ListState::new(0, ListAlignment::Top, px(1200.));
+        list_state.set_follow_mode(FollowMode::Tail);
+        let scroll_state = list_state.clone();
+        let panel = cx.weak_entity();
+        list_state.set_scroll_handler(move |event, _, cx| {
+            let attached = event.is_following_tail;
+            let scroll_state = scroll_state.clone();
+            let panel = panel.clone();
+            // ListState 在回调时持有可变借用；延后读取/更新，避免 RefCell 重入。
+            cx.defer(move |cx| {
+                let attached = attached || scroll_state.is_scrolled_to_end().unwrap_or(true);
+                let _ = panel.update(cx, |panel, cx| {
+                    if panel.tail_attached != attached {
+                        panel.tail_attached = attached;
+                        cx.notify();
+                    }
+                });
+            });
+        });
         Self {
             focus_handle: cx.focus_handle(),
             status: ChatStatus::Empty,
@@ -99,9 +121,12 @@ impl ChatPanel {
             active: None,
             composer,
             composer_mode: ComposerMode::Steer,
-            scroll_handle: ScrollHandle::new(),
+            list_state,
+            list_message_ids: Vec::new(),
             tail_attached: true,
             follow_requested: false,
+            minimap_visible: true,
+            expanded_tools: HashSet::new(),
             rpc_error: None,
             activity_generation: 0,
             calibration_generation: 0,
@@ -130,7 +155,27 @@ impl ChatPanel {
         self.calibration_generation = 0;
         self.tail_attached = true;
         self.follow_requested = false;
-        self.scroll_handle = ScrollHandle::new();
+        self.minimap_visible = true;
+        self.expanded_tools.clear();
+        self.list_state = ListState::new(0, ListAlignment::Top, px(1200.));
+        self.list_state.set_follow_mode(FollowMode::Tail);
+        let scroll_state = self.list_state.clone();
+        let panel = cx.weak_entity();
+        self.list_state.set_scroll_handler(move |event, _, cx| {
+            let attached = event.is_following_tail;
+            let scroll_state = scroll_state.clone();
+            let panel = panel.clone();
+            cx.defer(move |cx| {
+                let attached = attached || scroll_state.is_scrolled_to_end().unwrap_or(true);
+                let _ = panel.update(cx, |panel, cx| {
+                    if panel.tail_attached != attached {
+                        panel.tail_attached = attached;
+                        cx.notify();
+                    }
+                });
+            });
+        });
+        self.list_message_ids.clear();
         cx.notify();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |panel, cx| {
@@ -162,7 +207,10 @@ impl ChatPanel {
             return false;
         }
         self.status = match result {
-            Ok(document) => ChatStatus::Ready(document),
+            Ok(document) => {
+                self.sync_list_document(&document);
+                ChatStatus::Ready(document)
+            }
             Err(message) => ChatStatus::Error { title, message },
         };
         true
@@ -250,7 +298,9 @@ impl ChatPanel {
                     // 一个 batch 对应最多一次滚动请求，不随 token 数增长。
                     self.follow_requested = true;
                 }
-                self.status = ChatStatus::Ready(Arc::new(active.document()));
+                let document = Arc::new(active.document());
+                self.sync_list_document(&document);
+                self.status = ChatStatus::Ready(document);
             }
             PumpMessage::RequestFinished { intent, result, .. } => match result {
                 Ok(()) => {
@@ -282,7 +332,9 @@ impl ChatPanel {
                 match result {
                     Ok(document) => {
                         active.calibrate(document);
-                        self.status = ChatStatus::Ready(Arc::new(active.document()));
+                        let document = Arc::new(active.document());
+                        self.sync_list_document(&document);
+                        self.status = ChatStatus::Ready(document);
                     }
                     Err(error) => self.rpc_error = Some(format!("会话落盘校准失败：{error}")),
                 }
@@ -347,9 +399,61 @@ impl ChatPanel {
         cx.notify();
     }
 
-    fn resume_follow(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn resume_follow(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.tail_attached = true;
-        self.follow_requested = true;
+        self.follow_requested = false;
+        self.list_state.scroll_to_end();
+        self.list_state.set_follow_mode(FollowMode::Tail);
+        window.refresh();
+        cx.notify();
+    }
+
+    fn sync_list_document(&mut self, document: &ConversationDocument) {
+        let next_ids = document
+            .messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>();
+        let old_len = self.list_message_ids.len();
+        let shared_prefix = self
+            .list_message_ids
+            .iter()
+            .zip(&next_ids)
+            .take_while(|(old, new)| old == new)
+            .count();
+        if shared_prefix == old_len && next_ids.len() >= old_len {
+            if next_ids.len() > old_len {
+                self.list_state
+                    .splice(old_len..old_len, next_ids.len() - old_len);
+            } else if old_len > 0
+                && self
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.phase() != LivePhase::Idle)
+            {
+                // 只有流式草稿会改变尾部高度；静态重绘不应反复废弃布局缓存。
+                self.list_state.remeasure_items(old_len - 1..old_len);
+            }
+        } else {
+            self.list_state.reset(next_ids.len());
+        }
+        self.list_message_ids = next_ids;
+    }
+
+    fn toggle_minimap(&mut self, cx: &mut Context<Self>) {
+        self.minimap_visible = !self.minimap_visible;
+        cx.notify();
+    }
+
+    fn toggle_tool(&mut self, key: String, cx: &mut Context<Self>) {
+        if !self.expanded_tools.insert(key.clone()) {
+            self.expanded_tools.remove(&key);
+        }
+        if let Some((message_id, _)) = key.split_once(':')
+            && let Some(index) = self.list_message_ids.iter().position(|id| id == message_id)
+        {
+            self.list_state.remeasure_items(index..index + 1);
+        }
         cx.notify();
     }
 }
@@ -402,14 +506,13 @@ impl Render for ChatPanel {
         let probe = self.probe.clone();
         #[cfg(not(test))]
         let probe = self.probe;
-        if self.tail_attached
-            && self.scroll_handle.max_offset().y > px(0.)
-            && (self.scroll_handle.offset().y + self.scroll_handle.max_offset().y).abs() > px(2.)
-        {
-            // 覆盖滚动条拖拽、PageUp/Home 等不产生 ScrollWheelEvent 的路径。
+        if self.tail_attached && matches!(self.list_state.is_scrolled_to_end(), Some(false)) {
+            // 覆盖滚动条拖拽、PageUp/Home 等路径。
             self.tail_attached = false;
         }
-        let follow = self.follow_requested && self.tail_attached;
+        if self.follow_requested && self.tail_attached {
+            self.list_state.scroll_to_end();
+        }
         self.follow_requested = false;
         let panel = cx.entity();
         let content = match &self.status {
@@ -433,25 +536,43 @@ impl Render for ChatPanel {
                 .child(div().font_semibold().child(format!("{title} 加载失败")))
                 .child(div().text_sm().child(message.clone()))
                 .into_any_element(),
-            ChatStatus::Ready(document) => gpui_pi_ui::ChatWindow::new(document.clone())
-                .with_scroll_handle(self.scroll_handle.clone())
-                .follow_tail(follow)
-                .on_tail_attachment_change(move |attached, _, cx| {
-                    panel.update(cx, |panel, cx| {
-                        panel.tail_attached = attached;
-                        cx.notify();
-                    });
-                })
-                .on_tail_detach({
-                    let panel = cx.entity();
-                    move |_, cx| {
+            ChatStatus::Ready(document) => {
+                gpui_pi_ui::ChatWindow::new(document.clone(), self.list_state.clone())
+                    .show_minimap(self.minimap_visible)
+                    .expanded_tools(Arc::new(self.expanded_tools.clone()))
+                    .on_toggle_tool({
+                        let panel = cx.entity();
+                        move |key, cx| {
+                            panel.update(cx, |panel, cx| panel.toggle_tool(key, cx));
+                        }
+                    })
+                    .on_toggle_minimap({
+                        let panel = cx.entity();
+                        move |cx| {
+                            panel.update(cx, |panel, cx| panel.toggle_minimap(cx));
+                        }
+                    })
+                    .on_tail_attachment_change(move |attached, _, cx| {
                         panel.update(cx, |panel, cx| {
-                            panel.tail_attached = false;
+                            panel.tail_attached = attached;
+                            if !attached {
+                                panel.list_state.pause_following_tail();
+                            }
                             cx.notify();
                         });
-                    }
-                })
-                .into_any_element(),
+                    })
+                    .on_tail_detach({
+                        let panel = cx.entity();
+                        move |_, cx| {
+                            panel.update(cx, |panel, cx| {
+                                panel.tail_attached = false;
+                                panel.list_state.pause_following_tail();
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .into_any_element()
+            }
         };
         let phase = self.active.as_ref().map(|active| active.phase());
         let running = matches!(phase, Some(LivePhase::Running));
@@ -658,13 +779,16 @@ mod tests {
         let handle = cx.open_window(size(gpui::px(520.), gpui::px(480.)), move |window, cx| {
             let panel = cx.new(|cx| {
                 let mut panel = ChatPanel::new(window, cx);
+                if let ChatStatus::Ready(document) = &status {
+                    panel.sync_list_document(document);
+                }
                 panel.status = status;
                 panel
             });
             Root::new(panel, window, cx)
         });
         let mut visual = VisualTestContext::from_window(handle.into(), cx);
-        for _ in 0..3 {
+        for _ in 0..8 {
             visual.update(|window, cx| window.draw(cx).clear(cx));
             visual.run_until_parked();
         }
@@ -679,16 +803,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn ready_chat_renders_primary_r7_selectors(cx: &mut TestAppContext) {
+    fn ready_chat_renders_virtualized_shell_and_minimap(cx: &mut TestAppContext) {
         let mut ready = render_status(cx, ChatStatus::Ready(rich_document()));
-        for selector in [
-            "chat-window",
-            "chat-message",
-            "chat-minimap",
-            "frontmatter-card",
-            "tool-card",
-            "live-composer",
-        ] {
+        for selector in ["chat-window", "chat-minimap", "live-composer"] {
             assert!(ready.debug_bounds(selector).is_some(), "missing {selector}");
         }
     }
@@ -704,7 +821,9 @@ mod tests {
         let handle = cx.open_window(size(gpui::px(520.), gpui::px(480.)), move |window, cx| {
             let panel = cx.new(|cx| {
                 let mut panel = ChatPanel::new(window, cx);
-                panel.status = ChatStatus::Ready(rich_document());
+                let document = rich_document();
+                panel.sync_list_document(&document);
+                panel.status = ChatStatus::Ready(document);
                 *result.borrow_mut() = Some(cx.entity());
                 panel
             });

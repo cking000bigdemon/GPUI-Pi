@@ -1,21 +1,29 @@
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use gpui::{
     App, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat, InteractiveElement as _,
-    IntoElement, ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _,
-    Styled as _, StyledText, Window, div, img, prelude::FluentBuilder as _, px,
+    IntoElement, ListOffset, ListState, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, StyledText, Window, div, img, list,
+    prelude::FluentBuilder as _, px,
 };
+use gpui_base::{Scrollbar, ScrollbarMode};
 use gpui_component::{
-    ActiveTheme as _, StyledExt as _, WindowExt as _, dialog::DialogButtonProps, h_flex,
-    scroll::ScrollableElement as _, text::TextView, v_flex,
+    ActiveTheme as _, IconName, Sizable as _, StyledExt as _, WindowExt as _,
+    button::{Button, ButtonVariants as _},
+    dialog::DialogButtonProps,
+    h_flex,
+    scroll::ScrollableElement as _,
+    text::TextView,
+    v_flex,
 };
+
 type TailAttachmentHandler = Arc<dyn Fn(bool, &mut Window, &mut App)>;
-
 type TailDetachHandler = Arc<dyn Fn(&mut Window, &mut App)>;
-
-fn tail_attached_after_wheel(current: bool, delta_y: gpui::Pixels) -> bool {
-    current && delta_y <= px(0.)
-}
+type ToolToggleHandler = Arc<dyn Fn(String, &mut App)>;
+type MinimapToggleHandler = Arc<dyn Fn(&mut App)>;
 
 use pi_render::{
     AnsiColor, AnsiStyle, AnsiText, Block, CodeBlock, ConversationDocument, DiffBlock,
@@ -26,32 +34,48 @@ use pi_render::{
 #[derive(Clone, IntoElement)]
 pub struct ChatWindow {
     document: Arc<ConversationDocument>,
-    scroll_handle: ScrollHandle,
+    list_state: ListState,
     selected_message: Option<String>,
-    follow_tail: bool,
+    show_minimap: bool,
+    expanded_tools: Arc<HashSet<String>>,
+    on_toggle_tool: Option<ToolToggleHandler>,
+    on_toggle_minimap: Option<MinimapToggleHandler>,
     on_tail_attachment_change: Option<TailAttachmentHandler>,
     on_tail_detach: Option<TailDetachHandler>,
 }
 
 impl ChatWindow {
-    pub fn new(document: Arc<ConversationDocument>) -> Self {
+    pub fn new(document: Arc<ConversationDocument>, list_state: ListState) -> Self {
         Self {
             document,
-            scroll_handle: ScrollHandle::new(),
+            list_state,
             selected_message: None,
-            follow_tail: false,
+            show_minimap: true,
+            expanded_tools: Arc::new(HashSet::new()),
+            on_toggle_tool: None,
+            on_toggle_minimap: None,
             on_tail_attachment_change: None,
             on_tail_detach: None,
         }
     }
 
-    pub fn with_scroll_handle(mut self, scroll_handle: ScrollHandle) -> Self {
-        self.scroll_handle = scroll_handle;
+    pub fn show_minimap(mut self, show: bool) -> Self {
+        self.show_minimap = show;
         self
     }
 
-    pub fn follow_tail(mut self, follow: bool) -> Self {
-        self.follow_tail = follow;
+    pub fn expanded_tools(mut self, expanded: Arc<HashSet<String>>) -> Self {
+        self.expanded_tools = expanded;
+        self
+    }
+
+    pub fn on_toggle_tool(mut self, handler: impl Fn(String, &mut App) + 'static) -> Self {
+        self.on_toggle_tool = Some(Arc::new(handler));
+        self
+    }
+
+    pub fn on_toggle_minimap(mut self, handler: impl Fn(&mut App) + 'static) -> Self {
+        self.on_toggle_minimap = Some(Arc::new(handler));
         self
     }
 
@@ -78,14 +102,14 @@ impl gpui::RenderOnce for ChatWindow {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let document = self.document.clone();
         let message_count = document.messages.len();
-        let minimap_scroll = self.scroll_handle.clone();
-        let follow_scroll = self.scroll_handle.clone();
-        if self.follow_tail && message_count > 0 {
-            follow_scroll.scroll_to_bottom();
-        }
-        let attachment_scroll = self.scroll_handle.clone();
-        let attachment_handler = self.on_tail_attachment_change.clone();
+        let selected_message = self.selected_message.clone();
+        let expanded_tools = self.expanded_tools.clone();
+        let on_toggle_tool = self.on_toggle_tool.clone();
         let minimap_detach = self.on_tail_detach.clone();
+        let minimap_toggle = self.on_toggle_minimap.clone();
+        let list_state = self.list_state.clone();
+        let messages = document.messages.clone();
+
         h_flex()
             .debug_selector(|| "chat-window".into())
             .size_full()
@@ -93,56 +117,76 @@ impl gpui::RenderOnce for ChatWindow {
             .min_h_0()
             .bg(cx.theme().background)
             .child(
-                v_flex()
-                    .id("chat-message-scroll-area")
+                div()
+                    .id("chat-message-list-area")
                     .debug_selector(|| "chat-message-scroll".into())
+                    .relative()
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
-                    .gap_3()
-                    .track_scroll(&self.scroll_handle)
-                    .on_scroll_wheel(move |event, window, cx| {
-                        if let Some(handler) = &attachment_handler {
-                            let attached =
-                                tail_attached_after_wheel(true, event.delta.pixel_delta(px(20.)).y);
-                            if !attached {
-                                handler(false, window, cx);
-                            } else {
-                                window.defer(cx, {
-                                    let scroll = attachment_scroll.clone();
-                                    let handler = handler.clone();
-                                    move |window, cx| {
-                                        let attached = (scroll.offset().y - scroll.max_offset().y)
-                                            .abs()
-                                            <= px(2.);
-                                        handler(attached, window, cx);
-                                    }
-                                });
-                            }
-                        }
-                    })
-                    .overflow_y_scrollbar()
-                    .p_3()
-                    .children(
-                        document
-                            .messages
-                            .iter()
-                            .enumerate()
-                            .map(|(index, message)| {
-                                MessageView::new(index, message.clone())
-                                    .selected(self.selected_message.as_deref() == Some(&message.id))
-                            }),
+                    .child(
+                        list(list_state.clone(), move |index, _, _| {
+                            messages.get(index).map_or_else(
+                                || div().into_any_element(),
+                                |message| {
+                                    MessageView::new(index, message.clone())
+                                        .selected(selected_message.as_deref() == Some(&message.id))
+                                        .expanded_tools(expanded_tools.clone())
+                                        .on_toggle_tool(on_toggle_tool.clone())
+                                        .into_any_element()
+                                },
+                            )
+                        })
+                        .size_full(),
+                    )
+                    .child(
+                        Scrollbar::vertical(&self.list_state)
+                            .id("chat-message-scrollbar")
+                            .mode(ScrollbarMode::Hover),
                     ),
             )
-            .when(!document.minimap.is_empty(), |this| {
+            .when(self.show_minimap && !document.minimap.is_empty(), |this| {
                 this.child(
-                    ChatMinimap::new(document.clone(), minimap_scroll, message_count)
+                    ChatMinimap::new(document.clone(), self.list_state.clone(), message_count)
                         .selected(self.selected_message)
                         .on_navigate(move |window, cx| {
                             if let Some(handler) = &minimap_detach {
                                 handler(window, cx);
                             }
+                        })
+                        .on_toggle({
+                            let minimap_toggle = minimap_toggle.clone();
+                            move |cx| {
+                                if let Some(handler) = &minimap_toggle {
+                                    handler(cx);
+                                }
+                            }
                         }),
+                )
+            })
+            .when(!self.show_minimap && !document.minimap.is_empty(), |this| {
+                let on_toggle = minimap_toggle.clone();
+                this.child(
+                    v_flex()
+                        .debug_selector(|| "chat-minimap-collapsed".into())
+                        .h_full()
+                        .flex_none()
+                        .border_l_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().sidebar)
+                        .p_1()
+                        .child(
+                            Button::new("show-chat-minimap")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::PanelRightOpen)
+                                .tooltip("显示目录")
+                                .on_click(move |_, _, cx| {
+                                    if let Some(handler) = &on_toggle {
+                                        handler(cx);
+                                    }
+                                }),
+                        ),
                 )
             })
     }
@@ -153,6 +197,8 @@ pub struct MessageView {
     index: usize,
     message: Arc<Message>,
     selected: bool,
+    expanded_tools: Arc<HashSet<String>>,
+    on_toggle_tool: Option<ToolToggleHandler>,
 }
 
 impl MessageView {
@@ -161,11 +207,23 @@ impl MessageView {
             index,
             message,
             selected: false,
+            expanded_tools: Arc::new(HashSet::new()),
+            on_toggle_tool: None,
         }
     }
 
     pub fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
+        self
+    }
+
+    pub fn expanded_tools(mut self, expanded: Arc<HashSet<String>>) -> Self {
+        self.expanded_tools = expanded;
+        self
+    }
+
+    pub fn on_toggle_tool(mut self, handler: Option<ToolToggleHandler>) -> Self {
+        self.on_toggle_tool = handler;
         self
     }
 }
@@ -180,12 +238,14 @@ impl gpui::RenderOnce for MessageView {
             MessageRole::Unknown => cx.theme().danger,
             MessageRole::Custom => cx.theme().muted_foreground,
         };
+        let message_id = self.message.id.clone();
         v_flex()
-            .id(SharedString::from(format!("message-{}", self.message.id)))
+            .id(SharedString::from(format!("message-{message_id}")))
             .debug_selector(|| "chat-message".into())
             .w_full()
             .min_w_0()
             .gap_2()
+            .m_3()
             .p_3()
             .rounded_lg()
             .border_1()
@@ -221,9 +281,18 @@ impl gpui::RenderOnce for MessageView {
                 self.message
                     .blocks
                     .iter()
-                    .cloned()
                     .enumerate()
-                    .map(|(block_index, block)| render_block(self.index, block_index, block, cx)),
+                    .map(|(block_index, block)| {
+                        render_block(
+                            self.index,
+                            block_index,
+                            &message_id,
+                            block,
+                            &self.expanded_tools,
+                            self.on_toggle_tool.clone(),
+                            cx,
+                        )
+                    }),
             )
     }
 }
@@ -252,7 +321,6 @@ impl gpui::RenderOnce for MarkdownBody {
 fn safe_markdown(id: impl Into<gpui::ElementId>, source: impl Into<SharedString>) -> TextView {
     TextView::markdown(id, source)
         .selectable(true)
-        // 外层 ChatWindow 是唯一纵向滚动容器，避免消息内部再出现滚动条。
         .scrollable(false)
         .on_link_click(|url, _, window, cx| {
             let url: SharedString = url.clone();
@@ -284,24 +352,26 @@ fn safe_markdown(id: impl Into<gpui::ElementId>, source: impl Into<SharedString>
 #[derive(Clone, IntoElement)]
 pub struct ChatMinimap {
     document: Arc<ConversationDocument>,
-    scroll_handle: ScrollHandle,
+    list_state: ListState,
     message_count: usize,
     selected_message: Option<String>,
     on_navigate: Option<TailDetachHandler>,
+    on_toggle: Option<MinimapToggleHandler>,
 }
 
 impl ChatMinimap {
     pub fn new(
         document: Arc<ConversationDocument>,
-        scroll_handle: ScrollHandle,
+        list_state: ListState,
         message_count: usize,
     ) -> Self {
         Self {
             document,
-            scroll_handle,
+            list_state,
             message_count,
             selected_message: None,
             on_navigate: None,
+            on_toggle: None,
         }
     }
 
@@ -314,11 +384,24 @@ impl ChatMinimap {
         self.on_navigate = Some(Arc::new(handler));
         self
     }
+
+    pub fn on_toggle(mut self, handler: impl Fn(&mut App) + 'static) -> Self {
+        self.on_toggle = Some(Arc::new(handler));
+        self
+    }
 }
 
 impl gpui::RenderOnce for ChatMinimap {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let message_count = self.message_count;
+        let message_indexes = self
+            .document
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| (message.id.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        let on_toggle = self.on_toggle.clone();
         v_flex()
             .debug_selector(|| "chat-minimap".into())
             .w(px(176.))
@@ -328,51 +411,81 @@ impl gpui::RenderOnce for ChatMinimap {
             .border_l_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().sidebar)
-            .p_2()
-            .gap_1()
-            .overflow_y_scrollbar()
-            .children(self.document.minimap.iter().map(|node| {
-                let id = node.message_id.clone();
-                let selected = self.selected_message.as_deref() == Some(id.as_str());
-                let message_index = self
-                    .document
-                    .messages
-                    .iter()
-                    .position(|message| message.id == id)
-                    .unwrap_or(0)
-                    .min(message_count.saturating_sub(1));
-                let scroll = self.scroll_handle.clone();
-                let on_navigate = self.on_navigate.clone();
-                div()
-                    .id(SharedString::from(format!("minimap-{id}")))
-                    .debug_selector(|| "chat-minimap-node".into())
-                    .ml(px(f32::from(node.level.unwrap_or(1).saturating_sub(1)) * 7.))
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .text_xs()
-                    .truncate()
-                    .cursor_pointer()
-                    .when(selected, |item| item.bg(cx.theme().accent.opacity(0.16)))
-                    .hover(|item| item.bg(cx.theme().muted))
-                    .on_click(move |_, window, cx| {
-                        scroll.scroll_to_top_of_item(message_index);
-                        if let Some(handler) = &on_navigate {
-                            handler(window, cx);
-                        }
-                    })
-                    .child(node.label.clone())
-            }))
+            .child(
+                h_flex().justify_end().p_1().child(
+                    Button::new("hide-chat-minimap")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::PanelRight)
+                        .tooltip("隐藏目录")
+                        .on_click(move |_, _, cx| {
+                            if let Some(handler) = &on_toggle {
+                                handler(cx);
+                            }
+                        }),
+                ),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .p_2()
+                    .gap_1()
+                    .overflow_y_scrollbar()
+                    .children(self.document.minimap.iter().map(|node| {
+                        let id = node.message_id.clone();
+                        let selected = self.selected_message.as_deref() == Some(id.as_str());
+                        let message_index = message_indexes
+                            .get(id.as_str())
+                            .copied()
+                            .unwrap_or(0)
+                            .min(message_count.saturating_sub(1));
+                        let list_state = self.list_state.clone();
+                        let on_navigate = self.on_navigate.clone();
+                        div()
+                            .id(SharedString::from(format!("minimap-{id}")))
+                            .debug_selector(|| "chat-minimap-node".into())
+                            .ml(px(f32::from(node.level.unwrap_or(1).saturating_sub(1)) * 7.))
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .text_xs()
+                            .truncate()
+                            .cursor_pointer()
+                            .when(selected, |item| item.bg(cx.theme().accent.opacity(0.16)))
+                            .hover(|item| item.bg(cx.theme().muted))
+                            .on_click(move |_, window, cx| {
+                                list_state.scroll_to(ListOffset {
+                                    item_ix: message_index,
+                                    offset_in_item: px(0.),
+                                });
+                                if let Some(handler) = &on_navigate {
+                                    handler(window, cx);
+                                }
+                                window.refresh();
+                            })
+                            .child(node.label.clone())
+                    })),
+            )
     }
 }
 
-fn render_block(index: usize, block_index: usize, block: Block, cx: &App) -> gpui::AnyElement {
+fn render_block(
+    index: usize,
+    block_index: usize,
+    message_id: &str,
+    block: &Block,
+    expanded_tools: &HashSet<String>,
+    on_toggle_tool: Option<ToolToggleHandler>,
+    cx: &App,
+) -> gpui::AnyElement {
     match block {
-        Block::Markdown(markdown) => {
-            MarkdownBody::new(format!("markdown-{index}-{block_index}"), markdown.source)
-                .into_any_element()
-        }
-        Block::Code(code) => render_code(index, block_index, code, cx),
+        Block::Markdown(markdown) => MarkdownBody::new(
+            format!("markdown-{index}-{block_index}"),
+            markdown.source.clone(),
+        )
+        .into_any_element(),
+        Block::Code(code) => render_code(index, block_index, code.clone(), cx),
         Block::Thinking(text) => v_flex()
             .gap_1()
             .child(
@@ -384,26 +497,35 @@ fn render_block(index: usize, block_index: usize, block: Block, cx: &App) -> gpu
             )
             .child(safe_markdown(
                 format!("thinking-{index}-{block_index}"),
-                text,
+                text.clone(),
             ))
             .into_any_element(),
-        Block::Tool(tool) => render_tool(tool, cx),
-        Block::Diff(diff) => render_diff(diff, cx),
-        Block::Ansi(ansi) => render_ansi(ansi, cx),
-        Block::Image(image) => render_image(image, cx),
-        Block::Frontmatter(frontmatter) => render_frontmatter(frontmatter, cx),
+        Block::Tool(tool) => {
+            let key = tool_key(message_id, block_index, &tool.id);
+            render_tool(
+                tool.clone(),
+                key.clone(),
+                expanded_tools.contains(&key),
+                on_toggle_tool,
+                cx,
+            )
+        }
+        Block::Diff(diff) => render_diff(diff.clone(), cx),
+        Block::Ansi(ansi) => render_ansi(ansi.clone(), cx),
+        Block::Image(image) => render_image(image.clone(), cx),
+        Block::Frontmatter(frontmatter) => render_frontmatter(frontmatter.clone(), cx),
         Block::Notice(notice) => v_flex()
             .gap_1()
             .p_2()
             .rounded_md()
             .border_1()
             .border_color(cx.theme().border)
-            .child(div().text_sm().font_semibold().child(notice.title))
+            .child(div().text_sm().font_semibold().child(notice.title.clone()))
             .child(
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(notice.text),
+                    .child(notice.text.clone()),
             )
             .into_any_element(),
         Block::Unknown(unknown) => v_flex()
@@ -423,9 +545,17 @@ fn render_block(index: usize, block_index: usize, block: Block, cx: &App) -> gpu
                 div()
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_xs()
-                    .child(unknown.text),
+                    .child(unknown.text.clone()),
             )
             .into_any_element(),
+    }
+}
+
+fn tool_key(message_id: &str, block_index: usize, tool_id: &str) -> String {
+    if tool_id.is_empty() {
+        format!("{message_id}:{block_index}")
+    } else {
+        format!("{message_id}:{tool_id}")
     }
 }
 
@@ -472,7 +602,6 @@ fn render_code(index: usize, block_index: usize, code: CodeBlock, cx: &App) -> g
                     )
                 }),
         )
-        // TextView 的 fenced-code 路径由启用的 gpui-component tree-sitter features 高亮。
         .child(
             safe_markdown(
                 format!("code-{index}-{block_index}"),
@@ -483,14 +612,22 @@ fn render_code(index: usize, block_index: usize, code: CodeBlock, cx: &App) -> g
         .into_any_element()
 }
 
-fn render_tool(tool: ToolCard, cx: &App) -> gpui::AnyElement {
+fn render_tool(
+    tool: ToolCard,
+    key: String,
+    expanded: bool,
+    on_toggle_tool: Option<ToolToggleHandler>,
+    cx: &App,
+) -> gpui::AnyElement {
     let (status, color) = match tool.status {
         ToolStatus::Pending => ("pending", cx.theme().warning),
         ToolStatus::Success => ("success", cx.theme().success),
         ToolStatus::Error => ("error", cx.theme().danger),
         ToolStatus::Empty => ("empty", cx.theme().muted_foreground),
     };
+    let toggle_key = key.clone();
     v_flex()
+        .id(SharedString::from(format!("tool-card-{key}")))
         .debug_selector(|| "tool-card".into())
         .min_w_0()
         .gap_2()
@@ -500,8 +637,21 @@ fn render_tool(tool: ToolCard, cx: &App) -> gpui::AnyElement {
         .border_color(color.opacity(0.7))
         .child(
             h_flex()
+                .id(SharedString::from(format!("tool-toggle-{key}")))
+                .debug_selector(|| "tool-card-toggle".into())
                 .gap_2()
-                .child(div().text_sm().font_semibold().child(tool.name))
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    if let Some(handler) = &on_toggle_tool {
+                        handler(toggle_key.clone(), cx);
+                    }
+                })
+                .child(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .child(div().text_sm().font_semibold().child(tool.name.clone()))
                 .child(div().text_xs().text_color(color).child(status))
                 .when(tool.orphan, |row| {
                     row.child(
@@ -510,37 +660,48 @@ fn render_tool(tool: ToolCard, cx: &App) -> gpui::AnyElement {
                             .text_color(cx.theme().warning)
                             .child("orphan"),
                     )
-                }),
+                })
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if expanded { "收起" } else { "展开" }),
+                ),
         )
         .child(
             div()
                 .text_xs()
+                .truncate()
                 .text_color(cx.theme().muted_foreground)
                 .child(tool.preview),
         )
-        .child(
-            v_flex()
-                .gap_1()
-                .child(
-                    div()
-                        .text_xs()
-                        .font_semibold()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Input JSON"),
-                )
-                .child(
-                    div()
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .text_xs()
-                        .child(tool.input_json),
-                ),
-        )
-        .children(tool.output.into_iter().map(|output| match output {
-            ToolOutput::Text(text) => div().text_sm().child(text).into_any_element(),
-            ToolOutput::Ansi(ansi) => render_ansi(ansi, cx),
-            ToolOutput::Image(image) => render_image(image, cx),
-            ToolOutput::Diff(diff) => render_diff(diff, cx),
-        }))
+        .when(expanded, |view| {
+            view.child(
+                v_flex()
+                    .debug_selector(|| "tool-card-details".into())
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Input JSON"),
+                    )
+                    .child(
+                        div()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_xs()
+                            .child(tool.input_json),
+                    )
+                    .children(tool.output.into_iter().map(|output| match output {
+                        ToolOutput::Text(text) => div().text_sm().child(text).into_any_element(),
+                        ToolOutput::Ansi(ansi) => render_ansi(ansi, cx),
+                        ToolOutput::Image(image) => render_image(image, cx),
+                        ToolOutput::Diff(diff) => render_diff(diff, cx),
+                    })),
+            )
+        })
         .into_any_element()
 }
 
@@ -648,7 +809,6 @@ fn ansi_color(color: AnsiColor, cx: &App) -> gpui::Hsla {
             _ => cx.theme().foreground,
         },
         AnsiColor::Rgb(red, green, blue) => {
-            // ANSI 任意色先按感知亮度/主色投影到 theme semantic token，避免硬编码 RGB。
             let max = red.max(green).max(blue);
             let min = red.min(green).min(blue);
             if max.saturating_sub(min) < 24 {
@@ -761,9 +921,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn upward_wheel_detaches_tail_but_downward_wheel_keeps_it() {
-        assert!(!tail_attached_after_wheel(true, px(1.)));
-        assert!(tail_attached_after_wheel(true, px(-1.)));
-        assert!(!tail_attached_after_wheel(false, px(-1.)));
+    fn tool_keys_are_stable_and_fallback_for_missing_ids() {
+        assert_eq!(tool_key("m", 2, "call"), "m:call");
+        assert_eq!(tool_key("m", 2, ""), "m:2");
     }
 }
