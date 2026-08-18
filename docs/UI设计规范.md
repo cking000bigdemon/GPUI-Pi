@@ -1,6 +1,6 @@
 # GPUI-Pi UI 设计规范
 
-> 版本：v2.1（v1.0 为 R9 前置产出；v1.1 为 T3 目视验收后修订；v2.0 融合 pi-web 0.8.9 设计范本与 gpui-component 组件映射；**v2.1 为子代理审核后的勘误与收敛**，见文末「修订记录」）
+> 版本：v2.2（v1.0 为 R9 前置产出；v1.1 为 T3 目视验收后修订；v2.0 融合 pi-web 0.8.9 设计范本与 gpui-component 组件映射；v2.1 为子代理审核后的勘误与收敛；**v2.2 为 T3 复验后的用户气泡色勘误**，见文末「修订记录」）
 > 定位：本文件是 GPUI-Pi 界面视觉的唯一判据。与它冲突时以本规范为准；与立项文档冲突时以立项文档为准。
 > 来源基线：
 > - Zed 桌面端设计语言：`ZED_CHECKOUT/crates/theme/src/`、`ZED_CHECKOUT/crates/ui/src/styles/`、`ZED_CHECKOUT/crates/ui/src/components/`、`ZED_CHECKOUT/crates/agent_ui/src/`（下称 `ZED_*`）
@@ -148,7 +148,7 @@ pi-web 有三级文本色（`--text` / `--text-muted` / `--text-dim`），其中
 
 | 角色 | 用法 | 定义处 |
 |---|---|---|
-| 身份标识 | 用户消息气泡底 `opacity(0.10)` + 边框 `opacity(0.2)` | S-14 |
+| 身份标识 | ~~用户消息气泡底~~（v2.2 起气泡改由 `blue` 承担，见 S-14/§ 2.3；`blue` 同样不属状态色，本条豁免同样适用） | S-14 |
 | 选中态 | 列表行、minimap 节点底 `opacity(0.16)` | S-7 |
 | 焦点态 | `border_focused` 边框色 | S-6 |
 | 链接 / 可操作提示 | 文字色（或用 `cx.theme().link`） | § 2.1 |
@@ -161,7 +161,7 @@ pi-web 有三级文本色（`--text` / `--text-muted` / `--text-dim`），其中
 
 | 容器 | Zed 对应 | 本项目落地 |
 |---|---|---|
-| 用户消息气泡底 | —（改用 pi-web 基线，见 5.1） | `cx.theme().accent.opacity(0.10)`；边框 `cx.theme().accent.opacity(0.2)`。对应 pi-web `--user-bg`（浅 `#eff6ff` / 深 `#1e293b`）与 `border: 1px solid rgba(59,130,246,0.2)` |
+| 用户消息气泡底 | —（改用 pi-web 基线，见 5.1） | **`cx.theme().blue.opacity(0.10)`；边框 `cx.theme().blue.opacity(0.2)`**（v2.2 勘误：`accent` 在 gpui-component 里是中性 hover 色，铺不出可见的身份色）。`blue` 即 base.blue（浅 blue-600 / 深 blue-400），与 pi-web `--user-bg`（浅 `#eff6ff` / 深 `#1e293b`）、`border: 1px solid rgba(59,130,246,0.2)` 同族 |
 | 助手消息底 | 无（透明，纯文本流） | 不设背景 |
 | 工具/思考卡片底 | `element_background` 混合白 2.5% | **不铺底**（靠 `border.opacity(0.8)` 弱边框区分），header 同样不铺底 |
 | 代码块底 | 编辑器底 | `cx.theme().muted.opacity(0.42)` |
@@ -466,11 +466,18 @@ v_flex().items_end().mb_4()                    // 整条右对齐
         v_flex().max_w(relative(0.85))         // 气泡最宽 85%
             .px_3().py_2()                     // 12 / 8px
             .rounded_xl()                      // 12px
-            .bg(cx.theme().accent.opacity(0.10))
-            .border_1().border_color(cx.theme().accent.opacity(0.2))
+            .bg(cx.theme().blue.opacity(0.10))              // v2.2：走 base.blue
+            .border_1().border_color(cx.theme().blue.opacity(0.2))
             .text_sm()                         // 14px，见 S-12
     )
 ```
+
+> **v2.2 勘误**：此处曾写 `accent.opacity(…)`，前提是「本项目 accent=蓝」。经复核，gpui-component 的
+> `accent` 是 shadcn 语义的**中性 hover 色**（浅 neutral-100 / 深 neutral-800），10% 透明度铺在画布上
+> 不可见，T3 复验判红。气泡身份色改走 `cx.theme().blue`（base.blue：浅 blue-600 / 深 blue-400，
+> 与 pi-web `rgba(59,130,246,…)` 同族）；选中态边框用同源实色 `blue`。其余 `accent` 消费点
+> （列表/minimap 选中 0.16、焦点边框）**维持中性 accent**——pi-web 的 `--bg-selected` 同为中性灰，
+> 方向一致，是否也换蓝留待后续轮次统一评估。
 
 - **不显示 `User` 角色标签**——右对齐 + 气泡底色已经完成了身份区分，再加标签就是重复编码，且违反 S-8；
 - 气泡内正文 `text_sm`、行高 1.6；
@@ -640,7 +647,7 @@ pi-web 基线里这样的容器共 **9 处**（用户气泡 300、超大消息 4
 | 条款 | 落地形式 | 断言方式 |
 |---|---|---|
 | **S-13** 消息列 820 居中 | 列容器加 `debug_selector("message-column")` | 窗口宽 > 852 时断言 `bounds.size.width == px(820.)`；窄窗口断言 `width == 窗口宽 - 32` |
-| **S-14** 用户气泡 | 抽 `pub(crate) fn user_bubble_style(cx) -> UserBubbleStyle { bg, border, radius, max_w_ratio }` | `cx.update` 直接断言四个字段；另给气泡加 `debug_selector("user-bubble")`，断言其右缘贴列右缘、宽度 ≤ 列宽 × 0.85 |
+| **S-14** 用户气泡 | 抽 `pub(crate) fn user_bubble_style(cx) -> UserBubbleStyle { bg, border, selected_border, radius, max_w_ratio }`（v2.2：基色为 `cx.theme().blue`） | `cx.update` 直接断言各字段；深浅两种模式下断言边框饱和度 ≥ 0.5（防再次回归成中性灰，v2.2）；另给气泡加 `debug_selector("user-bubble")`，断言其右缘贴列右缘、宽度 ≤ 列宽 × 0.85 |
 | **S-18** 行高 | 抽 `pub const BODY_LINE_HEIGHT: f32 = 1.7;` | 断言常量值，并断言消息正文与用户气泡两处都引用它（不许各写各的） |
 | **S-16** 三/四级文本 | `dim_foreground(cx)` / `disabled_foreground(cx)` 两个函数 | 断言返回值 = `muted_foreground.opacity(0.7 / 0.5)`；grep 断言组件内无裸 `muted_foreground.opacity(` |
 | **S-15** 深色面板层级 | 主题投影集中在 `crates/ui/src/theme.rs` | 深色下断言 `theme.sidebar != theme.background` |
@@ -763,6 +770,22 @@ pi-web 是功能与阅读体验的对照基线，**不是逐像素复刻的对�
 ---
 
 ## 8. 修订记录
+
+### v2.2 —— T3 复验后的用户气泡色勘误
+
+T3 复验（浅色模式）判定用户气泡「颜色非常不明显」。核对后确认这是 v2.0/v2.1 遗留的**失实前提**，
+与 v2.1 勘误表同类：
+
+| 项 | v2.1 写的 | 实际 |
+|---|---|---|
+| `accent` | 「本项目 accent=蓝」（§ 2.1 多处） | gpui-component 默认主题的 `accent` 是 **shadcn 语义的中性 hover 色**（浅 `neutral-100` / 深 `neutral-800`），`opacity(0.10)` 铺在画布上不可见 |
+
+处置：
+
+- **用户气泡的身份色改走 `cx.theme().blue`**（base.blue：浅 blue-600 `#2563eb` / 深 blue-400 `#60a5fa`，与 pi-web `rgba(59,130,246,…)` 同族，深浅自适应）；透明度维持 0.10 底 / 0.2 边框不变；选中态边框用同源实色 `blue`；
+- `UserBubbleStyle` 增加 `selected_border` 字段，五值全部出自纯函数；§ 5.8 增加「深浅两种模式下边框饱和度 ≥ 0.5」的防回归断言——中性灰的饱和度趋近 0，这样气泡永远不可能再退化成看不见的灰；
+- **其余 `accent` 消费点不动**（列表/minimap 选中 `0.16`、焦点边框）：pi-web 的 `--bg-selected` 同为中性灰，中性 accent 在这些位置方向正确；是否统一换蓝留待后续轮次评估；
+- 同步修订处：§ 2.3 气泡行、§ 5.1 S-14 代码块与勘误注、S-24 表「身份标识」行、§ 5.8 S-14 行。
 
 ### v2.1 —— 子代理审核后的勘误与收敛
 

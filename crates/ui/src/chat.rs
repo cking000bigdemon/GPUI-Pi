@@ -85,18 +85,23 @@ pub(crate) const BODY_LINE_HEIGHT: f32 = 1.7;
 /// 用户气泡的可断言样式（规范 S-14 / § 5.8）。
 ///
 /// `debug_bounds` 只能断位置与尺寸，颜色/圆角/宽度比例断不了，
-/// 所以把这四个值收进纯函数，渲染与测试消费同一来源。
+/// 所以把这几个值收进纯函数，渲染与测试消费同一来源。
 pub(crate) struct UserBubbleStyle {
     pub bg: Hsla,
     pub border: Hsla,
+    pub selected_border: Hsla,
     pub radius: Pixels,
     pub max_w_ratio: f32,
 }
 
 pub(crate) fn user_bubble_style(cx: &App) -> UserBubbleStyle {
+    // 规范 v2.2 勘误：`accent` 在 gpui-component 里是中性 hover 色，10% 透明度铺不出
+    // 可见的身份色。气泡走 base.blue（浅 blue-600 / 深 blue-400），即 pi-web 的用户蓝。
+    let identity = cx.theme().blue;
     UserBubbleStyle {
-        bg: cx.theme().accent.opacity(0.10),
-        border: cx.theme().accent.opacity(0.2),
+        bg: identity.opacity(0.10),
+        border: identity.opacity(0.2),
+        selected_border: identity,
         radius: px(12.),
         max_w_ratio: 0.85,
     }
@@ -449,9 +454,9 @@ impl gpui::RenderOnce for MessageView {
                     .py_2()
                     .rounded(style.radius)
                     .border_1()
-                    // 选中态（minimap 定位）用边框实色表达，不与常规弱边框混淆（S-24）。
+                    // 选中态（minimap 定位）用同源实色边框表达，不与常规弱边框混淆。
                     .border_color(if selected {
-                        cx.theme().accent
+                        style.selected_border
                     } else {
                         style.border
                     })
@@ -1342,7 +1347,7 @@ mod tests {
         AppContext as _, Context, ListAlignment, Render, TestAppContext, VisualTestContext, size,
         transparent_black,
     };
-    use gpui_component::Root;
+    use gpui_component::{Root, ThemeMode};
     use pi_render::{MarkdownBlock, MinimapNode};
 
     use super::*;
@@ -1571,16 +1576,32 @@ mod tests {
         );
     }
 
-    /// § 5.8 S-14：气泡四项样式值全部出自 `user_bubble_style`，渲染与测试同源。
+    /// § 5.8 S-14：气泡样式值全部出自 `user_bubble_style`，渲染与测试同源；
+    /// 基色是 base.blue（v2.2 勘误），深浅两种模式下都必须是饱和的身份色，
+    /// 防止再次回归成看不见的中性灰（T3 复验意见）。
     #[gpui::test]
     fn user_bubble_style_matches_spec(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_component::init(cx);
-            let style = user_bubble_style(cx);
-            assert_eq!(style.bg, cx.theme().accent.opacity(0.10));
-            assert_eq!(style.border, cx.theme().accent.opacity(0.2));
-            assert_eq!(style.radius, px(12.), "气泡圆角是 rounded_xl 档（12px）");
-            assert!((style.max_w_ratio - 0.85).abs() < f32::EPSILON);
+            for mode in [ThemeMode::Light, ThemeMode::Dark] {
+                gpui_component::Theme::change(mode, None, cx);
+                let style = user_bubble_style(cx);
+                assert_eq!(style.bg, cx.theme().blue.opacity(0.10));
+                assert_eq!(style.border, cx.theme().blue.opacity(0.2));
+                assert_eq!(style.selected_border, cx.theme().blue);
+                assert_eq!(style.radius, px(12.), "气泡圆角是 rounded_xl 档（12px）");
+                assert!((style.max_w_ratio - 0.85).abs() < f32::EPSILON);
+                assert!(
+                    style.border.s >= 0.5,
+                    "{mode:?} 下气泡边框必须是饱和色（s={}），不许退化成中性灰",
+                    style.border.s
+                );
+                assert_ne!(
+                    style.bg,
+                    cx.theme().accent.opacity(0.10),
+                    "{mode:?} 下气泡底色不得回退到中性 accent"
+                );
+            }
         });
     }
 
