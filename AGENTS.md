@@ -57,11 +57,13 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 - 源码、脚本、fixture、构建产物仍放各自的标准目录，不为了“归档”复制进 `rounds/`；本地大日志与截图继续放 gitignored 的 `.pi/`，在任务卡中记录结论或引用路径；
 - 新增或引用轮次文件时禁止恢复 `rounds/round-NN.md`、`rounds/BLOCKED-NN.md` 这类扁平路径。
 
-## 代码审查派发
+## 代码审查工具路由
 
-- **按开发 harness 选择审查通道**：
-  - 使用 **pi harness** 开发时：代码 review 优先派发 `claude-code-review`（独立 Claude Code 子进程，只读审查，默认 `scope=working`）；若 `claude-code-review` 不可用（未登记、鉴权/限流不可用、启动失败等），降级派发 pi-subagents 的 `reviewer` 子代理，走下方「pi-subagents 审查路径」；
-  - 使用 **Claude Code / codex** 开发时：**不适用上述派发规则**，代码审查按对应工具自身的流程执行。
+- **本节只约束已有代码改动的独立审查通道**：不规定实现阶段由主会话还是子代理承担，也不得据此改变模型基于任务、能力与当前上下文自主选择的任务拆解、委派策略或 writer。使用 `claude-code-review` 不代表主会话必须充当 writer，也不降低 worker、scout 等子代理在实现阶段的可用性或优先级。
+- 当已有代码改动需要独立代码审查时，按开发 harness 选择审查通道：
+  - 使用 **pi harness** 时：优先调用 `claude-code-review`（独立 Claude Code 子进程，只读审查，默认 `scope=working`）；若 `claude-code-review` 不可用（未登记、鉴权/限流不可用、启动失败等），降级派发 pi-subagents 的 `reviewer` 子代理，走下方「pi-subagents 审查路径」；
+  - 使用 **Claude Code / codex** 时：**不适用上述路由规则**，代码审查按对应 harness 自身的流程执行。
+- 审查器始终只读，并与当前 writer 隔离。主会话负责判断是否接受审查结论；需要修改代码时，保持审查前已经形成的 writer 归属：此前由主会话实现则由主会话修复，此前由 worker 实现则将 findings 交回同一 worker。审查工具的选择本身不得触发 writer 身份切换。
 
 ### pi-subagents 审查路径（pi harness 降级用）
 
@@ -70,7 +72,7 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 - 若 `deepseek/deepseek-v4-pro` 未登记、鉴权/限流不可用或启动失败，立即以**不传 `model`** 的方式重试 reviewer，使其继承主会话模型；禁止拿 DeepSeek V4 Flash 或其他 DeepSeek 型号冒充 V4 Pro；
 - **DSV4 Pro 的 reviewer 任务必须从第一个字符开始用简体中文**，并在任务首部明确写“严禁英文前导语，调用工具前只能写中文”。它有时会先输出 `I'll review` / `Let me`，触发桌面端 `language-guard` 中断；此时工具层常只显示误导性的 `Operation aborted`；
 - DSV4 Pro 出现 `Operation aborted` 时，先查子代理 transcript 是否含 `[language-guard-restart]`。若存在，这是语言守卫中断，**不算模型/provider 启动失败，不得直接 fallback**；应保留 `deepseek/deepseek-v4-pro`，补强中文首字符约束后以 `context: fresh`、显式目标 `cwd` 重新运行，直到拿到完整审查结论；只有 transcript 无该标记且明确显示模型未登记、鉴权/限流或启动错误时，才按上一条 fallback；
-- 模型优先级不改变审查隔离要求：审查默认 `context: fresh`、只读、不与 writer 共用写权限，最终判断与修复仍由主会话负责。
+- 模型优先级不改变审查隔离要求：审查默认 `context: fresh`、只读、不与 writer 共用写权限。
 
 ## 平台归属
 
