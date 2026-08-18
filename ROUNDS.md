@@ -14,7 +14,7 @@
 | **R6** | 历史消息渲染（静态） | Windows | ✅ 已完成 | [#10](https://github.com/cking000bigdemon/GPUI-Pi/pull/10) | 2026-08-17 |
 | **R7** | 活会话流式 | Windows | ✅ 已完成 | [#13](https://github.com/cking000bigdemon/GPUI-Pi/pull/13) | 2026-08-17 |
 | **R8** | 输入框 / 附件 / slash 面板 | Windows | ✅ 已完成 | [#14](https://github.com/cking000bigdemon/GPUI-Pi/pull/14) | 2026-08-17 |
-| **R9** | 前端视觉打磨（依据 [`docs/UI设计规范.md`](docs/UI设计规范.md)，源自 Zed Agent Panel 设计语言调研） | Windows | ⬜ | — | — |
+| **R9** | 前端视觉打磨（依据 [`docs/UI设计规范.md`](docs/UI设计规范.md)，源自 Zed Agent Panel 设计语言调研） | Windows | 🟡 待验收（T1/T2 已过，T3 目视待人工） | — | — |
 | **R10** | 模型 · 思考级别 · 工具预设 | Windows | ⬜ | — | — |
 | **R11** | 文件浏览器 + 查看器 | Windows | ⬜ | — | — |
 | **R12** | git diff / worktree / 本轮改动文件 | Windows | ⬜ | — | — |

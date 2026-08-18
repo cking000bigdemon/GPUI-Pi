@@ -10,9 +10,9 @@ use gpui::{
     Styled as _, Subscription, Window, div, img, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Selectable as _,
-    Sizable as _, StyledExt as _,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _,
+    StyledExt as _,
+    button::{Button, ButtonVariants as _, Toggle, ToggleGroup, ToggleVariants as _},
     dock::{Panel, PanelControl, PanelEvent},
     h_flex,
     input::{InputEvent, Textarea, TextareaState},
@@ -830,14 +830,18 @@ impl ChatPanel {
         }
     }
 
-    fn select_steer(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.composer_mode = ComposerMode::Steer;
-        cx.notify();
-    }
-
-    fn select_follow_up(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.composer_mode = ComposerMode::FollowUp;
-        cx.notify();
+    /// ToggleGroup 回调：`checks` 是点击后每个 toggle 的新勾选状态。
+    ///
+    /// 语义仍是单选——点已选中的那个会把它翻成 false，此时保持当前模式不变，
+    /// 免得出现「两个模式都没选中」的空档。
+    fn select_mode(&mut self, checks: &[bool], cx: &mut Context<Self>) {
+        let Some(next) = next_composer_mode(checks, self.composer_mode) else {
+            return;
+        };
+        if self.composer_mode != next {
+            self.composer_mode = next;
+            cx.notify();
+        }
     }
 
     fn resume_follow(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1233,9 +1237,12 @@ impl Render for ChatPanel {
                             .debug_selector(|| "live-composer".into())
                             .flex_none()
                             .gap_2()
-                            .p_3()
+                            .px_2()
+                            .py_2()
                             .border_t_1()
                             .border_color(cx.theme().border)
+                            // 规范 5.6：composer 是编辑区，底色与画布同源，靠顶边框与消息流分开。
+                            .bg(cx.theme().background)
                             .when_some(popup, |composer, popup| composer.child(popup))
                             .when_some(attachments, |composer, attachments| {
                                 composer.child(attachments)
@@ -1244,11 +1251,14 @@ impl Render for ChatPanel {
                             .child(
                                 h_flex()
                                     .gap_2()
+                                    // 左：附件与上下文控件，一律 ghost + small（规范 5.6）。
                                     .child(
                                         Button::new("attach-images")
                                             .debug_selector(|| "attach-images".into())
+                                            .ghost()
                                             .small()
                                             .label("添加图片")
+                                            .tooltip("添加图片附件")
                                             .disabled(
                                                 self.attachments.len()
                                                     >= pi_data::MAX_ATTACHED_IMAGES,
@@ -1257,6 +1267,7 @@ impl Render for ChatPanel {
                                     )
                                     .child(
                                         Button::new("start-live-session")
+                                            .ghost()
                                             .small()
                                             .label(if live_started {
                                                 "活会话已启动"
@@ -1269,35 +1280,74 @@ impl Render for ChatPanel {
                                             )
                                             .on_click(cx.listener(Self::start_live)),
                                     )
-                                    .child(
-                                        Button::new("composer-steer")
-                                            .small()
-                                            .label("Steer")
-                                            .selected(self.composer_mode == ComposerMode::Steer)
-                                            .on_click(cx.listener(Self::select_steer)),
-                                    )
-                                    .child(
-                                        Button::new("composer-follow-up")
-                                            .small()
-                                            .label("Follow-up")
-                                            .selected(self.composer_mode == ComposerMode::FollowUp)
-                                            .on_click(cx.listener(Self::select_follow_up)),
-                                    )
                                     .child(div().flex_1())
+                                    // 右：模式切换 → 停止（仅运行态）→ 发送（唯一常驻主操作）。
                                     .child(
-                                        Button::new("abort-live")
-                                            .small()
-                                            .danger()
-                                            .label(if stopping {
-                                                "正在停止…"
-                                            } else {
-                                                "停止"
-                                            })
-                                            .disabled(!running)
-                                            .on_click(cx.listener(Self::abort)),
+                                        div()
+                                            .debug_selector(|| "composer-mode-toggle".into())
+                                            .child(
+                                                ToggleGroup::new("composer-mode")
+                                                    .small()
+                                                    .outline()
+                                                    .segmented()
+                                                    .child(
+                                                        Toggle::new("composer-steer")
+                                                            .checked(
+                                                                self.composer_mode
+                                                                    == ComposerMode::Steer,
+                                                            )
+                                                            // Toggle 本身不是 InteractiveElement，
+                                                            // 标签包一层 div 才能给测试留下可定位的选择器。
+                                                            .child(
+                                                                div()
+                                                                    .debug_selector(|| {
+                                                                        "composer-mode-steer".into()
+                                                                    })
+                                                                    .child("Steer"),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        Toggle::new("composer-follow-up")
+                                                            .checked(
+                                                                self.composer_mode
+                                                                    == ComposerMode::FollowUp,
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .debug_selector(|| {
+                                                                        "composer-mode-follow-up"
+                                                                            .into()
+                                                                    })
+                                                                    .child("Follow-up"),
+                                                            ),
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        |this, checks: &Vec<bool>, _, cx| {
+                                                            this.select_mode(checks, cx);
+                                                        },
+                                                    )),
+                                            ),
                                     )
+                                    // 停止是运行态才有意义的破坏性操作，空闲时不占位（规范 1.4）。
+                                    .when(running || stopping, |row| {
+                                        row.child(
+                                            Button::new("abort-live")
+                                                .debug_selector(|| "abort-live".into())
+                                                .ghost()
+                                                .small()
+                                                .danger()
+                                                .label(if stopping {
+                                                    "正在停止…"
+                                                } else {
+                                                    "停止"
+                                                })
+                                                .disabled(!running)
+                                                .on_click(cx.listener(Self::abort)),
+                                        )
+                                    })
                                     .child(
                                         Button::new("send-live")
+                                            .debug_selector(|| "send-live".into())
                                             .small()
                                             .primary()
                                             .label(if running { "加入队列" } else { "发送" })
@@ -1310,6 +1360,30 @@ impl Render for ChatPanel {
                             ),
                     ),
             )
+    }
+}
+
+/// ToggleGroup 的新勾选状态 → composer 模式。
+///
+/// ToggleGroup 是多选语义：它把被点的那一段取反后，把**整个**勾选向量回传。
+/// 所以 `[true, true]` 不代表「两个都选中」，而是「在 Steer 已选中时点了 Follow-up」。
+/// 这里靠与当前模式对应的向量比对，找出真正被点的那一段，从而还原成单选。
+/// 点已选中的那一段会得到 `[false, false]`，同样能定位到它本身，模式保持不变。
+const fn next_composer_mode(checks: &[bool], current: ComposerMode) -> Option<ComposerMode> {
+    let [steer, follow_up] = match *checks {
+        [steer, follow_up] => [steer, follow_up],
+        _ => return None,
+    };
+    let (steer_now, follow_up_now) = match current {
+        ComposerMode::Steer => (true, false),
+        ComposerMode::FollowUp => (false, true),
+    };
+    if steer != steer_now {
+        Some(ComposerMode::Steer)
+    } else if follow_up != follow_up_now {
+        Some(ComposerMode::FollowUp)
+    } else {
+        None
     }
 }
 
@@ -2061,6 +2135,71 @@ mod tests {
                 assert_eq!(panel.drafts.get("one").text, "draft one");
             });
         });
+    }
+
+    /// T2 ④：Steer / Follow-up 合并成 ToggleGroup 后仍是单选，点击可来回切换。
+    #[gpui::test]
+    fn composer_mode_toggle_group_switches_selection(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, _| {
+            assert_eq!(panel.composer_mode, ComposerMode::Steer);
+        });
+
+        let group = visual
+            .debug_bounds("composer-mode-toggle")
+            .expect("composer 模式切换组必须渲染");
+        assert!(group.size.width > px(0.));
+        let steer = visual
+            .debug_bounds("composer-mode-steer")
+            .expect("Steer 段必须渲染")
+            .center();
+        let follow_up = visual
+            .debug_bounds("composer-mode-follow-up")
+            .expect("Follow-up 段必须渲染")
+            .center();
+
+        visual.simulate_click(follow_up, Modifiers::default());
+        visual.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert_eq!(panel.composer_mode, ComposerMode::FollowUp);
+        });
+
+        visual.simulate_click(steer, Modifiers::default());
+        visual.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert_eq!(panel.composer_mode, ComposerMode::Steer);
+        });
+    }
+
+    /// ToggleGroup 回传的是整个勾选向量，必须还原成单选，且点已选中的那一段不清空模式。
+    #[test]
+    fn toggle_group_checks_are_reduced_to_a_single_mode() {
+        use ComposerMode::{FollowUp, Steer};
+
+        // Steer 已选中时点 Follow-up → [true, true]。
+        assert_eq!(next_composer_mode(&[true, true], Steer), Some(FollowUp));
+        // Follow-up 已选中时点 Steer → 同样是 [true, true]，但被点的是另一段。
+        assert_eq!(next_composer_mode(&[true, true], FollowUp), Some(Steer));
+        // 点已选中的那一段 → [false, false]，模式保持不变。
+        assert_eq!(next_composer_mode(&[false, false], Steer), Some(Steer));
+        assert_eq!(
+            next_composer_mode(&[false, false], FollowUp),
+            Some(FollowUp)
+        );
+        // 与当前状态一致说明没有任何一段被点，什么都不做。
+        assert_eq!(next_composer_mode(&[true, false], Steer), None);
+        assert_eq!(next_composer_mode(&[false, true], FollowUp), None);
+        // 段数对不上时保持沉默，不猜。
+        assert_eq!(next_composer_mode(&[true], Steer), None);
+    }
+
+    /// 停止按钮只在运行态出现，空闲时不占位（规范 1.4 三级操作可见性）。
+    #[gpui::test]
+    fn abort_button_is_absent_until_running(cx: &mut TestAppContext) {
+        let mut visual = render_status(cx, ChatStatus::Ready(document("hello")));
+        assert!(visual.debug_bounds("send-live").is_some());
+        assert!(visual.debug_bounds("abort-live").is_none());
     }
 
     #[gpui::test]
