@@ -16,6 +16,7 @@ use gpui_component::{
     dock::{Panel, PanelControl, PanelEvent},
     h_flex,
     input::{InputEvent, Textarea, TextareaState},
+    menu::{DropdownMenu as _, PopupMenuItem},
     scroll::ScrollableElement as _,
     v_flex,
 };
@@ -23,8 +24,8 @@ use pi_render::{ConversationDocument, ConversationItem, LivePhase};
 
 use crate::{
     live_session::{
-        ActiveSession, ComposerMode, ComposerSubmission, PumpMessage, RequestFailureKind,
-        RpcIntent, official_binary,
+        ActiveSession, ComposerMode, ComposerSubmission, ControlOperation, ControlRequest,
+        PumpMessage, RequestFailureKind, RpcIntent, SessionControls, ToolPreset, official_binary,
     },
     session_sidebar::SessionSelected,
 };
@@ -33,6 +34,7 @@ pub struct ChatPanel {
     focus_handle: FocusHandle,
     status: ChatStatus,
     load_generation: u64,
+    active_generation: u64,
     active: Option<ActiveSession>,
     composer: gpui::Entity<TextareaState>,
     composer_mode: ComposerMode,
@@ -40,6 +42,10 @@ pub struct ChatPanel {
     drafts: pi_data::DraftStore,
     attachments: Vec<ComposerAttachment>,
     slash_commands: Vec<pi_rpc::RpcSlashCommand>,
+    controls: Option<SessionControls>,
+    model_names: Arc<std::collections::HashMap<String, String>>,
+    tool_preset: ToolPreset,
+    control_operation: Option<ControlOperation>,
     popup: Option<ComposerPopup>,
     popup_index: usize,
     file_index: Option<pi_data::FileIndex>,
@@ -190,6 +196,7 @@ impl ChatPanel {
             focus_handle: cx.focus_handle(),
             status: ChatStatus::Empty,
             load_generation: 0,
+            active_generation: 0,
             active: None,
             composer,
             composer_mode: ComposerMode::Steer,
@@ -197,6 +204,10 @@ impl ChatPanel {
             drafts: pi_data::DraftStore::default(),
             attachments: Vec::new(),
             slash_commands: Vec::new(),
+            controls: None,
+            model_names: Arc::new(std::collections::HashMap::new()),
+            tool_preset: ToolPreset::Inherit,
+            control_operation: None,
             popup: None,
             popup_index: 0,
             file_index: None,
@@ -274,6 +285,7 @@ impl ChatPanel {
     pub fn load_selection(&mut self, selection: SessionSelected, cx: &mut Context<Self>) {
         self.save_current_draft(cx);
         self.load_generation = self.load_generation.wrapping_add(1);
+        self.active_generation = self.active_generation.wrapping_add(1);
         let generation = self.load_generation;
         if let Some(active) = self.active.take() {
             active.shutdown();
@@ -286,6 +298,10 @@ impl ChatPanel {
         self.composer_cwd = Some(selection.cwd.clone());
         self.file_index = None;
         self.slash_commands.clear();
+        self.controls = None;
+        self.model_names = Arc::new(std::collections::HashMap::new());
+        self.tool_preset = ToolPreset::Inherit;
+        self.control_operation = None;
         self.popup = None;
         self.popup_index = 0;
         self.prepare_draft_restore();
@@ -358,13 +374,16 @@ impl ChatPanel {
     }
 
     fn start_live(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.active.is_some() {
+        if self.active.is_some() || self.control_operation.is_some() {
             return;
         }
         let ChatStatus::Ready(history) = &self.status else {
             return;
         };
-        let generation = self.load_generation;
+        self.active_generation = self.active_generation.wrapping_add(1);
+        self.activity_generation = 0;
+        self.calibration_generation = 0;
+        let generation = self.active_generation;
         let history = history.clone();
         let session_path = history.source_path.clone();
         let cwd = session_cwd(&session_path).unwrap_or_else(|| PathBuf::from("."));
@@ -374,6 +393,7 @@ impl ChatPanel {
             session_path,
             cwd,
             (*history).clone(),
+            self.tool_preset,
         );
         match result {
             Ok((active, receiver)) => {
@@ -389,12 +409,14 @@ impl ChatPanel {
     fn spawn_pump(&self, mut receiver: UnboundedReceiver<PumpMessage>, cx: &mut Context<Self>) {
         cx.spawn(async move |panel, cx| {
             while let Some(message) = receiver.next().await {
-                let stopped = matches!(message, PumpMessage::Stopped { .. });
-                let _ = panel.update(cx, |panel, cx| {
-                    panel.handle_pump(message);
-                    cx.notify();
-                });
-                if stopped {
+                let should_stop = panel
+                    .update(cx, |panel, cx| {
+                        let should_stop = panel.handle_pump(message);
+                        cx.notify();
+                        should_stop
+                    })
+                    .unwrap_or(true);
+                if should_stop {
                     return;
                 }
             }
@@ -402,16 +424,43 @@ impl ChatPanel {
         .detach();
     }
 
-    fn handle_pump(&mut self, message: PumpMessage) {
+    fn handle_pump(&mut self, message: PumpMessage) -> bool {
         let generation = match &message {
             PumpMessage::Events { generation, .. }
             | PumpMessage::RequestFinished { generation, .. }
             | PumpMessage::CommandsLoaded { generation, .. }
+            | PumpMessage::ControlsLoaded { generation, .. }
+            | PumpMessage::ControlFinished { generation, .. }
+            | PumpMessage::ToolRestartFinished { generation, .. }
             | PumpMessage::Calibrated { generation, .. }
             | PumpMessage::Stopped { generation, .. } => *generation,
         };
-        if generation != self.load_generation {
-            return;
+        if generation != self.active_generation {
+            if let PumpMessage::ToolRestartFinished {
+                result: Ok(active), ..
+            } = message
+            {
+                active.shutdown();
+            }
+            return false;
+        }
+        if let PumpMessage::ToolRestartFinished { preset, result, .. } = message {
+            self.control_operation = None;
+            match result {
+                Ok(active) => {
+                    self.active = Some(*active);
+                    self.tool_preset = preset;
+                    self.rpc_error = None;
+                    if let Some(active) = self.active.as_ref() {
+                        active.refresh_metadata();
+                    }
+                }
+                Err(error) => {
+                    self.active = None;
+                    self.rpc_error = Some(format!("工具预设重启失败；请重新启动活会话：{error}"));
+                }
+            }
+            return false;
         }
         if let PumpMessage::Stopped { error, .. } = &message
             && self.active.is_none()
@@ -419,13 +468,17 @@ impl ChatPanel {
             if let Some(error) = error {
                 self.rpc_error = Some(error.clone());
             }
-            return;
+            if self.control_operation == Some(ControlOperation::Tools) {
+                return false;
+            }
+            self.control_operation = None;
+            return true;
         }
         let Some(active) = self.active.as_mut() else {
-            return;
+            return false;
         };
         if generation != active.generation() {
-            return;
+            return false;
         }
         match message {
             PumpMessage::Events { events, .. } => {
@@ -499,19 +552,37 @@ impl ChatPanel {
                 }
                 Err(error) => self.rpc_error = Some(format!("加载 slash 命令失败：{error}")),
             },
+            PumpMessage::ControlsLoaded { result, .. } => match result {
+                Ok(controls) => self.apply_controls(controls),
+                Err(error) => self.rpc_error = Some(format!("加载会话控制失败：{error}")),
+            },
+            PumpMessage::ControlFinished { result, .. } => {
+                self.control_operation = None;
+                match result {
+                    Ok(controls) => {
+                        self.apply_controls(controls);
+                        self.rpc_error = None;
+                    }
+                    Err(error) => {
+                        self.rpc_error = Some(format!("切换会话控制失败：{error}"));
+                        active.refresh_metadata();
+                    }
+                }
+            }
+            PumpMessage::ToolRestartFinished { .. } => {}
             PumpMessage::Calibrated {
                 calibration,
                 result,
                 ..
             } => {
                 if calibration < self.calibration_generation {
-                    return;
+                    return false;
                 }
                 self.calibration_generation = calibration;
                 // 校准线程属于发起它的 settled 状态；若其间已有新 run 开始，
                 // 旧文件快照不能覆盖正在流式的草稿。
                 if active.phase() != LivePhase::Idle || self.activity_generation != calibration {
-                    return;
+                    return false;
                 }
                 match result {
                     Ok(document) => {
@@ -528,8 +599,118 @@ impl ChatPanel {
                     self.rpc_error = Some(error);
                 }
                 self.active = None;
+                self.control_operation = None;
+                return true;
             }
         }
+        false
+    }
+
+    fn apply_controls(&mut self, controls: SessionControls) {
+        self.model_names = Arc::new(
+            controls
+                .models
+                .iter()
+                .map(|model| {
+                    (
+                        format!("{}\0{}", model.provider, model.id),
+                        model.name.clone(),
+                    )
+                })
+                .collect(),
+        );
+        self.controls = Some(controls);
+    }
+
+    fn set_model(&mut self, provider: String, model_id: String, cx: &mut Context<Self>) {
+        if self.control_operation.is_some() {
+            return;
+        }
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        if active.phase() != LivePhase::Idle {
+            return;
+        }
+        self.control_operation = Some(ControlOperation::Model);
+        self.rpc_error = None;
+        active.request_control(ControlRequest::SetModel { provider, model_id });
+        cx.notify();
+    }
+
+    fn can_cycle_model(&self) -> bool {
+        self.control_operation.is_none()
+            && self
+                .active
+                .as_ref()
+                .is_some_and(|active| active.phase() == LivePhase::Idle)
+    }
+
+    fn cycle_model(&mut self, cx: &mut Context<Self>) {
+        if !self.can_cycle_model() {
+            return;
+        }
+        let active = self
+            .active
+            .as_ref()
+            .expect("can_cycle_model requires an active session");
+        self.control_operation = Some(ControlOperation::Model);
+        self.rpc_error = None;
+        active.request_control(ControlRequest::CycleModel);
+        cx.notify();
+    }
+
+    fn set_thinking(&mut self, level: pi_rpc::ThinkingLevel, cx: &mut Context<Self>) {
+        if self.control_operation.is_some() {
+            return;
+        }
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        if active.phase() != LivePhase::Idle {
+            return;
+        }
+        self.control_operation = Some(ControlOperation::Thinking);
+        self.rpc_error = None;
+        active.request_control(ControlRequest::SetThinking(level));
+        cx.notify();
+    }
+
+    fn set_tool_preset(&mut self, preset: ToolPreset, cx: &mut Context<Self>) {
+        if self.control_operation.is_some() || preset == self.tool_preset {
+            return;
+        }
+        let Some(active) = self.active.take() else {
+            self.tool_preset = preset;
+            self.rpc_error = None;
+            cx.notify();
+            return;
+        };
+        if active.phase() != LivePhase::Idle {
+            self.active = Some(active);
+            return;
+        }
+        let ChatStatus::Ready(history) = &self.status else {
+            self.active = Some(active);
+            return;
+        };
+        let history = history.clone();
+        let session_path = history.source_path.clone();
+        let cwd = session_cwd(&session_path).unwrap_or_else(|| PathBuf::from("."));
+        self.control_operation = Some(ControlOperation::Tools);
+        self.rpc_error = None;
+        self.active_generation = self.active_generation.wrapping_add(1);
+        self.activity_generation = 0;
+        self.calibration_generation = 0;
+        active.restart_with_tools(
+            self.active_generation,
+            official_binary(),
+            session_path,
+            cwd,
+            (*history).clone(),
+            preset,
+        );
+        cx.notify();
     }
 
     fn composer_changed(&mut self, input: &gpui::Entity<TextareaState>, cx: &mut Context<Self>) {
@@ -635,6 +816,11 @@ impl ChatPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if is_cycle_model_keystroke(event) && self.can_cycle_model() {
+            self.cycle_model(cx);
+            cx.stop_propagation();
+            return;
+        }
         if event.keystroke.modifiers.secondary()
             && event.keystroke.key.eq_ignore_ascii_case("v")
             && self.attach_clipboard_images(cx)
@@ -685,6 +871,11 @@ impl ChatPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.control_operation.is_some() {
+            self.rpc_error = Some("会话控制切换中，暂不能发送消息".to_owned());
+            cx.notify();
+            return;
+        }
         let message = input.read(cx).value().trim().to_owned();
         if message.is_empty() && self.attachments.is_empty() {
             return;
@@ -1089,6 +1280,9 @@ impl Render for ChatPanel {
         }
         self.follow_requested = false;
         let panel = cx.entity();
+        let model_panel = panel.clone();
+        let thinking_panel = panel.clone();
+        let tools_panel = panel.clone();
         let content = match &self.status {
             ChatStatus::Empty => centered_state(
                 IconName::Bot,
@@ -1112,6 +1306,7 @@ impl Render for ChatPanel {
                 .into_any_element(),
             ChatStatus::Ready(document) => {
                 gpui_pi_ui::ChatWindow::new(document.clone(), self.list_state.clone())
+                    .model_names(self.model_names.clone())
                     .show_minimap(self.minimap_visible)
                     .expanded_tools(Arc::new(self.expanded_tools.clone()))
                     .expanded_processes(Arc::new(self.expanded_processes.clone()))
@@ -1179,6 +1374,40 @@ impl Render for ChatPanel {
             (steering + follow_up > 0)
                 .then(|| format!("队列：steer {steering} · follow-up {follow_up}"))
         });
+        let controls_enabled = session_controls_enabled(phase, self.control_operation.is_some());
+        let tools_enabled = !running
+            && !stopping
+            && self.control_operation.is_none()
+            && matches!(self.status, ChatStatus::Ready(_));
+        let current_model = self
+            .controls
+            .as_ref()
+            .and_then(|controls| controls.model.as_ref())
+            .map_or_else(|| "模型".to_owned(), |model| model.name.clone());
+        let current_thinking = self.controls.as_ref().map_or_else(
+            || "Thinking".to_owned(),
+            |controls| thinking_label(controls.thinking_level).to_owned(),
+        );
+        let models = self
+            .controls
+            .as_ref()
+            .map(|controls| controls.models.clone())
+            .unwrap_or_default();
+        let thinking_levels = self
+            .controls
+            .as_ref()
+            .map(|controls| controls.thinking_levels.clone())
+            .unwrap_or_default();
+        let current_model_ref = self
+            .controls
+            .as_ref()
+            .and_then(|controls| controls.model.as_ref())
+            .map(|model| (model.provider.clone(), model.id.clone()));
+        let current_thinking_level = self
+            .controls
+            .as_ref()
+            .map(|controls| controls.thinking_level);
+        let selected_tool_preset = self.tool_preset;
 
         div()
             .id("chat-workspace")
@@ -1276,9 +1505,128 @@ impl Render for ChatPanel {
                                             })
                                             .disabled(
                                                 live_started
+                                                    || self.control_operation.is_some()
                                                     || !matches!(self.status, ChatStatus::Ready(_)),
                                             )
                                             .on_click(cx.listener(Self::start_live)),
+                                    )
+                                    .child(
+                                        Button::new("model-selector")
+                                            .debug_selector(|| "model-selector".into())
+                                            .ghost()
+                                            .small()
+                                            .label(
+                                                if self.control_operation
+                                                    == Some(ControlOperation::Model)
+                                                {
+                                                    "切换中…".to_owned()
+                                                } else {
+                                                    current_model
+                                                },
+                                            )
+                                            .tooltip("切换模型；Ctrl+P 循环")
+                                            .disabled(!controls_enabled || models.is_empty())
+                                            .dropdown_menu(move |mut menu, _, _| {
+                                                for model in &models {
+                                                    let provider = model.provider.clone();
+                                                    let model_id = model.id.clone();
+                                                    let panel = model_panel.clone();
+                                                    let selected = current_model_ref
+                                                        .as_ref()
+                                                        .is_some_and(|current| {
+                                                            current.0 == provider
+                                                                && current.1 == model_id
+                                                        });
+                                                    menu = menu.item(
+                                                        PopupMenuItem::new(model.name.clone())
+                                                            .checked(selected)
+                                                            .on_click(move |_, _, cx| {
+                                                                panel.update(cx, |panel, cx| {
+                                                                    panel.set_model(
+                                                                        provider.clone(),
+                                                                        model_id.clone(),
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            }),
+                                                    );
+                                                }
+                                                menu.scrollable(true)
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("thinking-selector")
+                                            .debug_selector(|| "thinking-selector".into())
+                                            .ghost()
+                                            .small()
+                                            .label(
+                                                if self.control_operation
+                                                    == Some(ControlOperation::Thinking)
+                                                {
+                                                    "切换中…".to_owned()
+                                                } else {
+                                                    current_thinking
+                                                },
+                                            )
+                                            .tooltip("切换思考级别")
+                                            .disabled(
+                                                !controls_enabled || thinking_levels.is_empty(),
+                                            )
+                                            .dropdown_menu(move |mut menu, _, _| {
+                                                for level in &thinking_levels {
+                                                    let level = *level;
+                                                    let panel = thinking_panel.clone();
+                                                    menu = menu.item(
+                                                        PopupMenuItem::new(thinking_label(level))
+                                                            .checked(
+                                                                current_thinking_level
+                                                                    == Some(level),
+                                                            )
+                                                            .on_click(move |_, _, cx| {
+                                                                panel.update(cx, |panel, cx| {
+                                                                    panel.set_thinking(level, cx);
+                                                                });
+                                                            }),
+                                                    );
+                                                }
+                                                menu
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("tools-selector")
+                                            .debug_selector(|| "tools-selector".into())
+                                            .ghost()
+                                            .small()
+                                            .label(
+                                                if self.control_operation
+                                                    == Some(ControlOperation::Tools)
+                                                {
+                                                    "工具重启中…".to_owned()
+                                                } else {
+                                                    format!("工具：{}", self.tool_preset.label())
+                                                },
+                                            )
+                                            .tooltip("切换工具预设；会重启活会话")
+                                            .disabled(!tools_enabled)
+                                            .dropdown_menu(move |mut menu, _, _| {
+                                                for preset in ToolPreset::ALL {
+                                                    let panel = tools_panel.clone();
+                                                    menu = menu.item(
+                                                        PopupMenuItem::new(format!(
+                                                            "{} · {}",
+                                                            preset.label(),
+                                                            preset.description()
+                                                        ))
+                                                        .checked(selected_tool_preset == preset)
+                                                        .on_click(move |_, _, cx| {
+                                                            panel.update(cx, |panel, cx| {
+                                                                panel.set_tool_preset(preset, cx);
+                                                            });
+                                                        }),
+                                                    );
+                                                }
+                                                menu
+                                            }),
                                     )
                                     .child(div().flex_1())
                                     // 右：模式切换 → 停止（仅运行态）→ 发送（唯一常驻主操作）。
@@ -1351,7 +1699,11 @@ impl Render for ChatPanel {
                                             .small()
                                             .primary()
                                             .label(if running { "加入队列" } else { "发送" })
-                                            .disabled(!live_started || stopping)
+                                            .disabled(
+                                                !live_started
+                                                    || stopping
+                                                    || self.control_operation.is_some(),
+                                            )
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 let input = this.composer.clone();
                                                 this.submit_composer(&input, window, cx);
@@ -1387,6 +1739,10 @@ const fn next_composer_mode(checks: &[bool], current: ComposerMode) -> Option<Co
     }
 }
 
+const fn session_controls_enabled(phase: Option<LivePhase>, busy: bool) -> bool {
+    matches!(phase, Some(LivePhase::Idle)) && !busy
+}
+
 const fn should_restore_submission(kind: RequestFailureKind) -> bool {
     matches!(kind, RequestFailureKind::Rejected)
 }
@@ -1411,6 +1767,14 @@ fn build_submission(message: String, attachments: &[ComposerAttachment]) -> Comp
             .map(|attachment| attachment.draft.clone())
             .collect(),
     }
+}
+
+fn is_cycle_model_keystroke(event: &KeyDownEvent) -> bool {
+    event.keystroke.modifiers.control
+        && !event.keystroke.modifiers.alt
+        && !event.keystroke.modifiers.shift
+        && !event.keystroke.modifiers.platform
+        && event.keystroke.key.eq_ignore_ascii_case("p")
 }
 
 fn slash_query(value: &str) -> Option<&str> {
@@ -1440,6 +1804,18 @@ fn gpui_image_to_draft(image: Image) -> Option<pi_data::DraftImage> {
         ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::Webp
     )
     .then_some(draft)
+}
+
+const fn thinking_label(level: pi_rpc::ThinkingLevel) -> &'static str {
+    match level {
+        pi_rpc::ThinkingLevel::Off => "Off",
+        pi_rpc::ThinkingLevel::Minimal => "Minimal",
+        pi_rpc::ThinkingLevel::Low => "Low",
+        pi_rpc::ThinkingLevel::Medium => "Medium",
+        pi_rpc::ThinkingLevel::High => "High",
+        pi_rpc::ThinkingLevel::Xhigh => "XHigh",
+        pi_rpc::ThinkingLevel::Max => "Max",
+    }
 }
 
 fn centered_state(
@@ -1566,6 +1942,7 @@ mod tests {
             role,
             timestamp: None,
             label: None,
+            model: None,
             blocks: vec![pi_render::Block::Markdown(pi_render::MarkdownBlock {
                 source: (0..line_count)
                     .map(|line| format!("{prefix} line {line}"))
@@ -1609,6 +1986,7 @@ mod tests {
             role: MessageRole::Assistant,
             timestamp: None,
             label: None,
+            model: None,
             blocks: vec![pi_render::Block::Thinking(
                 (0..160)
                     .map(|line| format!("Expanded process detail {line}"))
@@ -1820,6 +2198,28 @@ mod tests {
 
     fn render_status(cx: &mut TestAppContext, status: ChatStatus) -> VisualTestContext {
         render_status_with_panel(cx, status).0
+    }
+
+    fn fixture_model(id: &str, name: &str, provider: &str) -> pi_rpc::Model {
+        pi_rpc::Model {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            api: "fixture".to_owned(),
+            provider: provider.to_owned(),
+            base_url: "https://fixture.invalid".to_owned(),
+            reasoning: true,
+            input: vec![pi_rpc::ModelInput::Text],
+            cost: pi_rpc::ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                tiers: None,
+            },
+            context_window: 100_000,
+            max_tokens: 4_096,
+            extra: Default::default(),
+        }
     }
 
     #[gpui::test]
@@ -2194,6 +2594,74 @@ mod tests {
         assert_eq!(next_composer_mode(&[true], Steer), None);
     }
 
+    /// 模型、thinking、工具三个选择器在会话控制数据到达后都进入渲染树。
+    #[gpui::test]
+    fn session_control_selectors_render_current_state(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, cx| {
+            let model = fixture_model("model-one", "Model One", "provider-one");
+            panel.apply_controls(SessionControls {
+                model: Some(model.clone()),
+                thinking_level: pi_rpc::ThinkingLevel::High,
+                models: vec![model],
+                thinking_levels: vec![pi_rpc::ThinkingLevel::Off, pi_rpc::ThinkingLevel::High],
+            });
+            panel.tool_preset = ToolPreset::ReadOnly;
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        for selector in ["model-selector", "thinking-selector", "tools-selector"] {
+            assert!(
+                visual.debug_bounds(selector).is_some(),
+                "missing {selector}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn tool_restart_failure_is_recoverable_and_stale_failures_are_ignored(cx: &mut TestAppContext) {
+        let (_visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, _| {
+            panel.active_generation = 7;
+            panel.activity_generation = 9;
+            panel.calibration_generation = 9;
+            panel.control_operation = Some(ControlOperation::Tools);
+            panel.rpc_error = None;
+            assert!(!panel.handle_pump(PumpMessage::ToolRestartFinished {
+                generation: 6,
+                preset: ToolPreset::ReadOnly,
+                result: Err("stale".to_owned()),
+            }));
+            assert_eq!(panel.control_operation, Some(ControlOperation::Tools));
+            assert!(panel.rpc_error.is_none());
+
+            assert!(!panel.handle_pump(PumpMessage::ToolRestartFinished {
+                generation: 7,
+                preset: ToolPreset::ReadOnly,
+                result: Err("spawn failed".to_owned()),
+            }));
+            assert!(panel.active.is_none());
+            assert!(panel.control_operation.is_none());
+            assert!(panel.rpc_error.as_deref().is_some_and(|error| {
+                error.contains("重新启动活会话") && error.contains("spawn failed")
+            }));
+            assert_eq!(panel.activity_generation, 9);
+            assert_eq!(panel.calibration_generation, 9);
+        });
+    }
+
+    #[gpui::test]
+    fn tool_preset_can_be_selected_before_starting_live_session(cx: &mut TestAppContext) {
+        let (_visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, cx| {
+            assert!(panel.active.is_none());
+            panel.set_tool_preset(ToolPreset::ReadOnly, cx);
+            assert_eq!(panel.tool_preset, ToolPreset::ReadOnly);
+            assert!(panel.active.is_none());
+        });
+    }
+
     /// 停止按钮只在运行态出现，空闲时不占位（规范 1.4 三级操作可见性）。
     #[gpui::test]
     fn abort_button_is_absent_until_running(cx: &mut TestAppContext) {
@@ -2227,11 +2695,28 @@ mod tests {
         let panel = captured.borrow().clone().unwrap();
         panel.update(cx, |panel, _| {
             panel.load_generation = 2;
+            panel.active_generation = 2;
             assert!(!panel.finish_load(1, "old".to_owned(), Ok(document("old"))));
             assert!(matches!(panel.status, ChatStatus::Empty));
             assert!(panel.finish_load(2, "new".to_owned(), Ok(document("new"))));
             assert!(matches!(panel.status, ChatStatus::Ready(_)));
         });
+    }
+
+    #[test]
+    fn ctrl_p_is_the_model_cycle_shortcut() {
+        let ctrl_p = gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("ctrl-p").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        };
+        let ctrl_shift_p = gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("ctrl-shift-p").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        };
+        assert!(is_cycle_model_keystroke(&ctrl_p));
+        assert!(!is_cycle_model_keystroke(&ctrl_shift_p));
     }
 
     #[test]
@@ -2268,6 +2753,20 @@ mod tests {
             drafts.restore_submission("session", pi_data::ComposerDraft::default());
         }
         assert_eq!(drafts.get("session"), before);
+    }
+
+    #[test]
+    fn session_controls_only_enable_for_idle_non_busy_sessions() {
+        assert!(session_controls_enabled(Some(LivePhase::Idle), false));
+        for phase in [
+            None,
+            Some(LivePhase::Running),
+            Some(LivePhase::Stopping),
+            Some(LivePhase::Error),
+        ] {
+            assert!(!session_controls_enabled(phase, false));
+        }
+        assert!(!session_controls_enabled(Some(LivePhase::Idle), true));
     }
 
     #[test]

@@ -7,9 +7,9 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use serde_json::Value;
 
 use crate::{
-    Block, ConversationDocument, ConversationItem, Message, MessageRole, MinimapNode, NoticeBlock,
-    RenderDiagnostic, ToolCard, ToolOutput, ToolStatus, parse_ansi, parse_unified_diff,
-    project_conversation,
+    Block, ConversationDocument, ConversationItem, Message, MessageRole, MinimapNode, ModelRef,
+    NoticeBlock, RenderDiagnostic, ToolCard, ToolOutput, ToolStatus, parse_ansi,
+    parse_unified_diff, project_conversation,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -688,7 +688,15 @@ fn render_live_message(
             .and_then(Value::as_str)
             .map(str::to_owned),
         label: None,
+        model: live_model_ref(value),
         blocks,
+    })
+}
+
+fn live_model_ref(value: &Value) -> Option<ModelRef> {
+    Some(ModelRef {
+        provider: value.get("provider")?.as_str()?.to_owned(),
+        id: value.get("model")?.as_str()?.to_owned(),
     })
 }
 

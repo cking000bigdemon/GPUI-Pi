@@ -10,6 +10,7 @@ use pi_rpc::{
     Client, ClientConfig, ClientError, ClientEvent, Command, CommandsData, ImageContent, ImageKind,
     LifecycleEvent, RpcSessionState, SlashCommandSource,
 };
+use serde_json::Value;
 
 fn fake_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_fake_child"))
@@ -76,6 +77,61 @@ fn initial_session_is_used_by_the_first_spawn() {
         Some(initial.clone())
     );
     assert_eq!(client.resume_session(), Some(initial));
+    client.shutdown().unwrap();
+}
+
+#[test]
+fn new_client_can_resume_the_same_session_with_a_new_tool_allowlist() {
+    let session = std::env::temp_dir().join(format!(
+        "pi-rpc-tool-restart-session-{}.jsonl",
+        std::process::id()
+    ));
+    let mut initial = config();
+    initial.initial_session = Some(session.clone());
+    initial
+        .args
+        .extend(["--tools".into(), "read,bash,edit,write".into()]);
+    let first = Client::spawn(initial).unwrap();
+    let first_state: Value = first
+        .request_data(Command::GetState, Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(
+        first_state["sessionFile"],
+        session.to_string_lossy().as_ref()
+    );
+    assert_eq!(first_state["toolAllowlist"], "read,bash,edit,write");
+    let first_pid = first.pid().unwrap();
+    first.shutdown().unwrap();
+
+    let mut restarted = config();
+    restarted.initial_session = Some(session.clone());
+    restarted
+        .args
+        .extend(["--tools".into(), "read,grep,find,ls".into()]);
+    let second = Client::spawn(restarted).unwrap();
+    let second_state: Value = second
+        .request_data(Command::GetState, Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(
+        second_state["sessionFile"],
+        session.to_string_lossy().as_ref()
+    );
+    // fake child 的 sessionId 由同一个 --session 路径派生；这里只验证重启参数透传。
+    assert_eq!(second_state["sessionId"], first_state["sessionId"]);
+    assert_eq!(second_state["toolAllowlist"], "read,grep,find,ls");
+    assert_ne!(second.pid().unwrap(), first_pid);
+    second.shutdown().unwrap();
+}
+
+#[test]
+fn empty_tool_allowlist_is_preserved_as_an_explicit_argument() {
+    let mut child_config = config();
+    child_config.args.extend(["--tools".into(), "".into()]);
+    let client = Client::spawn(child_config).unwrap();
+    let state: Value = client
+        .request_data(Command::GetState, Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(state["toolAllowlist"], "");
     client.shutdown().unwrap();
 }
 

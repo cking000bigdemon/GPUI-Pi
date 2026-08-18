@@ -74,12 +74,19 @@ pub enum MessageRole {
     Unknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRef {
+    pub provider: String,
+    pub id: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
     pub id: String,
     pub role: MessageRole,
     pub timestamp: Option<String>,
     pub label: Option<String>,
+    pub model: Option<ModelRef>,
     pub blocks: Vec<Block>,
 }
 
@@ -334,9 +341,15 @@ pub fn render_session(session: &SessionFile) -> ConversationDocument {
 
     let mut consumed_results = HashSet::new();
     let mut messages = Vec::new();
+    let mut current_model = None;
     for index in selected {
         let entry = &session.entries[index];
         match entry {
+            SessionEntry::ModelChange {
+                provider, model_id, ..
+            } => {
+                current_model = model_ref_from_parts(provider.as_deref(), model_id.as_deref());
+            }
             SessionEntry::Message { base, message } => {
                 let fallback = messages.len();
                 let role = message
@@ -360,6 +373,7 @@ pub fn render_session(session: &SessionFile) -> ConversationDocument {
                     base,
                     message,
                     fallback,
+                    current_model.as_ref(),
                     &results,
                     &mut consumed_results,
                     &mut diagnostics,
@@ -391,6 +405,7 @@ pub fn render_session(session: &SessionFile) -> ConversationDocument {
                             .clone()
                             .unwrap_or_else(|| "自定义消息".to_owned()),
                     ),
+                    model: None,
                     blocks,
                 });
             }
@@ -404,6 +419,7 @@ pub fn render_session(session: &SessionFile) -> ConversationDocument {
                 role: MessageRole::Compaction,
                 timestamp: base.timestamp.clone(),
                 label: Some("上下文压缩".to_owned()),
+                model: None,
                 blocks: vec![Block::Notice(NoticeBlock {
                     title: tokens_before.map_or_else(
                         || "上下文压缩".to_owned(),
@@ -422,6 +438,7 @@ pub fn render_session(session: &SessionFile) -> ConversationDocument {
                 role: MessageRole::BranchSummary,
                 timestamp: base.timestamp.clone(),
                 label: Some("分支摘要".to_owned()),
+                model: None,
                 blocks: vec![Block::Notice(NoticeBlock {
                     title: from_id.as_ref().map_or_else(
                         || "分支摘要".to_owned(),
@@ -439,12 +456,13 @@ pub fn render_session(session: &SessionFile) -> ConversationDocument {
                 role: MessageRole::Unknown,
                 timestamp: base.timestamp.clone(),
                 label: Some("未知会话条目".to_owned()),
+                model: None,
                 blocks: vec![Block::Unknown(UnknownBlock {
                     kind: entry_type.clone(),
                     text: visible_json(raw),
                 })],
             }),
-            // model/thinking/label/session_info/custom 都是元数据，不占据对话正文。
+            // thinking/label/session_info/custom 都是元数据，不占据对话正文。
             _ => {}
         }
     }
@@ -556,6 +574,7 @@ fn render_message(
     base: &EntryBase,
     message: &Value,
     fallback: usize,
+    current_model: Option<&ModelRef>,
     results: &HashMap<String, ToolResultData>,
     consumed_results: &mut HashSet<String>,
     diagnostics: &mut Vec<RenderDiagnostic>,
@@ -567,6 +586,7 @@ fn render_message(
             role: MessageRole::Assistant,
             timestamp: base.timestamp.clone(),
             label: Some("Bash execution".to_owned()),
+            model: None,
             blocks: vec![Block::Tool(render_bash_execution(message))],
         });
     }
@@ -620,7 +640,24 @@ fn render_message(
         role,
         timestamp: base.timestamp.clone(),
         label: None,
+        model: (role == MessageRole::Assistant)
+            .then(|| message_model_ref(message).or_else(|| current_model.cloned()))
+            .flatten(),
         blocks,
+    })
+}
+
+fn message_model_ref(message: &Value) -> Option<ModelRef> {
+    model_ref_from_parts(
+        message.get("provider").and_then(Value::as_str),
+        message.get("model").and_then(Value::as_str),
+    )
+}
+
+fn model_ref_from_parts(provider: Option<&str>, id: Option<&str>) -> Option<ModelRef> {
+    Some(ModelRef {
+        provider: provider?.to_owned(),
+        id: id?.to_owned(),
     })
 }
 
@@ -977,6 +1014,7 @@ fn orphan_result_message(
         role: MessageRole::Unknown,
         timestamp: base.timestamp.clone(),
         label: Some("未配对工具结果".to_owned()),
+        model: None,
         blocks: vec![Block::Tool(ToolCard {
             id: result
                 .tool_call_id
@@ -1436,6 +1474,7 @@ pub(crate) fn project_conversation(
                     role: final_message.role,
                     timestamp: final_message.timestamp.clone(),
                     label: final_message.label.clone(),
+                    model: final_message.model.clone(),
                     blocks: process_blocks,
                 }));
             }
@@ -1451,6 +1490,7 @@ pub(crate) fn project_conversation(
                     role: final_message.role,
                     timestamp: final_message.timestamp.clone(),
                     label: final_message.label.clone(),
+                    model: final_message.model.clone(),
                     blocks: answer_blocks,
                 });
                 push_minimap_node(&mut minimap, &answer, turn);
@@ -1747,6 +1787,50 @@ mod tests {
     }
 
     #[test]
+    fn model_change_only_applies_to_following_assistant_messages() {
+        let document = render_fixture(&[
+            serde_json::json!({"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":"first"}}),
+            serde_json::json!({"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","content":"before"}}),
+            serde_json::json!({"type":"model_change","id":"m1","parentId":"a1","provider":"provider-one","modelId":"model-one"}),
+            serde_json::json!({"type":"message","id":"u2","parentId":"m1","message":{"role":"user","content":"second"}}),
+            serde_json::json!({"type":"message","id":"a2","parentId":"u2","message":{"role":"assistant","content":"after"}}),
+            serde_json::json!({"type":"model_change","id":"m2","parentId":"a2","provider":"provider-two","modelId":"model-two"}),
+            serde_json::json!({"type":"message","id":"a3","parentId":"m2","message":{"role":"assistant","provider":"wire-provider","model":"wire-model","content":"wire wins"}}),
+        ]);
+
+        assert_eq!(document.messages[0].model, None);
+        assert_eq!(document.messages[1].model, None);
+        assert_eq!(document.messages[2].model, None);
+        assert_eq!(
+            document.messages[3].model,
+            Some(ModelRef {
+                provider: "provider-one".to_owned(),
+                id: "model-one".to_owned(),
+            })
+        );
+        assert_eq!(
+            document.messages[4].model,
+            Some(ModelRef {
+                provider: "wire-provider".to_owned(),
+                id: "wire-model".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn incomplete_model_change_clears_the_cursor_without_guessing() {
+        let document = render_fixture(&[
+            serde_json::json!({"type":"model_change","id":"m1","parentId":null,"provider":"provider-one","modelId":"model-one"}),
+            serde_json::json!({"type":"message","id":"a1","parentId":"m1","message":{"role":"assistant","content":"first"}}),
+            serde_json::json!({"type":"model_change","id":"m2","parentId":"a1","provider":"provider-two"}),
+            serde_json::json!({"type":"message","id":"a2","parentId":"m2","message":{"role":"assistant","content":"second"}}),
+        ]);
+
+        assert!(document.messages[0].model.is_some());
+        assert_eq!(document.messages[1].model, None);
+    }
+
+    #[test]
     fn markdown_frontmatter_code_mermaid_and_minimap() {
         let document = render_fixture(&[
             serde_json::json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"---\ntitle: Demo\ntags: [one, two]\nauthor: Pi\n---\nHello world"}}),
@@ -1820,6 +1904,7 @@ mod tests {
             role: MessageRole::Assistant,
             timestamp: None,
             label: None,
+            model: None,
             blocks: vec![
                 Block::Markdown(MarkdownBlock {
                     source: "early text".to_owned(),

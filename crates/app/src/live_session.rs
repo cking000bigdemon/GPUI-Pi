@@ -12,8 +12,9 @@ use pi_render::{
 };
 
 use pi_rpc::{
-    AssistantMessageEvent, Client, ClientConfig, ClientEvent, Command, CommandsData, ImageContent,
-    ImageKind, RpcEvent, RpcSlashCommand, StreamingBehavior,
+    AssistantMessageEvent, AvailableModelsData, Client, ClientConfig, ClientEvent, Command,
+    CommandsData, ImageContent, ImageKind, Model, RpcEvent, RpcSessionState, RpcSlashCommand,
+    StreamingBehavior, ThinkingLevel, ThinkingLevelsData,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -43,6 +44,85 @@ pub enum RpcIntent {
     Abort,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolPreset {
+    #[default]
+    Inherit,
+    None,
+    ReadOnly,
+    Default,
+    Full,
+}
+
+impl ToolPreset {
+    pub const ALL: [Self; 5] = [
+        Self::Inherit,
+        Self::None,
+        Self::ReadOnly,
+        Self::Default,
+        Self::Full,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Inherit => "跟随 pi",
+            Self::None => "关闭",
+            Self::ReadOnly => "只读",
+            Self::Default => "默认",
+            Self::Full => "完整",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Inherit => "沿用 settings.json 的 defaultTools 与扩展工具",
+            Self::None => "不启用任何工具（扩展工具也不生效）",
+            Self::ReadOnly => "内建 read、grep、find、ls（扩展工具不生效）",
+            Self::Default => "内建四件套 read、bash、edit、write（扩展工具不生效）",
+            Self::Full => "全部 7 个内建工具（扩展工具不生效）",
+        }
+    }
+
+    pub const fn tool_names(self) -> &'static [&'static str] {
+        match self {
+            Self::Inherit | Self::None => &[],
+            Self::ReadOnly => &["read", "grep", "find", "ls"],
+            Self::Default => &["read", "bash", "edit", "write"],
+            Self::Full => &["bash", "read", "edit", "write", "grep", "find", "ls"],
+        }
+    }
+
+    pub fn append_args(self, args: &mut Vec<std::ffi::OsString>) {
+        if self == Self::Inherit {
+            return;
+        }
+        args.push("--tools".into());
+        args.push(self.tool_names().join(",").into());
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionControls {
+    pub model: Option<Model>,
+    pub thinking_level: ThinkingLevel,
+    pub models: Vec<Model>,
+    pub thinking_levels: Vec<ThinkingLevel>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlOperation {
+    Model,
+    Thinking,
+    Tools,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ControlRequest {
+    SetModel { provider: String, model_id: String },
+    CycleModel,
+    SetThinking(ThinkingLevel),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ComposerSubmission {
     pub message: String,
@@ -70,7 +150,6 @@ pub enum RequestFailureKind {
     Ambiguous,
 }
 
-#[derive(Debug)]
 pub enum PumpMessage {
     Events {
         generation: u64,
@@ -86,6 +165,19 @@ pub enum PumpMessage {
     CommandsLoaded {
         generation: u64,
         result: Result<Vec<RpcSlashCommand>, String>,
+    },
+    ControlsLoaded {
+        generation: u64,
+        result: Result<SessionControls, String>,
+    },
+    ControlFinished {
+        generation: u64,
+        result: Result<SessionControls, String>,
+    },
+    ToolRestartFinished {
+        generation: u64,
+        preset: ToolPreset,
+        result: Result<Box<ActiveSession>, String>,
     },
     Calibrated {
         generation: u64,
@@ -105,6 +197,15 @@ pub struct ActiveSession {
     pump: UnboundedSender<PumpMessage>,
 }
 
+struct ActiveSessionSpawn {
+    generation: u64,
+    binary: PathBuf,
+    session_path: PathBuf,
+    cwd: PathBuf,
+    history: ConversationDocument,
+    tool_preset: ToolPreset,
+}
+
 impl ActiveSession {
     pub fn spawn(
         generation: u64,
@@ -112,29 +213,51 @@ impl ActiveSession {
         session_path: PathBuf,
         cwd: PathBuf,
         history: ConversationDocument,
+        tool_preset: ToolPreset,
     ) -> Result<(Self, UnboundedReceiver<PumpMessage>), String> {
-        let mut config = ClientConfig::new(binary);
-        config.current_dir = Some(cwd);
-        config.initial_session = Some(session_path);
+        let (pump, receiver) = mpsc::unbounded();
+        let active = Self::spawn_with_pump(
+            ActiveSessionSpawn {
+                generation,
+                binary,
+                session_path,
+                cwd,
+                history,
+                tool_preset,
+            },
+            pump,
+            true,
+        )?;
+        Ok((active, receiver))
+    }
+
+    fn spawn_with_pump(
+        spawn: ActiveSessionSpawn,
+        pump: UnboundedSender<PumpMessage>,
+        refresh_metadata: bool,
+    ) -> Result<Self, String> {
+        let mut config = ClientConfig::new(spawn.binary);
+        config.current_dir = Some(spawn.cwd);
+        config.initial_session = Some(spawn.session_path);
         config.args = vec!["--no-context-files".into()];
+        spawn.tool_preset.append_args(&mut config.args);
         let session_path = config
             .initial_session
             .clone()
             .expect("active session requires an initial path");
         let client = Client::spawn(config).map_err(|error| error.to_string())?;
         let events = client.subscribe();
-        let (pump, receiver) = mpsc::unbounded();
-        spawn_event_pump(generation, session_path, events, pump.clone());
-        spawn_commands_request(generation, client.clone(), pump.clone());
-        Ok((
-            Self {
-                generation,
-                client,
-                reducer: LiveSessionReducer::new(history),
-                pump,
-            },
-            receiver,
-        ))
+        spawn_event_pump(spawn.generation, session_path, events, pump.clone());
+        let active = Self {
+            generation: spawn.generation,
+            client,
+            reducer: LiveSessionReducer::new(spawn.history),
+            pump,
+        };
+        if refresh_metadata {
+            active.refresh_metadata();
+        }
+        Ok(active)
     }
 
     pub const fn generation(&self) -> u64 {
@@ -223,6 +346,63 @@ impl ActiveSession {
             .expect("failed to spawn RPC request thread");
     }
 
+    pub fn refresh_metadata(&self) {
+        spawn_commands_request(self.generation, self.client.clone(), self.pump.clone());
+        spawn_controls_request(self.generation, self.client.clone(), self.pump.clone());
+    }
+
+    pub fn request_control(&self, request: ControlRequest) {
+        let generation = self.generation;
+        let client = self.client.clone();
+        let pump = self.pump.clone();
+        thread::Builder::new()
+            .name(format!("pi-rpc-control-{generation}"))
+            .spawn(move || {
+                let result = execute_control(&client, request);
+                let _ = pump.unbounded_send(PumpMessage::ControlFinished { generation, result });
+            })
+            .expect("failed to spawn RPC control thread");
+    }
+
+    pub fn restart_with_tools(
+        self,
+        generation: u64,
+        binary: PathBuf,
+        session_path: PathBuf,
+        cwd: PathBuf,
+        history: ConversationDocument,
+        preset: ToolPreset,
+    ) {
+        let pump = self.pump.clone();
+        thread::Builder::new()
+            .name(format!("pi-rpc-tool-restart-{generation}"))
+            .spawn(move || {
+                let shutdown = self.client.shutdown().map_err(|error| error.to_string());
+                drop(self);
+                let result = shutdown.and_then(|()| {
+                    Self::spawn_with_pump(
+                        ActiveSessionSpawn {
+                            generation,
+                            binary,
+                            session_path,
+                            cwd,
+                            history,
+                            tool_preset: preset,
+                        },
+                        pump.clone(),
+                        false,
+                    )
+                    .map(Box::new)
+                });
+                let _ = pump.unbounded_send(PumpMessage::ToolRestartFinished {
+                    generation,
+                    preset,
+                    result,
+                });
+            })
+            .expect("failed to spawn tool restart thread");
+    }
+
     pub fn shutdown(self) {
         let generation = self.generation;
         let pump = self.pump.clone();
@@ -237,6 +417,73 @@ impl ActiveSession {
             })
             .expect("failed to spawn RPC shutdown thread");
     }
+}
+
+fn spawn_controls_request(generation: u64, client: Client, pump: UnboundedSender<PumpMessage>) {
+    thread::Builder::new()
+        .name(format!("pi-rpc-controls-{generation}"))
+        .spawn(move || {
+            let result = load_controls(&client);
+            let _ = pump.unbounded_send(PumpMessage::ControlsLoaded { generation, result });
+        })
+        .expect("failed to spawn RPC controls thread");
+}
+
+pub(crate) fn load_controls(client: &Client) -> Result<SessionControls, String> {
+    let state = client
+        .request_data::<RpcSessionState>(Command::GetState, REQUEST_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    let mut models = client
+        .request_data::<AvailableModelsData>(Command::GetAvailableModels, REQUEST_TIMEOUT)
+        .map_err(|error| error.to_string())?
+        .models;
+    models.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let thinking_levels = client
+        .request_data::<ThinkingLevelsData>(Command::GetAvailableThinkingLevels, REQUEST_TIMEOUT)
+        .map_err(|error| error.to_string())?
+        .levels;
+    Ok(SessionControls {
+        model: state.model,
+        thinking_level: state.thinking_level,
+        models,
+        thinking_levels,
+    })
+}
+
+pub(crate) fn execute_control(
+    client: &Client,
+    request: ControlRequest,
+) -> Result<SessionControls, String> {
+    match request {
+        ControlRequest::SetModel { provider, model_id } => {
+            client
+                .request_data::<Model>(Command::SetModel { provider, model_id }, REQUEST_TIMEOUT)
+                .map_err(|error| error.to_string())?;
+        }
+        ControlRequest::CycleModel => {
+            let response = client
+                .request(Command::CycleModel, REQUEST_TIMEOUT)
+                .map_err(|error| error.to_string())?;
+            if !response.success {
+                return Err(response.error.unwrap_or_else(|| "unknown RPC error".into()));
+            }
+        }
+        ControlRequest::SetThinking(level) => {
+            let response = client
+                .request(Command::SetThinkingLevel { level }, REQUEST_TIMEOUT)
+                .map_err(|error| error.to_string())?;
+            if !response.success {
+                return Err(response.error.unwrap_or_else(|| "unknown RPC error".into()));
+            }
+        }
+    }
+    load_controls(client)
 }
 
 fn spawn_commands_request(generation: u64, client: Client, pump: UnboundedSender<PumpMessage>) {
@@ -514,6 +761,59 @@ fn project_update(event: AssistantMessageEvent) -> LiveAssistantUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GPUI_PI_TEST_FAKE_CHILD=target/debug/fake_child.exe"]
+    fn session_controls_and_switches_use_typed_rpc_state() {
+        let binary = std::env::var_os("GPUI_PI_TEST_FAKE_CHILD")
+            .map(PathBuf::from)
+            .expect("GPUI_PI_TEST_FAKE_CHILD must point to pi-rpc fake_child");
+        let client = Client::spawn(ClientConfig::new(binary)).unwrap();
+        let controls = load_controls(&client).unwrap();
+        assert_eq!(controls.models.len(), 2);
+        assert_eq!(controls.model.as_ref().unwrap().id, "model-one");
+        assert_eq!(
+            controls.thinking_levels,
+            [ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High,]
+        );
+
+        let controls = execute_control(&client, ControlRequest::CycleModel).unwrap();
+        assert_eq!(controls.model.as_ref().unwrap().id, "model-two");
+        let controls =
+            execute_control(&client, ControlRequest::SetThinking(ThinkingLevel::High)).unwrap();
+        assert_eq!(controls.thinking_level, ThinkingLevel::High);
+        let controls = execute_control(
+            &client,
+            ControlRequest::SetModel {
+                provider: "provider-one".to_owned(),
+                model_id: "model-one".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(controls.model.as_ref().unwrap().id, "model-one");
+        client.shutdown().unwrap();
+    }
+
+    #[test]
+    fn tool_presets_generate_explicit_allowlists() {
+        let expected = [
+            (ToolPreset::Inherit, None),
+            (ToolPreset::None, Some("")),
+            (ToolPreset::ReadOnly, Some("read,grep,find,ls")),
+            (ToolPreset::Default, Some("read,bash,edit,write")),
+            (ToolPreset::Full, Some("bash,read,edit,write,grep,find,ls")),
+        ];
+        for (preset, allowlist) in expected {
+            let mut args = Vec::new();
+            preset.append_args(&mut args);
+            match allowlist {
+                Some(allowlist) => {
+                    assert_eq!(args, ["--tools", allowlist].map(std::ffi::OsString::from));
+                }
+                None => assert!(args.is_empty()),
+            }
+        }
+    }
 
     #[test]
     fn streaming_intents_use_atomic_prompt_behavior() {
