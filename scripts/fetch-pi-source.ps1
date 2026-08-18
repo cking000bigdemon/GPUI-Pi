@@ -1,4 +1,4 @@
-# Fetch the pinned pi source into a stable directory outside auto-updated desktop app files.
+﻿# Fetch the pinned pi source into a stable directory outside auto-updated desktop app files.
 # This source tree is read-only reference material; fetch-pi.ps1 still provides the runtime binary.
 #
 # Publish flow: download the codeload tag archive -> verify archive SHA256 -> extract into a

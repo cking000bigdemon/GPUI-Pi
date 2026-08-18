@@ -1,4 +1,4 @@
-# Fetch the pinned pi-web reference source (feature baseline) into a stable directory.
+﻿# Fetch the pinned pi-web reference source (feature baseline) into a stable directory.
 # Same flow as fetch-pi-source.ps1: verify remote tag -> commit via the GitHub API
 # (annotated tags need a two-level lookup), verify archive SHA256, extract into a
 # same-volume temp dir, write the pin marker, full manifest comparison, then publish.

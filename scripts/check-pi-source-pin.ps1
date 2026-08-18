@@ -1,4 +1,4 @@
-# Verify the pinned pi source tree matches the checked-in manifest byte-for-byte.
+﻿# Verify the pinned pi source tree matches the checked-in manifest byte-for-byte.
 # Used by check-pins.ps1 and fetch-pi-source.ps1.
 # Usage: check-pi-source-pin.ps1 [-Dir <path>]
 #   Default dir is vendor\upstream\pi-0.84.2; fetch passes its temp extraction dir.

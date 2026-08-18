@@ -1,4 +1,4 @@
-# 拉取钉死版本的 pi 独立二进制到 vendor\pi\。
+﻿# 拉取钉死版本的 pi 独立二进制到 vendor\pi\。
 #
 # 版本钉死点之一 —— 另外两处是 crates/pi-rpc/src/lib.rs 的 PINNED_PI_VERSION
 # 和 scripts/fetch-pi.sh，三者由 pi-rpc 的单测强制同源。

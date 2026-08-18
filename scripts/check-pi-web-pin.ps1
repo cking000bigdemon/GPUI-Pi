@@ -1,4 +1,4 @@
-# Verify the pinned pi-web reference tree matches the checked-in manifest byte-for-byte.
+﻿# Verify the pinned pi-web reference tree matches the checked-in manifest byte-for-byte.
 # Used by check-pins.ps1 and fetch-pi-web.ps1.
 # Usage: check-pi-web-pin.ps1 [-Dir <path>]
 param([string]$Dir)

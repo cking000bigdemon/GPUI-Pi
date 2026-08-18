@@ -1,4 +1,4 @@
-# T1 静态验收（validate.sh 的 Windows 版）—— 每一轮 /loop 迭代结束都必须全绿。
+﻿# T1 静态验收（validate.sh 的 Windows 版）—— 每一轮 /loop 迭代结束都必须全绿。
 #
 #   .\scripts\validate.ps1          全量
 #   .\scripts\validate.ps1 -Logic   只跑三个纯逻辑 crate
