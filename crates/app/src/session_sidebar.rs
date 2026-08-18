@@ -14,6 +14,7 @@ use gpui_component::{
     input::{Input, InputState},
     notification::Notification,
     scroll::ScrollableElement as _,
+    tooltip::Tooltip,
     v_flex,
 };
 use pi_data::{
@@ -52,6 +53,9 @@ pub struct SessionSidebar {
     rename_input: gpui::Entity<InputState>,
     rename_target: Option<String>,
     load_generation: u64,
+    /// 当前鼠标悬停的会话行。行内低频操作（重命名/导出/删除）只在悬停行渲染，
+    /// 规范 S-9：一行默认不铺开三个图标按钮。
+    hovered_id: Option<String>,
     probe: Option<LayoutProbe>,
 }
 
@@ -74,6 +78,7 @@ impl SessionSidebar {
             rename_input,
             rename_target: None,
             load_generation: 0,
+            hovered_id: None,
             probe: None,
         };
         sidebar.refresh(window, cx);
@@ -95,6 +100,7 @@ impl SessionSidebar {
             rename_input: cx.new(|cx| InputState::new(window, cx).placeholder("会话名称")),
             rename_target: None,
             load_generation: 0,
+            hovered_id: None,
             probe: None,
         }
     }
@@ -374,12 +380,17 @@ impl SessionSidebar {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let id = node.id.clone();
+        let hover_id = node.id.clone();
         let rename_id = id.clone();
         let delete_id = id.clone();
         let export_id = id.clone();
         let selected = self.selected_id.as_deref() == Some(&node.id);
         let busy = self.busy_actions.contains(&node.id);
-        let metric = format_metrics(node);
+        // 规范 S-8：一行不堆超过 3 个片段，所以元信息拆两行，分支名进 tooltip。
+        let (metric_primary, metric_secondary) = format_metrics(node);
+        let branch_tooltip = node.branch.clone();
+        // 低频操作在悬停行才出现；busy 时保持可见，否则禁用态一闪就消失，用户看不到反馈。
+        let actions_visible = self.hovered_id.as_deref() == Some(&node.id) || busy;
         v_flex()
             .w_full()
             .child(
@@ -392,6 +403,13 @@ impl SessionSidebar {
                     .cursor_pointer()
                     .when(selected, |row| row.bg(cx.theme().accent.opacity(0.16)))
                     .hover(|row| row.bg(cx.theme().muted))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        let next = hovered.then(|| hover_id.clone());
+                        if this.hovered_id != next {
+                            this.hovered_id = next;
+                            cx.notify();
+                        }
+                    }))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let SidebarStatus::Ready(projects) = &this.status
                             && let Some(session) = find_session(projects, &id)
@@ -422,65 +440,104 @@ impl SessionSidebar {
                                 v_flex()
                                     .flex_1()
                                     .min_w_0()
-                                    .gap_1()
+                                    .gap_0p5()
                                     .child(div().text_sm().truncate().child(node.title.clone()))
                                     .child(
                                         div()
                                             .text_xs()
+                                            .truncate()
                                             .text_color(cx.theme().muted_foreground)
-                                            .child(metric),
+                                            .child(metric_primary),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "session-metric-{}",
+                                                node.id
+                                            )))
+                                            .text_xs()
+                                            .truncate()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .when_some(branch_tooltip, |row, branch| {
+                                                row.tooltip(move |window, cx| {
+                                                    Tooltip::new(format!("分支：{branch}"))
+                                                        .build(window, cx)
+                                                })
+                                            })
+                                            .child(metric_secondary),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_1()
-                                    .child(
-                                        Button::new(format!("rename-{}", node.id))
-                                            .debug_selector({
-                                                let id = node.id.clone();
-                                                move || format!("rename-{id}")
-                                            })
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(IconName::Settings)
-                                            .tooltip("重命名")
-                                            .disabled(busy)
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.start_rename(rename_id.clone(), window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new(format!("export-{}", node.id))
-                                            .debug_selector({
-                                                let id = node.id.clone();
-                                                move || format!("export-{id}")
-                                            })
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(IconName::Copy)
-                                            .tooltip("导出原始 JSONL")
-                                            .disabled(busy)
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.export_session(export_id.clone(), window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new(format!("delete-{}", node.id))
-                                            .debug_selector({
-                                                let id = node.id.clone();
-                                                move || format!("delete-{id}")
-                                            })
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(IconName::Delete)
-                                            .tooltip("删除")
-                                            .disabled(busy)
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.confirm_delete(delete_id.clone(), window, cx)
-                                            })),
-                                    ),
-                            ),
+                            .when(actions_visible, |row| {
+                                row.child(
+                                    div()
+                                        .flex()
+                                        .flex_none()
+                                        .gap_1()
+                                        .child(
+                                            Button::new(format!("rename-{}", node.id))
+                                                .debug_selector({
+                                                    let id = node.id.clone();
+                                                    move || format!("rename-{id}")
+                                                })
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(IconName::Settings)
+                                                .tooltip("重命名")
+                                                .disabled(busy)
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.start_rename(
+                                                            rename_id.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new(format!("export-{}", node.id))
+                                                .debug_selector({
+                                                    let id = node.id.clone();
+                                                    move || format!("export-{id}")
+                                                })
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(IconName::Copy)
+                                                .tooltip("导出原始 JSONL")
+                                                .disabled(busy)
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.export_session(
+                                                            export_id.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new(format!("delete-{}", node.id))
+                                                .debug_selector({
+                                                    let id = node.id.clone();
+                                                    move || format!("delete-{id}")
+                                                })
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(IconName::Delete)
+                                                .tooltip("删除")
+                                                .disabled(busy)
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.confirm_delete(
+                                                            delete_id.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    },
+                                                )),
+                                        ),
+                                )
+                            }),
                     ),
             )
             .children(
@@ -650,24 +707,29 @@ impl Render for SessionSidebar {
     }
 }
 
-fn format_metrics(session: &SessionView) -> String {
+/// 会话行元信息，拆成两行返回。
+///
+/// 规范 S-8 限制一行最多 3 个片段，原来的单行把「运行中 · 时间 · 消息数 · token · 花费 · 分支」
+/// 六段挤在一起，窄侧栏里必然截断。这里第一行放时间性信息，第二行放用量，分支交给 tooltip。
+fn format_metrics(session: &SessionView) -> (String, String) {
+    let running = if session.running { "运行中 · " } else { "" };
+    let primary = format!(
+        "{running}{} · {} 条消息",
+        format_relative_time(session.modified),
+        session.message_count,
+    );
     let token = session
         .metrics
         .recent_context_tokens
         .map(format_tokens)
         .unwrap_or_else(|| "— token".to_owned());
-    let running = if session.running { "运行中 · " } else { "" };
     let branch = session
         .branch
         .as_deref()
-        .map(|branch| format!(" · {}", truncate_text(branch, 24)))
+        .map(|branch| format!(" · {}", truncate_text(branch, 16)))
         .unwrap_or_default();
-    format!(
-        "{running}{} · {} 条消息 · {token} · ${:.4}{branch}",
-        format_relative_time(session.modified),
-        session.message_count,
-        session.metrics.cumulative_cost
-    )
+    let secondary = format!("{token} · ${:.4}{branch}", session.metrics.cumulative_cost);
+    (primary, secondary)
 }
 
 fn format_relative_time(modified: std::time::SystemTime) -> String {
@@ -729,7 +791,7 @@ fn find_session<'a>(projects: &'a [ProjectSessionView], id: &str) -> Option<&'a 
 mod tests {
     use std::time::SystemTime;
 
-    use gpui::{TestAppContext, VisualTestContext, size};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext, point, size};
     use gpui_component::Root;
     use pi_data::SessionMetrics;
 
@@ -770,6 +832,7 @@ mod tests {
             rename_input: cx.new(|cx| InputState::new(window, cx)),
             rename_target: None,
             load_generation: 0,
+            hovered_id: None,
             probe: None,
         }
     }
@@ -798,8 +861,20 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    fn ready_sidebar_renders_project_row_metrics_and_actions(cx: &mut TestAppContext) {
+    const ROW_ACTIONS: [&str; 3] = [
+        "rename-fixture-session",
+        "export-fixture-session",
+        "delete-fixture-session",
+    ];
+
+    fn draw(visual: &mut VisualTestContext, frames: usize) {
+        for _ in 0..frames {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.run_until_parked();
+        }
+    }
+
+    fn ready_sidebar_window(cx: &mut TestAppContext) -> VisualTestContext {
         cx.update(|cx| {
             gpui_component::init(cx);
             gpui_pi_ui::theme::init_fonts(cx).expect("font init failed");
@@ -809,19 +884,91 @@ mod tests {
             Root::new(sidebar, window, cx)
         });
         let mut visual = VisualTestContext::from_window(handle.into(), cx);
-        for _ in 0..3 {
-            visual.update(|window, cx| window.draw(cx).clear(cx));
-            visual.run_until_parked();
-        }
+        draw(&mut visual, 3);
+        visual
+    }
+
+    #[gpui::test]
+    fn ready_sidebar_renders_project_row_and_diagnostics(cx: &mut TestAppContext) {
+        let mut visual = ready_sidebar_window(cx);
         assert!(visual.debug_bounds("session-sidebar").is_some());
-        assert!(visual.debug_bounds("session-row").is_some());
-        assert!(visual.debug_bounds("rename-fixture-session").is_some());
-        assert!(visual.debug_bounds("export-fixture-session").is_some());
-        assert!(visual.debug_bounds("delete-fixture-session").is_some());
         assert!(visual.debug_bounds("session-diagnostics").is_some());
         let row = visual
             .debug_bounds("session-row")
             .expect("session row missing");
         assert!(row.size.width > px(0.) && row.size.height > px(0.));
+    }
+
+    /// T2 ③：低频行操作按规范 S-9 收进 hover 态，hover 前不占位、hover 后可点。
+    #[gpui::test]
+    fn session_row_actions_are_hover_only(cx: &mut TestAppContext) {
+        let mut visual = ready_sidebar_window(cx);
+        for action in ROW_ACTIONS {
+            assert!(
+                visual.debug_bounds(action).is_none(),
+                "hover 前不应渲染 {action}"
+            );
+        }
+
+        let row = visual
+            .debug_bounds("session-row")
+            .expect("session row missing");
+        visual.simulate_mouse_move(row.center(), None, Modifiers::default());
+        draw(&mut visual, 2);
+        for action in ROW_ACTIONS {
+            assert!(
+                visual.debug_bounds(action).is_some(),
+                "hover 后必须渲染 {action}"
+            );
+        }
+
+        // 指针移出该行后操作重新收起，避免一屏里每行都挂三个图标。
+        visual.simulate_mouse_move(
+            point(row.center().x, row.origin.y - px(4.)),
+            None,
+            Modifiers::default(),
+        );
+        draw(&mut visual, 2);
+        for action in ROW_ACTIONS {
+            assert!(
+                visual.debug_bounds(action).is_none(),
+                "移出行后不应继续渲染 {action}"
+            );
+        }
+    }
+
+    #[test]
+    fn metrics_split_into_two_short_lines() {
+        let session = SessionView {
+            id: "s".to_owned(),
+            path: PathBuf::from("s.jsonl"),
+            cwd: PathBuf::from("C:/fixture"),
+            title: "t".to_owned(),
+            modified: SystemTime::now(),
+            message_count: 3,
+            metrics: SessionMetrics {
+                cumulative_tokens: 100,
+                cumulative_cost: 0.125,
+                recent_context_tokens: Some(42_000),
+            },
+            branch: Some("feature/fixture".to_owned()),
+            running: true,
+            children: Vec::new(),
+        };
+        let (primary, secondary) = format_metrics(&session);
+        // 规范 S-8：每行最多 3 个片段，原来的单行是 6 段。
+        assert_eq!(primary, "运行中 · 刚刚 · 3 条消息");
+        assert_eq!(secondary, "42.0k token · $0.1250 · feature/fixture");
+        assert_eq!(primary.matches(" · ").count(), 2);
+        assert_eq!(secondary.matches(" · ").count(), 2);
+
+        let plain = SessionView {
+            branch: None,
+            running: false,
+            ..session
+        };
+        let (primary, secondary) = format_metrics(&plain);
+        assert_eq!(primary, "刚刚 · 3 条消息");
+        assert_eq!(secondary, "42.0k token · $0.1250");
     }
 }
