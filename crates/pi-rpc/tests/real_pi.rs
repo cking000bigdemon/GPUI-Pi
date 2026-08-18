@@ -8,8 +8,9 @@ use std::{
 use tempfile::TempDir;
 
 use pi_rpc::{
-    BashResult, Client, ClientConfig, ClientEvent, Command, CommandsData, LifecycleEvent,
-    MessagesData, PINNED_PI_VERSION, QueueMode, RpcSessionState, StreamingBehavior, ThinkingLevel,
+    AvailableModelsData, BashResult, Client, ClientConfig, ClientEvent, Command, CommandsData,
+    LifecycleEvent, MessagesData, PINNED_PI_VERSION, QueueMode, RpcSessionState, StreamingBehavior,
+    ThinkingLevel, ThinkingLevelsData,
 };
 use serde_json::Value;
 
@@ -78,6 +79,17 @@ fn zero_token_command_matrix() {
     let client = &test.client;
     let state: RpcSessionState = client.request_data(Command::GetState, TIMEOUT).unwrap();
     assert!(!state.session_id.is_empty());
+    let models: AvailableModelsData = client
+        .request_data(Command::GetAvailableModels, TIMEOUT)
+        .unwrap();
+    assert!(models.models.iter().all(|model| {
+        !model.id.is_empty() && !model.provider.is_empty() && !model.name.is_empty()
+    }));
+    let levels: ThinkingLevelsData = client
+        .request_data(Command::GetAvailableThinkingLevels, TIMEOUT)
+        .unwrap();
+    assert!(!levels.levels.is_empty());
+    assert!(levels.levels.contains(&state.thinking_level));
 
     let commands: CommandsData = client.request_data(Command::GetCommands, TIMEOUT).unwrap();
     assert!(commands.commands.iter().all(|command| {
@@ -86,14 +98,15 @@ fn zero_token_command_matrix() {
             && !command.source_info.source.is_empty()
     }));
 
+    let can_cycle_model = models.models.len() > 1;
+    let can_cycle_thinking = levels.levels.len() > 1;
+
     for command in [
         Command::GetMessages,
         Command::GetEntries { since: None },
         Command::GetTree,
         Command::GetSessionStats,
         Command::GetLastAssistantText,
-        Command::GetAvailableModels,
-        Command::GetAvailableThinkingLevels,
         Command::SetThinkingLevel {
             level: ThinkingLevel::Off,
         },
@@ -116,8 +129,6 @@ fn zero_token_command_matrix() {
         Command::Abort,
         Command::AbortRetry,
         Command::AbortBash,
-        Command::CycleModel,
-        Command::CycleThinkingLevel,
     ] {
         let response = client.request(command, TIMEOUT).unwrap();
         assert!(
@@ -125,6 +136,31 @@ fn zero_token_command_matrix() {
             "{}: {:?}",
             response.command, response.error
         );
+    }
+
+    if can_cycle_model {
+        let response = client.request(Command::CycleModel, TIMEOUT).unwrap();
+        assert!(response.success, "cycle_model: {:?}", response.error);
+        let state: RpcSessionState = client.request_data(Command::GetState, TIMEOUT).unwrap();
+        let selected = state.model.expect("cycled model must be selected");
+        assert!(
+            models
+                .models
+                .iter()
+                .any(|model| { model.provider == selected.provider && model.id == selected.id })
+        );
+    }
+    if can_cycle_thinking {
+        let response = client
+            .request(Command::CycleThinkingLevel, TIMEOUT)
+            .unwrap();
+        assert!(
+            response.success,
+            "cycle_thinking_level: {:?}",
+            response.error
+        );
+        let state: RpcSessionState = client.request_data(Command::GetState, TIMEOUT).unwrap();
+        assert!(levels.levels.contains(&state.thinking_level));
     }
 
     let invalid = client

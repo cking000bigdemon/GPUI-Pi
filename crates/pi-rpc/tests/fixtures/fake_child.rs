@@ -20,9 +20,49 @@ fn main() {
     }
     let session_file =
         session_file.unwrap_or_else(|| env::temp_dir().join("pi-rpc-fake-session.jsonl"));
-    let session_id = "fake-session";
+    let session_id = session_file
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("fake-session")
+        .to_owned();
+    let available_models = json!([
+        {
+            "id":"model-one",
+            "name":"Model One",
+            "api":"fixture",
+            "provider":"provider-one",
+            "baseUrl":"https://fixture.invalid",
+            "reasoning":true,
+            "input":["text"],
+            "cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0},
+            "contextWindow":100000,
+            "maxTokens":4096
+        },
+        {
+            "id":"model-two",
+            "name":"Model Two",
+            "api":"fixture",
+            "provider":"provider-two",
+            "baseUrl":"https://fixture.invalid",
+            "reasoning":true,
+            "input":["text","image"],
+            "cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0},
+            "contextWindow":200000,
+            "maxTokens":8192
+        }
+    ]);
+    let mut current_model = available_models[0].clone();
+    let mut thinking_level = "off".to_owned();
+    let tool_allowlist = env::args_os()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|args| args[0] == "--tools")
+        .map(|args| args[1].to_string_lossy().into_owned());
 
-    eprintln!("fake child ready");
+    eprintln!(
+        "fake child ready tools={}",
+        tool_allowlist.as_deref().unwrap_or("<unset>")
+    );
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in BufReader::new(stdin.lock()).lines() {
@@ -130,7 +170,9 @@ fn main() {
                 "command": "get_state",
                 "success": true,
                 "data": {
-                    "thinkingLevel": "off",
+                    "model": current_model,
+                    "thinkingLevel": thinking_level,
+                    "toolAllowlist": tool_allowlist,
                     "isStreaming": false,
                     "isCompacting": false,
                     "steeringMode": "all",
@@ -144,6 +186,43 @@ fn main() {
             }),
             "get_messages" => {
                 json!({"id":id,"type":"response","command":"get_messages","success":true,"data":{"messages":[]}})
+            }
+            "get_available_models" => json!({
+                "id":id,
+                "type":"response",
+                "command":"get_available_models",
+                "success":true,
+                "data":{"models":available_models}
+            }),
+            "get_available_thinking_levels" => json!({
+                "id":id,
+                "type":"response",
+                "command":"get_available_thinking_levels",
+                "success":true,
+                "data":{"levels":["off","low","high"]}
+            }),
+            "set_model" => {
+                let target = available_models.as_array().unwrap().iter().find(|model| {
+                    model["provider"] == value["provider"] && model["id"] == value["modelId"]
+                });
+                if let Some(target) = target {
+                    current_model = target.clone();
+                    json!({"id":id,"type":"response","command":"set_model","success":true,"data":current_model})
+                } else {
+                    json!({"id":id,"type":"response","command":"set_model","success":false,"error":"model not found"})
+                }
+            }
+            "cycle_model" => {
+                current_model = if current_model["id"] == "model-one" {
+                    available_models[1].clone()
+                } else {
+                    available_models[0].clone()
+                };
+                json!({"id":id,"type":"response","command":"cycle_model","success":true,"data":{"model":current_model,"thinkingLevel":thinking_level,"isScoped":false}})
+            }
+            "set_thinking_level" => {
+                thinking_level = value["level"].as_str().unwrap_or("off").to_owned();
+                json!({"id":id,"type":"response","command":"set_thinking_level","success":true})
             }
             "get_commands" => json!({
                 "id":id,

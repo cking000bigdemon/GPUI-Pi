@@ -59,8 +59,16 @@ try {
     }
 
     Write-Host "==> Extract and write pin marker"
-    & tar.exe -xzf $Archive -C $Extract
-    if ($LASTEXITCODE -ne 0) { throw "tar.exe failed with exit $LASTEXITCODE" }
+    # Git Bash 会把自己的 GNU tar.exe 放到 PATH 前面，并把 D:\... 误判为
+    # remote:file。只在真正解压时定位 Windows 系统 tar；已准备目录的快速校验路径不受影响。
+    $TarCandidates = @(
+        (Join-Path $env:SystemRoot "Sysnative\tar.exe")
+        (Join-Path $env:SystemRoot "System32\tar.exe")
+    )
+    $Tar = $TarCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if (-not $Tar) { throw "Windows system tar.exe not found" }
+    & $Tar -xzf $Archive -C $Extract
+    if ($LASTEXITCODE -ne 0) { throw "Windows system tar.exe failed with exit $LASTEXITCODE" }
 
     $SourceRoot = Join-Path $Extract "pi-web-$PiWebVersion"
     if (-not (Test-Path -LiteralPath $SourceRoot -PathType Container)) {

@@ -1,6 +1,6 @@
 use pi_render::{
     Block, ConversationItem, LiveAssistantUpdate, LiveBlockKind, LiveEvent, LivePhase,
-    LiveSessionReducer, ToolOutput, ToolStatus,
+    LiveSessionReducer, ModelRef, ToolOutput, ToolStatus,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -51,6 +51,49 @@ fn assembles_multiple_blocks_and_message_end_is_authoritative() {
     assert_eq!(final_document.messages[0].id, "authoritative");
     assert!(
         matches!(&final_document.messages[0].blocks[0], Block::Markdown(text) if text.source == "final snapshot")
+    );
+}
+
+#[test]
+fn live_assistant_preserves_model_metadata_from_start_and_end() {
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.apply(LiveEvent::AgentStart);
+    reducer.apply(LiveEvent::MessageStart {
+        message: json!({
+            "role":"assistant",
+            "provider":"provider-one",
+            "model":"model-one",
+            "content":[]
+        }),
+    });
+    reducer.apply(LiveEvent::MessageUpdate(LiveAssistantUpdate::BlockDelta {
+        index: 0,
+        kind: LiveBlockKind::Text,
+        delta: "draft".to_owned(),
+    }));
+    assert_eq!(
+        reducer.document().messages[0].model,
+        Some(ModelRef {
+            provider: "provider-one".to_owned(),
+            id: "model-one".to_owned(),
+        })
+    );
+
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({
+            "id":"authoritative",
+            "role":"assistant",
+            "provider":"provider-two",
+            "model":"model-two",
+            "content":"final"
+        }),
+    });
+    assert_eq!(
+        reducer.document().messages[0].model,
+        Some(ModelRef {
+            provider: "provider-two".to_owned(),
+            id: "model-two".to_owned(),
+        })
     );
 }
 

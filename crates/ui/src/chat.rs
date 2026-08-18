@@ -183,6 +183,7 @@ impl ScrollbarHandle for ChatScrollbarHandle {
 #[derive(Clone, IntoElement)]
 pub struct ChatWindow {
     document: Arc<ConversationDocument>,
+    model_names: Arc<HashMap<String, String>>,
     list_state: ListState,
     selected_message: Option<String>,
     show_minimap: bool,
@@ -199,6 +200,7 @@ impl ChatWindow {
     pub fn new(document: Arc<ConversationDocument>, list_state: ListState) -> Self {
         Self {
             document,
+            model_names: Arc::new(HashMap::new()),
             list_state,
             selected_message: None,
             show_minimap: true,
@@ -210,6 +212,11 @@ impl ChatWindow {
             on_tail_attachment_change: None,
             on_tail_detach: None,
         }
+    }
+
+    pub fn model_names(mut self, names: Arc<HashMap<String, String>>) -> Self {
+        self.model_names = names;
+        self
     }
 
     pub fn show_minimap(mut self, show: bool) -> Self {
@@ -264,6 +271,7 @@ impl ChatWindow {
 impl gpui::RenderOnce for ChatWindow {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let document = self.document.clone();
+        let model_names = self.model_names.clone();
         let item_count = document.items.len();
         let selected_message = self.selected_message.clone();
         let expanded_tools = self.expanded_tools.clone();
@@ -298,6 +306,7 @@ impl gpui::RenderOnce for ChatWindow {
                                     message_column(match item {
                                         ConversationItem::Message(message) => {
                                             MessageView::new(index, message.clone())
+                                                .model_names(model_names.clone())
                                                 .selected(
                                                     selected_message.as_deref()
                                                         == Some(&message.id),
@@ -308,6 +317,7 @@ impl gpui::RenderOnce for ChatWindow {
                                         }
                                         ConversationItem::Process(group) => {
                                             ProcessGroupView::new(index, group.clone())
+                                                .model_names(model_names.clone())
                                                 .expanded(
                                                     !group.collapsible
                                                         || expanded_processes.contains(&group.id),
@@ -382,6 +392,7 @@ impl gpui::RenderOnce for ChatWindow {
 pub struct MessageView {
     index: usize,
     message: Arc<Message>,
+    model_names: Arc<HashMap<String, String>>,
     selected: bool,
     expanded_tools: Arc<HashSet<String>>,
     on_toggle_tool: Option<DetailToggleHandler>,
@@ -392,10 +403,16 @@ impl MessageView {
         Self {
             index,
             message,
+            model_names: Arc::new(HashMap::new()),
             selected: false,
             expanded_tools: Arc::new(HashSet::new()),
             on_toggle_tool: None,
         }
+    }
+
+    pub fn model_names(mut self, names: Arc<HashMap<String, String>>) -> Self {
+        self.model_names = names;
+        self
     }
 
     pub fn selected(mut self, selected: bool) -> Self {
@@ -475,6 +492,16 @@ impl gpui::RenderOnce for MessageView {
                     .children(blocks),
             )
         } else {
+            let model_label = (self.message.role == MessageRole::Assistant)
+                .then(|| {
+                    self.message.model.as_ref().map(|model| {
+                        self.model_names
+                            .get(&model_ref_key(&model.provider, &model.id))
+                            .cloned()
+                            .unwrap_or_else(|| model.id.clone())
+                    })
+                })
+                .flatten();
             let role_color = match self.message.role {
                 // 用户消息走上面的气泡分支，此处不可达；给个中性值保持 match 完整。
                 MessageRole::User => cx.theme().foreground,
@@ -484,6 +511,24 @@ impl gpui::RenderOnce for MessageView {
                 MessageRole::Unknown => cx.theme().warning,
                 MessageRole::Custom => cx.theme().muted_foreground,
             };
+            let header_primary = model_label.map_or_else(
+                || {
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(role_color)
+                        .child(role_label(self.message.role))
+                        .into_any_element()
+                },
+                |model| {
+                    div()
+                        .debug_selector(|| "assistant-model".into())
+                        .text_xs()
+                        .text_color(crate::theme::dim_foreground(cx))
+                        .child(model)
+                        .into_any_element()
+                },
+            );
             root.gap_2()
                 .px_5()
                 .py_1p5()
@@ -495,25 +540,17 @@ impl gpui::RenderOnce for MessageView {
                 .when(selected, |view| {
                     view.rounded_md().bg(cx.theme().accent.opacity(0.16))
                 })
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
+                .child(h_flex().gap_2().child(header_primary).when_some(
+                    self.message.label.clone(),
+                    |row, label| {
+                        row.child(
                             div()
                                 .text_xs()
-                                .font_semibold()
-                                .text_color(role_color)
-                                .child(role_label(self.message.role)),
+                                .text_color(cx.theme().muted_foreground)
+                                .child(label),
                         )
-                        .when_some(self.message.label.clone(), |row, label| {
-                            row.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(label),
-                            )
-                        }),
-                )
+                    },
+                ))
                 .children(blocks)
         }
     }
@@ -523,6 +560,7 @@ impl gpui::RenderOnce for MessageView {
 pub struct ProcessGroupView {
     index: usize,
     group: ProcessGroup,
+    model_names: Arc<HashMap<String, String>>,
     expanded: bool,
     expanded_tools: Arc<HashSet<String>>,
     on_toggle_tool: Option<DetailToggleHandler>,
@@ -534,11 +572,17 @@ impl ProcessGroupView {
         Self {
             index,
             group,
+            model_names: Arc::new(HashMap::new()),
             expanded: false,
             expanded_tools: Arc::new(HashSet::new()),
             on_toggle_tool: None,
             on_toggle_process: None,
         }
+    }
+
+    pub fn model_names(mut self, names: Arc<HashMap<String, String>>) -> Self {
+        self.model_names = names;
+        self
     }
 
     pub fn expanded(mut self, expanded: bool) -> Self {
@@ -604,6 +648,7 @@ impl gpui::RenderOnce for ProcessGroupView {
                     .child(div().text_xs().min_w_0().truncate().child(summary)),
             )
             .when(self.expanded, |view| {
+                let model_names = self.model_names.clone();
                 let expanded_tools = self.expanded_tools.clone();
                 let on_toggle_tool = self.on_toggle_tool.clone();
                 view.child(
@@ -621,6 +666,7 @@ impl gpui::RenderOnce for ProcessGroupView {
                                     self.index.saturating_mul(10_000) + message_index,
                                     message.clone(),
                                 )
+                                .model_names(model_names.clone())
                                 .expanded_tools(expanded_tools.clone())
                                 .on_toggle_tool(on_toggle_tool.clone())
                             },
@@ -909,6 +955,10 @@ fn render_block(
             )
             .into_any_element(),
     }
+}
+
+fn model_ref_key(provider: &str, id: &str) -> String {
+    format!("{provider}\0{id}")
 }
 
 fn message_item_id(detail_key: &str) -> String {
@@ -1343,18 +1393,21 @@ fn role_label(role: MessageRole) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use gpui::{
         AppContext as _, Context, ListAlignment, Render, TestAppContext, VisualTestContext, size,
         transparent_black,
     };
     use gpui_component::{Root, ThemeMode};
-    use pi_render::{MarkdownBlock, MinimapNode};
+    use pi_render::{MarkdownBlock, MinimapNode, ModelRef};
 
     use super::*;
 
     /// `ChatWindow` 是 `RenderOnce`，测试需要一个持有状态的宿主视图来反复绘制。
     struct ChatHarness {
         document: Arc<ConversationDocument>,
+        model_names: Arc<HashMap<String, String>>,
         list_state: ListState,
         expanded_tools: Arc<HashSet<String>>,
         selected: Option<String>,
@@ -1363,6 +1416,7 @@ mod tests {
     impl Render for ChatHarness {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let chat = ChatWindow::new(self.document.clone(), self.list_state.clone())
+                .model_names(self.model_names.clone())
                 .expanded_tools(self.expanded_tools.clone());
             match &self.selected {
                 Some(id) => chat.selected_message(id.clone()),
@@ -1377,6 +1431,23 @@ mod tests {
             role,
             timestamp: None,
             label: None,
+            model: None,
+            blocks,
+        })
+    }
+
+    fn message_with_model(
+        id: &str,
+        role: MessageRole,
+        model: Option<ModelRef>,
+        blocks: Vec<Block>,
+    ) -> Arc<Message> {
+        Arc::new(Message {
+            id: id.to_owned(),
+            role,
+            timestamp: None,
+            label: None,
+            model,
             blocks,
         })
     }
@@ -1447,6 +1518,34 @@ mod tests {
         )
     }
 
+    fn render_chat_with_names(
+        cx: &mut TestAppContext,
+        document: Arc<ConversationDocument>,
+        model_names: Arc<HashMap<String, String>>,
+    ) -> VisualTestContext {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init_fonts(cx).expect("font init failed");
+        });
+        let item_count = document.items.len();
+        let handle = cx.open_window(size(px(640.), px(480.)), move |window, cx| {
+            let harness = cx.new(|_| ChatHarness {
+                document,
+                model_names,
+                list_state: ListState::new(item_count, ListAlignment::Top, px(1200.)).measure_all(),
+                expanded_tools: Arc::new(HashSet::new()),
+                selected: None,
+            });
+            Root::new(harness, window, cx)
+        });
+        let mut visual = VisualTestContext::from_window(handle.into(), cx);
+        for _ in 0..4 {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.run_until_parked();
+        }
+        visual
+    }
+
     fn render_chat_sized(
         cx: &mut TestAppContext,
         document: Arc<ConversationDocument>,
@@ -1462,6 +1561,7 @@ mod tests {
         let handle = cx.open_window(window_size, move |window, cx| {
             let harness = cx.new(|_| ChatHarness {
                 document,
+                model_names: Arc::new(HashMap::new()),
                 list_state: ListState::new(item_count, ListAlignment::Top, px(1200.)).measure_all(),
                 expanded_tools: Arc::new(expanded_tools.into_iter().collect()),
                 selected,
@@ -1622,6 +1722,50 @@ mod tests {
             source.matches(&const_call).count() >= 2,
             "消息正文与用户气泡两处都必须显式声明行高"
         );
+    }
+
+    #[gpui::test]
+    fn assistant_model_is_rendered_only_when_metadata_exists(cx: &mut TestAppContext) {
+        let with_model = message_with_model(
+            "with-model",
+            MessageRole::Assistant,
+            Some(ModelRef {
+                provider: "provider".to_owned(),
+                id: "model-id".to_owned(),
+            }),
+            vec![Block::Markdown(MarkdownBlock {
+                source: "answer".to_owned(),
+            })],
+        );
+        let document = Arc::new(ConversationDocument {
+            session_id: "model".to_owned(),
+            source_path: PathBuf::from("model.jsonl"),
+            messages: Arc::from([with_model.clone()]),
+            items: Arc::from([ConversationItem::Message(with_model)]),
+            minimap: Arc::from([]),
+            diagnostics: Arc::from([]),
+        });
+        let mut visual = render_chat_with_names(
+            cx,
+            document,
+            Arc::new(HashMap::from([(
+                model_ref_key("provider", "model-id"),
+                "Model Display Name".to_owned(),
+            )])),
+        );
+        assert!(visual.debug_bounds("assistant-model").is_some());
+
+        let without_model = message("without-model", MessageRole::Assistant, vec![]);
+        let document = Arc::new(ConversationDocument {
+            session_id: "none".to_owned(),
+            source_path: PathBuf::from("none.jsonl"),
+            messages: Arc::from([without_model.clone()]),
+            items: Arc::from([ConversationItem::Message(without_model)]),
+            minimap: Arc::from([]),
+            diagnostics: Arc::from([]),
+        });
+        let mut visual = render_chat(cx, document, Vec::new(), None);
+        assert!(visual.debug_bounds("assistant-model").is_none());
     }
 
     #[gpui::test]
