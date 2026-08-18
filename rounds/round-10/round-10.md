@@ -1,6 +1,6 @@
 # Round 10 — 模型、思考级别与工具预设
 
-> 执行方：**Windows** · 状态：✅ T1/T2/T3 全部通过 · 完成日期：2026-08-18 · PR：待创建
+> 执行方：**Windows** · 状态：✅ T1/T2/T3 全部通过 · 完成日期：2026-08-18 · PR：[#17](https://github.com/cking000bigdemon/GPUI-Pi/pull/17)
 
 ## 目标
 
@@ -159,4 +159,4 @@ GPUI_PI_TEST_FAKE_CHILD="D:/variFlight_work/GPUI-Pi-round-10/target/debug/fake_c
 - 官方 RPC 0.84.2 没有查询 active tools 的命令，自动化只能验证 CLI 参数、进程时序和 session resume；实际工具可用性必须在 T3 通过只读/完整预设各跑一次确认。
 - 纯历史浏览在活会话启动前没有模型目录，只能显示原始 model id；启动活会话加载 model catalog 后会优先显示 display name。
 - 控制切换采用 30s RPC 超时；极端 pi 卡死时 busy 反馈可能较久，但失败后会解锁并保留错误信息。
-- 用户最初要求不创建 PR、不推送；T3 通过后已明确授权创建 PR、运行 CI、CI 通过后合并到 `main` 并清理分支。最终 PR 编号与合并核验将在创建后回填。
+- 用户最初要求不创建 PR、不推送；T3 通过后已明确授权创建 PR、运行 CI、CI 通过后合并到 `main` 并清理分支。PR 已创建为 [#17](https://github.com/cking000bigdemon/GPUI-Pi/pull/17)，合并后需核验 `main` 包含最终提交。
