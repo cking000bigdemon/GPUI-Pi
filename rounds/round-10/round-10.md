@@ -1,6 +1,6 @@
 # Round 10 — 模型、思考级别与工具预设
 
-> 执行方：**Windows** · 状态：🧪 自动验收全绿，待用户 T3 验收 · 交付方式：仅本地提交并进入用户验收，不创建 PR、不推送 GitHub
+> 执行方：**Windows** · 状态：✅ T1/T2/T3 全部通过 · 完成日期：2026-08-18 · PR：待创建
 
 ## 目标
 
@@ -140,9 +140,11 @@ GPUI_PI_TEST_FAKE_CHILD="D:/variFlight_work/GPUI-Pi-round-10/target/debug/fake_c
 - 第二轮复核上述问题关闭，补修预启动工具选择、工具重启失败测试、真实 cycle 覆盖、显示名映射、Sysnative 快速路径等。
 - 第三轮未再发现进程并发、session 文件并发写、UI 线程阻塞或模型/thinking 状态不一致 blocker；唯一实质问题是重启后 calibration generation 未对齐，已在最终 validation 前修复。
 
-### T3 用户验收清单
+### T3 用户验收结论
 
-请运行 `target\release\gpui-pi.exe` 后验收：
+用户于 2026-08-18 完成验收，结论：**全部通过**。验收过程中一度误以为模型只能通过快捷键循环；确认点击「启动活会话」并完成模型目录加载后，可通过模型下拉菜单手动选择，`Ctrl+P` 仅为辅助循环快捷键，行为符合本轮设计。
+
+已通过项目：
 
 1. 选择一个有历史消息的会话，确认 assistant 消息顶部显示模型 display name；老消息没有模型信息时不出现空行。
 2. 启动活会话，确认模型、Thinking、工具三个选择器出现且当前值正确；运行中选择器不可用。
@@ -157,4 +159,4 @@ GPUI_PI_TEST_FAKE_CHILD="D:/variFlight_work/GPUI-Pi-round-10/target/debug/fake_c
 - 官方 RPC 0.84.2 没有查询 active tools 的命令，自动化只能验证 CLI 参数、进程时序和 session resume；实际工具可用性必须在 T3 通过只读/完整预设各跑一次确认。
 - 纯历史浏览在活会话启动前没有模型目录，只能显示原始 model id；启动活会话加载 model catalog 后会优先显示 display name。
 - 控制切换采用 30s RPC 超时；极端 pi 卡死时 busy 反馈可能较久，但失败后会解锁并保留错误信息。
-- 按用户要求：**未创建 PR、未推送 GitHub**。用户 T3 通过后再把任务卡状态改为完成并填写完成日期；PR 列保持 `—（按要求不创建）`。
+- 用户最初要求不创建 PR、不推送；T3 通过后已明确授权创建 PR、运行 CI、CI 通过后合并到 `main` 并清理分支。最终 PR 编号与合并核验将在创建后回填。
