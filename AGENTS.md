@@ -57,7 +57,13 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 - 源码、脚本、fixture、构建产物仍放各自的标准目录，不为了“归档”复制进 `rounds/`；本地大日志与截图继续放 gitignored 的 `.pi/`，在任务卡中记录结论或引用路径；
 - 新增或引用轮次文件时禁止恢复 `rounds/round-NN.md`、`rounds/BLOCKED-NN.md` 这类扁平路径。
 
-## 子代理代码审查
+## 代码审查派发
+
+- **按开发 harness 选择审查通道**：
+  - 使用 **pi harness** 开发时：代码 review 优先派发 `claude-code-review`（独立 Claude Code 子进程，只读审查，默认 `scope=working`）；若 `claude-code-review` 不可用（未登记、鉴权/限流不可用、启动失败等），降级派发 pi-subagents 的 `reviewer` 子代理，走下方「pi-subagents 审查路径」；
+  - 使用 **Claude Code / codex** 开发时：**不适用上述派发规则**，代码审查按对应工具自身的流程执行。
+
+### pi-subagents 审查路径（pi harness 降级用）
 
 - 启动 `reviewer` 前先用 `subagent action=models`（或 `/subagents-models reviewer`）核对当前运行时映射；
 - 代码审查优先显式指定 **DeepSeek provider** 的 `deepseek/deepseek-v4-pro`；这里的 provider 必须是 `deepseek`，不得改用 `variflight-ticket`、OpenRouter 等其他 provider 的同名/路由模型；
