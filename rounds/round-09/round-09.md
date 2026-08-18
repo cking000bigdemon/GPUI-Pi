@@ -2,7 +2,7 @@
 
 <!-- 保存为 rounds/round-09/round-09.md；该轮其他管理产出也放在同一目录。 -->
 
-> 执行方：**Windows** · 状态：🟡 实现完成，T1/T2 已过，待 T3 人工目视验收
+> 执行方：**Windows** · 状态：🟡 规范 v2.1 全部剩余条款已落地（两批），T1/T2 已过，待 T3 人工目视验收
 
 ## 目标
 
@@ -108,17 +108,59 @@ T3 目视验收提出三条意见（用户消息气泡化、主区左右留白�
 | 条款 | 状态 | 说明 |
 |---|---|---|
 | v1.0 全部条款（消息无外层边框、工具卡状态点、左竖线从属、侧栏 hover 显隐、composer 主次分层、minimap 选中态） | ✅ 已落地 | 见上方 T1/T2 记录 |
-| S-13 消息列 820 居中 + `px_4` | ❌ 未落地 | `chat.rs` 无 `max_w` |
-| S-14 用户消息右对齐气泡 | ❌ 未落地 | `chat.rs` 用户消息仍是 v1.0 的通栏卡片 |
-| S-18 正文行高 `relative(1.7)` | ❌ 未落地 | `chat.rs` 无 `line_height` |
-| S-12 正文显式 `text_sm` | ❌ 未落地 | 当前继承 rem 默认 16px |
-| S-15 深色主题投影 | ❌ 未落地 | `theme.rs` 未改 |
-| S-16 dim/disabled 封装函数 | ❌ 未落地 | — |
-| S-25 / § 5.8 条款断言 | ❌ 未落地 | 需先抽出纯函数与常量 |
+| S-13 消息列 820 居中 + `px_4` | ✅ 已落地（第二批） | `chat.rs::message_column` 套在每个 list 表项外层；`MESSAGE_COLUMN_MAX_WIDTH = 820.` |
+| S-14 用户消息右对齐气泡 | ✅ 已落地（第二批） | `chat.rs::user_bubble_style` 四值纯函数（accent 0.10 底 / 0.2 边框 / 12px 圆角 / 85% 宽），去掉 `User` 角色标签；选中态改边框 accent 实色 |
+| S-18 正文行高 `relative(1.7)` | ✅ 已落地（第二批） | `BODY_LINE_HEIGHT = 1.7`，正文与气泡两处引用同一常量（裁决见下方「第二批备注」①） |
+| S-12 正文显式 `text_sm` | ✅ 已落地（第二批） | 助手文本流与用户气泡容器均显式 `.text_sm()` |
+| S-15 深色主题投影 | ✅ 已落地（第二批） | `theme.rs::apply_panel_elevation`：深色下 `sidebar`/`sidebar_border` 对齐 `title_bar`/`title_bar_border` 档（纯 token 投影，零硬编码），`colors` 与 legacy `tokens` 双写；挂进 `sync_system_theme` 随 appearance 重放 |
+| S-16 dim/disabled 封装函数 | ✅ 已落地（第二批） | `theme.rs::dim_foreground`（0.7）/ `disabled_foreground`（0.5）+ 源码守卫测试；当前组件内散落用法为零（见「第二批备注」②） |
+| S-25 / § 5.8 条款断言 | ✅ 已落地（第二批） | 断言明细见下方「第二批 T2」表 |
 | S-20 助手消息模型名 | ⛔ 不属本轮 | 依赖 `pi-render` 增加 `Message.model`，被本轮「禁止」条排除，规范已标注生效轮次 R10 |
 
-**结论：R9 尚未完成。** 剩余项均为纯 UI 改动（除 S-20），不触碰三个纯逻辑 crate。
+**结论：规范 v2.1 内属于 R9 的条款已全部落地，待 T3 人工目视。** 三个纯逻辑 crate 全程未触碰。
+
+### 第二批实测（规范 v2.1 补齐 · 2026-08-18）
+
+> 改动范围：`crates/ui/src/chat.rs`、`crates/ui/src/theme.rs`、`ROUNDS.md`、本任务卡。
+> `pi-rpc` / `pi-data` / `pi-render` / `crates/app` 均未改动。
+
+#### 第二批 T1 静态（与第一批同因，`validate.ps1` 缺 BOM 无法直跑，逐条执行同样五步）
+
+| 步 | 命令 | 结果 |
+|---|---|---|
+| 1 | `.\scripts\check-pins.ps1` | OK（10 项） |
+| 2 | `cargo fmt --all -- --check` | OK |
+| 3 | `cargo clippy --workspace --all-targets -- -D warnings` | OK，无 `#[allow]` |
+| 4 | `cargo test --workspace` | 全绿：`gpui-pi` 31 passed、`gpui-pi-ui` **17 passed**（较第一批 +7）、`pi-render` 27 passed，其余 crate 不变；`real_pi.rs` 5 例仍 opt-in ignored |
+| 5 | `cargo build --release --workspace` | OK |
+
+#### 第二批 T2（§ 5.8 条款断言）
+
+| 条款 | 用例 | 断言内容 |
+|---|---|---|
+| S-13 | `message_column_is_centered_and_capped` | 1000px 窗口列宽恰为 820 且水平居中；640px 窗口列宽 = 窗宽 − 32、起点 x=16 |
+| S-14 | `user_bubble_hugs_column_right_edge` | `user-bubble` 右缘贴 `message-column` 右缘（±1px），宽度 ≤ 列宽 × 85% |
+| S-14 | `user_bubble_style_matches_spec` | 纯函数四值：bg = accent(0.10)、border = accent(0.2)、radius = 12px、ratio = 0.85 |
+| S-18 | `body_line_height_is_shared_constant` | 常量 = 1.7；源码级守卫：所有 `line_height` 都引用 `BODY_LINE_HEIGHT` 且 ≥2 处 |
+| S-16 | `dim_and_disabled_foregrounds_are_single_source` | 两函数返回值 = muted_foreground × 0.7 / 0.5，且两档互异 |
+| S-16 | `muted_foreground_opacity_is_centralized` | 扫描 `crates/ui/src` + `crates/app/src` 全部 `.rs`，除 `theme.rs` 集中定义外无手写派生 |
+| S-15 | `dark_panels_are_elevated_above_canvas` | 深色下 `sidebar != background` 且亮度更高、legacy tokens 与 colors 同步；浅色不投影且方向正确 |
+| 红线 10 | `only_user_messages_are_bubbled`（由 `only_user_messages_are_carded` 改名） | 仅 User 气泡化，其余角色纯文本流 |
+
+既有用例零回归（第一批 T2 ①–⑤ 全部保留并通过）。
+
+#### 第二批备注
+
+1. **S-18 行高裁决**：规范 § 3.4 表把用户气泡行高写作 `relative(1.6)`，但 § 5.8 要求「消息正文与用户气泡两处都引用 `BODY_LINE_HEIGHT = 1.7`」，本轮任务指令亦明确「正文与气泡显式 `.line_height(relative(1.7))`」。按 § 5.8（可验证性条款）与任务指令取 **1.7**，规范 § 3.4 表的 1.6 建议随下次修订收敛。
+2. **S-16 现状**：本仓组件内此前并无散落的 `muted_foreground` 透明度派生（grep 为零），故本条落地形式为「集中定义 + 返回值断言 + 源码守卫」；后续轮次需要 dim/disabled 档时直接消费这两个函数。
+3. **顺带对齐（1 行）**：`MessageView` 的 Unknown 角色标签色由 `danger` 改为 `warning`，对齐规范 § 5.1「渲染不了 ≠ 出错了」及既有 unknown-card 的 warning 状态点；属本轮消息区视觉范围。
+4. **选中态定值**：助手消息选中底色由 `accent.opacity(0.12)` 统一为 **0.16**（S-7 勘误后为定值，v2.0 前的「0.12~0.16」区间已废止）。
 
 ### T3 目视
 
-待用户验收：需在深/浅两种模式下各看一遍，逐项对照《UI 设计规范》确认消息区无「框套框」、工具/思考卡片弱边框 + header 状态点、侧栏操作 hover 显隐、composer 主次分明。结论由验收方回填本节。
+待用户验收：需在深/浅两种模式下各看一遍，逐项对照《UI 设计规范》确认——
+
+- 第一批条款：消息区无「框套框」、工具/思考卡片弱边框 + header 状态点、侧栏操作 hover 显隐、composer 主次分明；
+- 第二批条款：消息列 820 居中（超宽窗口留白变大、行长不变）、用户消息为右对齐弱色气泡且无 `User` 标签、正文 14px + 1.7 行高的阅读密度、**深色模式下侧栏/目录面板比画布亮一档**（切系统深浅模式验证投影重放）。
+
+结论由验收方回填本节。

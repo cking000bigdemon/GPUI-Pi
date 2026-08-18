@@ -7,7 +7,7 @@ use gpui::{
     App, Bounds, Div, FontStyle, FontWeight, HighlightStyle, Hsla, Image, ImageFormat,
     InteractiveElement as _, IntoElement, ListOffset, ListState, ParentElement as _, Pixels, Point,
     SharedString, Size, StatefulInteractiveElement as _, Styled as _, StyledText, Window, div, img,
-    list, prelude::FluentBuilder as _, px,
+    list, prelude::FluentBuilder as _, px, relative,
 };
 use gpui_base::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 use gpui_component::{
@@ -71,11 +71,63 @@ const fn disclosure_icon(expanded: bool) -> IconName {
     }
 }
 
-/// 该角色的消息是否渲染成卡片。
+/// 消息列最大行宽（规范 S-13；`820` 在红线 4 的 `px(n)` 白名单内）。
 ///
-/// 规范 5.1 / 红线 10：只有用户消息卡片化（`rounded_md + border_1`），
-/// 助手与其余角色是无框无底的纯文本流。抽成纯函数以便单测直接断言消息根节点无边框。
-const fn message_is_carded(role: MessageRole) -> bool {
+/// 通栏长行是「读起来累」的首因：超宽窗口只允许留白变大，不允许行长变长。
+pub(crate) const MESSAGE_COLUMN_MAX_WIDTH: f32 = 820.;
+
+/// 消息正文与用户气泡共用的行高倍数（规范 S-18 / § 5.8）。
+///
+/// 组件库 typography token 的默认行高约 1.43，比阅读基线（pi-web 1.7）明显偏挤；
+/// 两处必须引用同一常量，禁止各写各的字面量（守卫见测试）。
+pub(crate) const BODY_LINE_HEIGHT: f32 = 1.7;
+
+/// 用户气泡的可断言样式（规范 S-14 / § 5.8）。
+///
+/// `debug_bounds` 只能断位置与尺寸，颜色/圆角/宽度比例断不了，
+/// 所以把这四个值收进纯函数，渲染与测试消费同一来源。
+pub(crate) struct UserBubbleStyle {
+    pub bg: Hsla,
+    pub border: Hsla,
+    pub radius: Pixels,
+    pub max_w_ratio: f32,
+}
+
+pub(crate) fn user_bubble_style(cx: &App) -> UserBubbleStyle {
+    UserBubbleStyle {
+        bg: cx.theme().accent.opacity(0.10),
+        border: cx.theme().accent.opacity(0.2),
+        radius: px(12.),
+        max_w_ratio: 0.85,
+    }
+}
+
+/// 消息列容器（规范 S-13）：820px 居中列 + 列外 16px 留白。
+///
+/// 消息流是虚拟化 `list`，没有统一的内容父节点，所以这层必须套在每一个表项外层
+/// （消息与处理详情组都算）。
+fn message_column(content: gpui::AnyElement) -> gpui::AnyElement {
+    div()
+        .w_full()
+        .px_4()
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .debug_selector(|| "message-column".into())
+                .w_full()
+                .min_w_0()
+                .max_w(px(MESSAGE_COLUMN_MAX_WIDTH))
+                .child(content),
+        )
+        .into_any_element()
+}
+
+/// 该角色的消息是否渲染成右对齐气泡。
+///
+/// 规范 S-14 / 红线 10：用户消息是全应用唯一允许给消息本体上底色的地方，
+/// 其余角色一律无框无底的纯文本流。抽成纯函数以便单测直接断言。
+const fn message_is_bubbled(role: MessageRole) -> bool {
     matches!(role, MessageRole::User)
 }
 
@@ -237,27 +289,30 @@ impl gpui::RenderOnce for ChatWindow {
                         list(list_state.clone(), move |index, _, _| {
                             items.get(index).map_or_else(
                                 || div().into_any_element(),
-                                |item| match item {
-                                    ConversationItem::Message(message) => {
-                                        MessageView::new(index, message.clone())
-                                            .selected(
-                                                selected_message.as_deref() == Some(&message.id),
-                                            )
-                                            .expanded_tools(expanded_tools.clone())
-                                            .on_toggle_tool(on_toggle_tool.clone())
-                                            .into_any_element()
-                                    }
-                                    ConversationItem::Process(group) => {
-                                        ProcessGroupView::new(index, group.clone())
-                                            .expanded(
-                                                !group.collapsible
-                                                    || expanded_processes.contains(&group.id),
-                                            )
-                                            .expanded_tools(expanded_tools.clone())
-                                            .on_toggle_tool(on_toggle_tool.clone())
-                                            .on_toggle_process(on_toggle_process.clone())
-                                            .into_any_element()
-                                    }
+                                |item| {
+                                    message_column(match item {
+                                        ConversationItem::Message(message) => {
+                                            MessageView::new(index, message.clone())
+                                                .selected(
+                                                    selected_message.as_deref()
+                                                        == Some(&message.id),
+                                                )
+                                                .expanded_tools(expanded_tools.clone())
+                                                .on_toggle_tool(on_toggle_tool.clone())
+                                                .into_any_element()
+                                        }
+                                        ConversationItem::Process(group) => {
+                                            ProcessGroupView::new(index, group.clone())
+                                                .expanded(
+                                                    !group.collapsible
+                                                        || expanded_processes.contains(&group.id),
+                                                )
+                                                .expanded_tools(expanded_tools.clone())
+                                                .on_toggle_tool(on_toggle_tool.clone())
+                                                .on_toggle_process(on_toggle_process.clone())
+                                                .into_any_element()
+                                        }
+                                    })
                                 },
                             )
                         })
@@ -356,84 +411,106 @@ impl MessageView {
 
 impl gpui::RenderOnce for MessageView {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let role = role_label(self.message.role);
-        let role_color = match self.message.role {
-            MessageRole::User => cx.theme().accent_foreground,
-            MessageRole::Assistant => cx.theme().foreground,
-            MessageRole::Compaction | MessageRole::BranchSummary => cx.theme().warning,
-            MessageRole::Unknown => cx.theme().danger,
-            MessageRole::Custom => cx.theme().muted_foreground,
-        };
         let message_id = self.message.id.clone();
         let expanded_tools = self.expanded_tools.clone();
-        // 规范 5.1 / 红线 10：只有用户消息是卡片，其余角色是纯文本流。
-        // 之前每条消息都套一层 rounded_lg 描边卡，长会话里就是一串「框套框」。
-        let is_user = message_is_carded(self.message.role);
         let selected = self.selected;
-        v_flex()
+        let blocks = self
+            .message
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(block_index, block)| {
+                render_block(
+                    self.index,
+                    block_index,
+                    &message_id,
+                    block,
+                    &expanded_tools,
+                    self.on_toggle_tool.clone(),
+                    cx,
+                )
+            })
+            .collect::<Vec<_>>();
+        let root = v_flex()
             .id(SharedString::from(format!("message-{message_id}")))
             .debug_selector(|| "chat-message".into())
             .w_full()
-            .min_w_0()
-            .gap_2()
-            .map(|view| {
-                if is_user {
-                    view.mx_2()
-                        .mt_2()
-                        .mb_3()
-                        .p_2()
-                        .rounded_md()
-                        .border_1()
-                        // 用户消息靠边框与圆角识别，底色与画布同源，不铺 accent（规范 5.1）。
-                        .border_color(if selected {
-                            cx.theme().accent
-                        } else {
-                            card_border(cx)
-                        })
-                        .bg(cx.theme().background)
-                } else {
-                    // 选中态走弱底而不是描边（规范 S-7），免得给助手消息加回卡片。
-                    view.px_5().py_1p5().when(selected, |view| {
-                        view.rounded_md().bg(cx.theme().accent.opacity(0.12))
+            .min_w_0();
+        if message_is_bubbled(self.message.role) {
+            // 规范 S-14：用户消息是右对齐弱色气泡，不通栏；右对齐 + 底色已完成身份区分，
+            // 不再显示 `User` 角色标签（再加就是重复编码，违反 S-8）。
+            let style = user_bubble_style(cx);
+            root.items_end().mb_4().child(
+                v_flex()
+                    .debug_selector(|| "user-bubble".into())
+                    .min_w_0()
+                    .max_w(relative(style.max_w_ratio))
+                    .px_3()
+                    .py_2()
+                    .rounded(style.radius)
+                    .border_1()
+                    // 选中态（minimap 定位）用边框实色表达，不与常规弱边框混淆（S-24）。
+                    .border_color(if selected {
+                        cx.theme().accent
+                    } else {
+                        style.border
                     })
-                }
-            })
-            .child(
-                h_flex()
+                    .bg(style.bg)
+                    .text_sm()
+                    .line_height(relative(BODY_LINE_HEIGHT))
                     .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_semibold()
-                            .text_color(role_color)
-                            .child(role),
-                    )
-                    .when_some(self.message.label.clone(), |row, label| {
-                        row.child(
+                    .when_some(self.message.label.clone(), |bubble, label| {
+                        bubble.child(
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(label),
                         )
-                    }),
+                    })
+                    .children(blocks),
             )
-            .children(
-                self.message
-                    .blocks
-                    .iter()
-                    .enumerate()
-                    .map(|(block_index, block)| {
-                        render_block(
-                            self.index,
-                            block_index,
-                            &message_id,
-                            block,
-                            &expanded_tools,
-                            self.on_toggle_tool.clone(),
-                            cx,
+        } else {
+            let role_color = match self.message.role {
+                // 用户消息走上面的气泡分支，此处不可达；给个中性值保持 match 完整。
+                MessageRole::User => cx.theme().foreground,
+                MessageRole::Assistant => cx.theme().foreground,
+                MessageRole::Compaction | MessageRole::BranchSummary => cx.theme().warning,
+                // 「渲染不了」不等于「出错了」，Unknown 不与真错误抢 danger 通道（§ 5.1）。
+                MessageRole::Unknown => cx.theme().warning,
+                MessageRole::Custom => cx.theme().muted_foreground,
+            };
+            root.gap_2()
+                .px_5()
+                .py_1p5()
+                // 正文字号与行高必须显式声明（S-12 / S-18）：rem 默认 16px，
+                // 不显式 `text_sm` 就会整体偏大；行高不给则吃组件库的 1.43，偏挤。
+                .text_sm()
+                .line_height(relative(BODY_LINE_HEIGHT))
+                // 选中态走弱底而不是描边（规范 S-7，0.16 是定值），免得给助手消息加回卡片。
+                .when(selected, |view| {
+                    view.rounded_md().bg(cx.theme().accent.opacity(0.16))
+                })
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(role_color)
+                                .child(role_label(self.message.role)),
                         )
-                    }),
-            )
+                        .when_some(self.message.label.clone(), |row, label| {
+                            row.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(label),
+                            )
+                        }),
+                )
+                .children(blocks)
+        }
     }
 }
 
@@ -1356,12 +1433,28 @@ mod tests {
         expanded_tools: Vec<String>,
         selected: Option<String>,
     ) -> VisualTestContext {
+        render_chat_sized(
+            cx,
+            document,
+            expanded_tools,
+            selected,
+            size(px(640.), px(480.)),
+        )
+    }
+
+    fn render_chat_sized(
+        cx: &mut TestAppContext,
+        document: Arc<ConversationDocument>,
+        expanded_tools: Vec<String>,
+        selected: Option<String>,
+        window_size: Size<Pixels>,
+    ) -> VisualTestContext {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::theme::init_fonts(cx).expect("font init failed");
         });
         let item_count = document.items.len();
-        let handle = cx.open_window(size(px(640.), px(480.)), move |window, cx| {
+        let handle = cx.open_window(window_size, move |window, cx| {
             let harness = cx.new(|_| ChatHarness {
                 document,
                 list_state: ListState::new(item_count, ListAlignment::Top, px(1200.)).measure_all(),
@@ -1378,6 +1471,19 @@ mod tests {
         visual
     }
 
+    /// 消息列宽度断言需要排除 176px 目录面板的占位，用空 minimap 的文档。
+    fn fixture_document_without_minimap(status: ToolStatus) -> Arc<ConversationDocument> {
+        let base = fixture_document(status);
+        Arc::new(ConversationDocument {
+            session_id: base.session_id.clone(),
+            source_path: base.source_path.clone(),
+            messages: base.messages.clone(),
+            items: base.items.clone(),
+            minimap: Arc::from(Vec::new()),
+            diagnostics: Arc::from(Vec::new()),
+        })
+    }
+
     #[test]
     fn detail_keys_are_stable_and_separate_thinking_from_tools() {
         assert_eq!(tool_key("m", 2, "call"), "m:tool:call");
@@ -1385,10 +1491,10 @@ mod tests {
         assert_eq!(detail_key("m", 2, "thinking"), "m:thinking:2");
     }
 
-    /// T2 ①：消息根节点不再是「每条一张描边卡」，只有用户消息卡片化。
+    /// T2 ①：消息根节点不再是「每条一张描边卡」，只有用户消息气泡化（S-14 / 红线 10）。
     #[test]
-    fn only_user_messages_are_carded() {
-        assert!(message_is_carded(MessageRole::User));
+    fn only_user_messages_are_bubbled() {
+        assert!(message_is_bubbled(MessageRole::User));
         for role in [
             MessageRole::Assistant,
             MessageRole::Compaction,
@@ -1397,10 +1503,104 @@ mod tests {
             MessageRole::Unknown,
         ] {
             assert!(
-                !message_is_carded(role),
-                "{role:?} 必须是纯文本流，不能套外层卡片"
+                !message_is_bubbled(role),
+                "{role:?} 必须是纯文本流，不能上气泡"
             );
         }
+    }
+
+    /// § 5.8 S-13：宽窗口（> 852 = 820 + 32）列宽钉在 820 且居中；
+    /// 窄窗口列宽等于窗宽减去列外 16px × 2 留白。
+    #[gpui::test]
+    fn message_column_is_centered_and_capped(cx: &mut TestAppContext) {
+        let mut wide = render_chat_sized(
+            cx,
+            fixture_document_without_minimap(ToolStatus::Success),
+            Vec::new(),
+            None,
+            size(px(1000.), px(480.)),
+        );
+        let column = wide.debug_bounds("message-column").expect("消息列必须存在");
+        assert_eq!(column.size.width, px(MESSAGE_COLUMN_MAX_WIDTH));
+        assert_eq!(
+            column.origin.x,
+            (px(1000.) - px(MESSAGE_COLUMN_MAX_WIDTH)) / 2.,
+            "超宽窗口下消息列必须水平居中"
+        );
+
+        let mut narrow = render_chat_sized(
+            cx,
+            fixture_document_without_minimap(ToolStatus::Success),
+            Vec::new(),
+            None,
+            size(px(640.), px(480.)),
+        );
+        let column = narrow
+            .debug_bounds("message-column")
+            .expect("消息列必须存在");
+        assert_eq!(column.size.width, px(640.) - px(32.));
+        assert_eq!(column.origin.x, px(16.));
+    }
+
+    /// § 5.8 S-14：用户气泡右缘贴列右缘，宽度不超过列宽 × 85%。
+    #[gpui::test]
+    fn user_bubble_hugs_column_right_edge(cx: &mut TestAppContext) {
+        let mut visual = render_chat(
+            cx,
+            fixture_document_without_minimap(ToolStatus::Success),
+            Vec::new(),
+            None,
+        );
+        let bubble = visual
+            .debug_bounds("user-bubble")
+            .expect("用户消息必须渲染为气泡");
+        let column = visual
+            .debug_bounds("message-column")
+            .expect("消息列必须存在");
+        let bubble_right = bubble.origin.x + bubble.size.width;
+        let column_right = column.origin.x + column.size.width;
+        assert!(
+            (bubble_right - column_right).abs() <= px(1.),
+            "气泡右缘必须贴列右缘：bubble_right={bubble_right:?} column_right={column_right:?}"
+        );
+        assert!(
+            bubble.size.width <= column.size.width * 0.85 + px(1.),
+            "气泡宽度不得超过列宽的 85%：bubble={:?} column={:?}",
+            bubble.size.width,
+            column.size.width
+        );
+    }
+
+    /// § 5.8 S-14：气泡四项样式值全部出自 `user_bubble_style`，渲染与测试同源。
+    #[gpui::test]
+    fn user_bubble_style_matches_spec(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let style = user_bubble_style(cx);
+            assert_eq!(style.bg, cx.theme().accent.opacity(0.10));
+            assert_eq!(style.border, cx.theme().accent.opacity(0.2));
+            assert_eq!(style.radius, px(12.), "气泡圆角是 rounded_xl 档（12px）");
+            assert!((style.max_w_ratio - 0.85).abs() < f32::EPSILON);
+        });
+    }
+
+    /// § 5.8 S-18：行高常量唯一；消息正文与用户气泡都必须引用它，不许出现字面量行高。
+    #[test]
+    fn body_line_height_is_shared_constant() {
+        assert!((BODY_LINE_HEIGHT - 1.7).abs() < f32::EPSILON);
+        let source = include_str!("chat.rs");
+        // 拼接构造检索串，避免本用例的源码把自己算进去。
+        let any_call = format!("line_height(relative{}", "(");
+        let const_call = format!("{any_call}BODY_LINE_HEIGHT");
+        assert_eq!(
+            source.matches(&any_call).count(),
+            source.matches(&const_call).count(),
+            "所有行高都必须引用 BODY_LINE_HEIGHT，不许写字面量（S-18 / § 5.8）"
+        );
+        assert!(
+            source.matches(&const_call).count() >= 2,
+            "消息正文与用户气泡两处都必须显式声明行高"
+        );
     }
 
     #[gpui::test]
