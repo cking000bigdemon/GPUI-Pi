@@ -1,7 +1,10 @@
 # GPUI-Pi UI 设计规范
 
-> 版本：v2.2（v1.0 为 R9 前置产出；v1.1 为 T3 目视验收后修订；v2.0 融合 pi-web 0.8.9 设计范本与 gpui-component 组件映射；v2.1 为子代理审核后的勘误与收敛；**v2.2 为 T3 复验后的用户气泡色勘误**，见文末「修订记录」）
+> 版本：**v2.3**（修订历史见 [`UI设计规范-CHANGELOG.md`](UI设计规范-CHANGELOG.md)）
 > 定位：本文件是 GPUI-Pi 界面视觉的唯一判据。与它冲突时以本规范为准；与立项文档冲突时以立项文档为准。
+> **单一定义原则（v2.3 起）**：每个数值在全文只有**一个**定义点，其余章节只许写指针（「见 § x.y」/「见 S-n」），
+> 不许复述数值。v2.1 与 v2.2 的勘误之所以各漏改 1~4 处，全部是因为同一数值有 3~5 份副本。
+> 新增条款时若发现要在第二处写下同一个数字，说明该数字的定义点没找对。
 > 来源基线：
 > - Zed 桌面端设计语言：`ZED_CHECKOUT/crates/theme/src/`、`ZED_CHECKOUT/crates/ui/src/styles/`、`ZED_CHECKOUT/crates/ui/src/components/`、`ZED_CHECKOUT/crates/agent_ui/src/`（下称 `ZED_*`）
 > - 组件库：`GPC_CHECKOUT/crates/base/src/theme_tokens.rs`、`GPC_CHECKOUT/crates/ui/src/theme/theme_color.rs`、`GPC_CHECKOUT/crates/ui/src/button/button.rs`（下称 `GPC_*`）
@@ -26,7 +29,9 @@ Zed 的层级模型（`ZED_crates/ui/src/styles/elevation.rs`）：
 
 **规范 S-1**：层级一律用「背景色阶 + 留白」表达，禁止用边框堆层级。同一容器内不再套边框容器（禁止边框套边框）。
 **规范 S-2**：阴影仅用于浮层（popover / tooltip / 对话框），**外加 composer 输入壳一处豁免**（`shadow_sm`——输入焦点区需要从画布浮起，这是全应用唯一的非浮层阴影）。日常卡片、列表行、消息条目一律不使用阴影。
-**规范 S-3**：**表面层级**最多三级——`background`（画布）→ `sidebar` / `popover`（面板、浮层）→ 对话框，不要引入第四级表面。
+**规范 S-3**：**表面层级**最多三级——`background`（画布）→ `sidebar`（面板）→ `popover`（浮层与对话框），不要引入第四级表面。
+
+对话框与 popover **共用底色**，靠 `cx.theme().overlay` 遮罩（而非第四个底色）与下层分离。
 
 「表面」指的是**独立成块、有自己边界的容器底色**。以下**不计入**层级数，可自由叠加：
 
@@ -116,15 +121,20 @@ pi-web 有三级文本色（`--text` / `--text-muted` / `--text-dim`），其中
 | 幽灵控件 hover | `ghost_element_hover` = alpha step_3/4 | `cx.theme().muted` 同源 | 同左 | `hover(\|row\| row.bg(cx.theme().muted))` |
 | 弱边框（非交互） | `border` = step_6 | `#3b3a37` | `#dad9d6` | `cx.theme().border` |
 | 弱边框（交互） | `border_variant` = step_5 | `#31312e` | `#e2e1de` | `cx.theme().border`（可用 opacity 区分） |
-| 焦点边框 | `border_focused` = blue step_5 | blue dark_5 | blue light_5 | `cx.theme().accent`（本项目 accent=蓝） |
+| 焦点边框 | `border_focused` = blue step_5 | blue dark_5 | blue light_5 | `cx.theme().accent`（**中性色，见下方待决项**） |
 | 主文本 | `text` = step_12 | `#eeeeec` | `#21201c` | `cx.theme().foreground` |
 | 次要文本 | `text_muted` = step_11（深）/step_10（浅） | `#b5b3ad` | `#82827c` | `cx.theme().muted_foreground` |
 | 占位文本 | `text_placeholder` = step_10 | `#7c7b74` | `#8d8d86` | `cx.theme().muted_foreground`（定值，不加 opacity） |
 | **第三级弱文本（dim）** | —（pi-web `--text-dim`） | `#9ca3af` | `#6b7280` | **`cx.theme().muted_foreground.opacity(0.7)`**，见 S-16 |
 | 禁用文本（第四级，唯一额外档） | `text_disabled` = step_9 | `#6f6d66` | `#8d8d86` | `cx.theme().muted_foreground.opacity(0.5)`，同样封装成 `disabled_foreground(cx)`，见 S-16 |
-| 强调文本/链接 | `text_accent` = blue step_11 | blue dark_11 | blue light_11 | `cx.theme().accent` |
+| 强调文本/链接 | `text_accent` = blue step_11 | blue dark_11 | blue light_11 | **`cx.theme().link`**（不要用 `accent`，见下方待决项） |
 | 图标常规 | `icon` = step_11 | `#b5b3ad` | `#63635e` | `cx.theme().muted_foreground` |
 | 滚动条滑块 | `scrollbar_thumb_background` = alpha step_3 | 白 alpha 0x12 | 黑 alpha 0x0f | `cx.theme().scrollbar_thumb` |
+
+> **待决项（v2.3 登记）**：Zed 的 `border_focused` / `text_accent` 都是**蓝**（左侧三列如实记录），但右侧把它们映射到
+> `cx.theme().accent` —— 而 gpui-component 的 `accent` 是 shadcn 语义的**中性 hover 色**，与 v2.2 判红用户气泡时
+> 是同一个失实前提。链接色本轮改判 `cx.theme().link`；**焦点边框维持 `accent` 不动**（改它会连带 S-6 与全局
+> `Theme::focus_ring`，属实现改动，须由承接轮次任务卡授权）。在那之前，**S-6 在浅色模式下不作为判红依据**。
 
 ### 2.2 状态 / 语义色
 
@@ -184,6 +194,7 @@ pi-web 有三级文本色（`--text` / `--text-muted` / `--text-dim`），其中
 | 紧凑间隙 | Base04 | `gap_1` = 4px | 图标+文字、按钮内容、chip 内距 |
 | 常规间隙 | Base06 | `gap_1p5` = 6px | 工具卡 header、thinking 内容左缩进 |
 | 行内间隙 | Base08 | `gap_2` = 8px | 列表行、卡片内块间距、行首图标间距 |
+| **中密度间隙** | —（pi-web 高频档） | **`gap_2p5` / `p_2p5` = 10px** | 见 S-17；gpui 原生刻度（`rems(0.625)`），不是自定义值 |
 | 段间距 | Base12 | `gap_3` = 12px | 卡片内节间距、minimap 节点组 |
 | 消息流间隙 | Base16 | `gap_4` = 16px | 消息之间 |
 | 区块间距 | Base20 | `gap_5` = 20px | 侧栏项目分组 |
@@ -194,18 +205,28 @@ pi-web 有三级文本色（`--text` / `--text-muted` / `--text-dim`），其中
 
 **规范 S-17（从 pi-web 迁移数值时向刻度取整）**：pi-web 的间距值域是 1–32px 的**连续整数**（实测 19 个不同值），其中 `3 / 5 / 7 / 9 / 11 / 18` 六个奇值合计约占 28%——它们是累积出来的，不构成设计意图（同类 chip 上 5 和 6 混用、同类按钮上 7 和 8 混用）。迁移时**一律向 gpui 刻度取整，禁止用 `px(n)` 复刻奇值**：
 
-| pi-web | → 本项目 | | pi-web 圆角 | → 本项目 |
-|---|---|---|---|---|
-| 3 | `_1`(4px) | | 3 | `rounded_sm`(4px) |
-| 5 | `_1p5`(6px) | | **5**（最高频，58 处） | **`rounded_md`(6px)** |
-| 7 | `_2`(8px) | | 7 / 9 | `rounded_lg`(8px) |
-| 9 | `_2p5`(10px) | | 10 / 11 / 12 / 14 | `rounded_xl`(12px) |
-| 11 | `_3`(12px) | | | |
-| 18 | `_4`(16px) | | | |
+**间距**：
 
-**唯一必须保留的非常规刻度是 `_2p5`（10px）**——pi-web 里 padding 用了 84 次、gap 用了 20 次，是真实高频档，不许并入 8 或 12。
+| pi-web | → 本项目 |
+|---|---|
+| 3 | `_1`(4px) |
+| 5 | `_1p5`(6px) |
+| 7 | `_2`(8px) |
+| 9 | `_2p5`(10px) |
+| 11 | `_3`(12px) |
+| 18 | `_4`(16px) |
 
-圆角收敛为四档，用途见 § 3.3（该表是唯一定义，此处不复述）。
+**圆角**（四档制的用途见 § 3.3，该表是唯一定义，此处只给收敛映射）：
+
+| pi-web 圆角 | → 本项目 |
+|---|---|
+| 3 | `rounded_sm`(4px) |
+| **5**（最高频，58 处） | **`rounded_md`(6px)** |
+| 7 / 9 | `rounded_lg`(8px) |
+| 10 / 11 / 12 / 14 | `rounded_xl`(12px) |
+
+`_2p5`（10px）**必须保留**——pi-web 里 padding 用了 84 次、gap 用了 20 次，是真实高频档，不许并入 8 或 12。
+它是 gpui 原生刻度（`rems(0.625)`，`ZED_crates/gpui_macros/src/styles.rs:954`），已登记进 § 3.1 刻度表，用它不需要 `px(n)`。
 
 注意 gpui 链式 `rounded_sm` 是 **4px**，而 gpui-component 的语义 radius token `Theme::radius_tokens().sm` 是 **3px**（`radius/2`）——**两套不要混用**，本项目统一用 gpui 链式方法。
 
@@ -213,30 +234,30 @@ pi-web 有三级文本色（`--text` / `--text-muted` / `--text-dim`），其中
 
 ### 3.2 各场景节奏（消息流 / 列表行 / 卡片 / composer）
 
-| 场景 | 外边距 | 内边距 | 圆角 | 说明 |
-|---|---|---|---|---|
-| **消息列（容器）** | 水平居中 | `px_4`（16px） | 无 | `max_w(px(820.))` + 居中；宽窗口下靠左右留白控制行长（pi-web `ChatWindow.tsx:703`） |
-| 助手消息条目 | `px_5`（20px 左右）、`py_1p5`（6px）、末条 `pb_4` | 无 | 无 | 纯文本流，无框无底（Zed 助手消息，`thread_view.rs:6395`） |
-| **用户消息条目** | 整条右对齐、底部 `mb_4`（16px） | `px_3 py_2`（12/8px） | `rounded_xl`(12px) | 气泡 `max_w` 85%，accent 弱底 + accent 弱边框（pi-web `MessageView.tsx:365`） |
-| 缩进消息（子代理/处理详情） | 见 § 5.3 | 见 § 5.3 | 无 | 左竖线 + 缩进，**不铺底色**（数值只在 § 5.3 定义一次） |
-| 列表行（侧栏会话） | 无 | `p_2` | `rounded_md` | hover `muted`、选中 `accent.opacity(0.16)`，行间 `gap_1`（见 S-7） |
-| 工具卡片 | 消息流内 `gap_2` | `p_2` | `rounded_md` | 弱边框 `border`（见 5.3） |
-| thinking 卡片 | 消息流内 `gap_2` | header 无、内容 `pl_3p5`(14px) | 无边框卡，左竖线 | header 高 `line_height - 2px`（`thread_view.rs:7450`） |
-| 代码块 | 无 | 内容 `p_2`、header `px_2 py_1` | `rounded_md` | header 下 `border_b_1` |
-| composer | 底部固定 | 容器 `px_2 py_2` | 见 § 5.6 | 顶边框 `border_t_1`，`bg(cx.theme().background)`；列宽与消息列一致 |
-| minimap/目录节点 | — | `px_2 py_1` | `rounded_sm` | 缩进与选中态数值见 § 5.5（唯一定义处，此处不复述） |
+**本表是纯索引，不含任何数值**（v2.3 起）。数值一律去定义点查：
+
+| 场景 | 定义点 |
+|---|---|
+| 消息列（容器） | S-13（§ 5.1） |
+| 助手消息条目 | § 5.1「助手消息」 |
+| 用户消息条目 | S-14（§ 5.1） |
+| 缩进消息（子代理/处理详情、工具输出、thinking 内容） | § 5.3 |
+| 列表行（侧栏会话） | § 4.3；颜色见 S-7 |
+| 工具卡片 | § 5.2；卡片通用结构见 § 4.2 |
+| thinking 卡片 | § 5.4 |
+| 代码块 | § 4.2（结构）+ § 3.3（圆角） |
+| composer | § 5.6 |
+| minimap / 目录节点 | § 5.5 |
 
 ### 3.3 圆角刻度
 
-| 本项目方法 | 像素 | Zed 对应 | 用途 |
-|---|---|---|---|
 **四档制**（本表是全文唯一的圆角定义，其余章节只许引用）：
 
 | 本项目方法 | 像素 | 用途 |
 |---|---|---|
 | `rounded_sm` | 4px | 按钮、minimap 节点、小 chip、徽章 |
 | `rounded_md` | 6px | 输入框、工具卡、代码块、列表行、**非用户消息的一切卡片** |
-| `rounded_lg` | 8px | 面板、卡片内嵌卡片 |
+| `rounded_lg` | 8px | 面板 |
 | `rounded_xl` | 12px | **用户消息气泡**、**composer 输入壳**、**对话框** |
 
 另有两个专用值：`rounded_xs`(2px) 仅用于极小元素、`rounded_full`(9999px) 仅用于状态点/头像/圆钮。
@@ -245,7 +266,7 @@ pi-web 有三级文本色（`--text` / `--text-muted` / `--text-dim`），其中
 
 > **勘误**：v2.0 及更早在本表写「gpui-component `radius_lg` 默认 12px」，**错误**——`GPC_crates/ui/src/theme/mod.rs:460` 实为 `radius_lg: px(8.)`，12px 对应的是 `radius_tokens().xl`（`radius * 2`）。
 
-**规范 S-11**：圆角只用上表刻度，禁止自定义中间值（包括 5px、7px、9px、14px）；相邻嵌套元素圆角保持「同心收缩」（如卡片 `rounded_lg` 内嵌 header 用 `rounded_md`）。
+**规范 S-11**：圆角只用上表刻度，禁止自定义中间值（包括 5px、7px、9px、14px）；相邻嵌套元素圆角保持「同心收缩」（如面板 `rounded_lg` 内嵌卡片用 `rounded_md`）。
 
 ### 3.4 字号 / 字重 / 行高
 
@@ -266,12 +287,14 @@ pi-web 有三级文本色（`--text` / `--text-muted` / `--text-dim`），其中
 |---|---|---|
 | **消息正文 / markdown** | `.line_height(relative(1.7))` | pi-web `globals.css:348` 实测值；14px × 1.7 ≈ 24px |
 | markdown 标题 | `relative(1.35)` | `PIWEB_globals.css:359` |
-| 用户气泡正文 | `relative(1.6)` | `PIWEB_MessageView.tsx:382` |
+| 用户气泡正文 | **同正文 `relative(1.7)`** | 与正文共用常量，见下 |
 | 紧凑列表行 / 状态栏 | 不设（用组件默认） | 只有正文与气泡需要显式行高 |
 
 gpui-component 语义 typography token 的行高是**绝对 px**（sm = 14/20 → 倍数 **1.43**），明显比 pi-web 正文的 1.7 紧。**正文不得吃 token 默认行高**，必须显式写 `relative(1.7)`。
 
 gpui 的 `line_height(relative(x))` 语义等同 CSS `line-height: x`（按字号倍乘），但结果会 `.round()` 取整（1.7 × 14 = 23.8 → 24px）。
+
+**正文与用户气泡共用同一个常量 `BODY_LINE_HEIGHT`（1.7）**，不许各写各的（S-25 有对应断言）。
 
 来源：`PIWEB_app/globals.css:348, 359`、`PIWEB_components/MessageView.tsx:382`、`GPC_crates/base/src/theme_tokens.rs:112-117`、`ZED_crates/gpui/src/style.rs:554-556`
 
@@ -336,13 +359,26 @@ gpui 的 `line_height(relative(x))` 语义等同 CSS `line-height: x`（按字�
 - 卡内第一段是 header：`h_flex().gap_1p5()`，header 与内容之间用 `gap_2` 或 `border_t_1`（内容多块时）；
 - **禁止**：卡片内再套完整卡片（工具输出、diff 只能以左竖线/文本块下沉）。
 
+**代码块**（本项目唯一定义处，v2.3 从 § 3.2 迁入）：内容 `p_2`、header `px_2 py_1`、`rounded_md`、
+header 与内容之间 `border_b_1`；底色 `cx.theme().muted.opacity(0.42)`（见 § 2.3）；
+正文走 `mono_font_family` + `text_xs`（见 S-21）。header 自绘的挂点是 `markdown_block_renderer`（见 § 4.8）。
+
 ### 4.3 列表行
 
-- 结构：`div().px_2().py_1().rounded_md().cursor_pointer()`；
+- 结构：`div().p_2().rounded_md().cursor_pointer()`；
+- 行与行之间 `gap_1`；
 - hover：`.hover(|row| row.bg(cx.theme().muted))`；
 - 选中：`.bg(cx.theme().accent.opacity(0.16))`，不加边框；
 - 行内信息最多 3 片段：标题（`text_sm` 截断）+ 指标行（`text_xs` + `muted_foreground`）+ 状态图标色；
-- 缩进（树形会话）：`ml(depth * 12px)`，与 minimap 缩进刻度（7px/级）不同用途，列表用 12px。
+- 缩进（树形会话）：`ml(px(depth * 12.))`，与 minimap 缩进刻度（7px/级）不同用途，列表用 12px（红线 4 白名单）。
+
+**S-19 豁免（v2.3）：会话列表不强制用 `List` / `ListItem`。**
+§ 4.8 表把会话列表标为「复用 `List<ListDelegate>` + `ListItem`」，但本节的手写结构是**允许的**，理由有二：
+
+1. `ListItem` 自带的选中色是 `list_active`，与 S-7 定死的 `accent.opacity(0.16)` **不是同一个值**——用组件就违反 S-7，手写才守得住；
+2. 会话行需要「双行元信息 + 左竖条 + hover 显隐（红线 17 豁免的结构断言形态）」，与 `ListItem` 的形制不符。
+
+§ 4.8 该行相应从「必须」降为「可选参考」。**其余场景的 S-19 强制不受影响。**
 
 来源：`crates/app/src/session_sidebar.rs`（现状）、`ZED_crates/ui/src/components/list/`（行 hover 语义）
 
@@ -356,7 +392,7 @@ gpui 的 `line_height(relative(x))` 语义等同 CSS `line-height: x`（按字�
 ### 4.5 状态点 / 状态竖条
 
 - 状态点：`div().size_2().rounded_full().bg(cx.theme().<status>)`（8px 圆点）；
-- 竖条（工具输出从属关系）：`div().w_px().bg(cx.theme().border)`，位于容器左缘 18px 处（Zed 缩进竖线，`thread_view.rs:6516`）；
+- 竖条（工具输出从属关系）：**结构与数值只在 § 5.3 定义**（`ml_1p5` + `pl_3p5` + `border_l_1`）；
 - 状态点旁文字用 `text_xs + muted_foreground`，**状态色只上点/图标，不上文字**（或文字用 `text_xs` 同色，与点并列时不重复）。
 
 ### 4.6 Tooltip / Popover / 右键菜单
@@ -380,6 +416,8 @@ gpui 的 `line_height(relative(x))` 语义等同 CSS `line-height: x`（按字�
 
 **规范 S-19**：下表列出的场景**必须复用 gpui-component 现成组件**，不许手搓。
 
+**已登记的两处豁免**（此外不许再自行认定豁免）：**会话列表**（理由见 § 4.3）、**折叠**（理由见本节末「结论」）。
+
 表中所有**组件名与路径**已在 `GPC_CHECKOUT` 源码中核实存在；**括号内的像素值一律以源码为准，引用前请复核**——v2.0 曾在此表写错按钮尺寸（把 20/24/32 写成 26/28/30）。
 
 | 场景 | 组件 / API | 关键说明 |
@@ -387,8 +425,8 @@ gpui 的 `line_height(relative(x))` 语义等同 CSS `line-height: x`（按字�
 | 窗口标题栏 | `TitleBar::new()`（`ui/src/title_bar.rs:42`） | `TITLE_BAR_HEIGHT = px(34.)`；自动走 `title_bar` / `title_bar_border` token |
 | 左侧栏外壳 | `Sidebar::new(id).side(..).collapsible(..).header(..).footer(..)`（`ui/src/sidebar/mod.rs:238`） | 默认宽 `px(255.)`；折叠钮用 `SidebarToggleButton`（`:302`） |
 | 侧栏分组标题 | `SidebarGroup::new(label)`（`ui/src/sidebar/group.rs:17`） | 替代手写大写小标题 |
-| **会话列表** | `List<D: ListDelegate>` + `ListItem`（`ui/src/list/`） | **不要用 `SidebarMenuItem`**——它只有单行 label+icon+suffix，装不下双行 + 左竖条。`ListDelegate` 一次覆盖 加载中/空/错误/分组/搜索/`load_more` 六态且自带虚拟化 |
-| 列表行 hover/选中 | `ListItem::new(id).selected(..)` | 自带 `list_hover` / `list_active`，正好对应 pi-web 的 `--bg-hover` / `--bg-selected` |
+| 会话列表 | `List<D: ListDelegate>` + `ListItem`（`ui/src/list/`） | **可选参考，非强制**（S-19 豁免，理由见 § 4.3）。`ListDelegate` 一次覆盖 加载中/空/错误/分组/搜索/`load_more` 六态且自带虚拟化，值得参考；但 `ListItem` 的 `list_active` 与 S-7 定死的 `accent.opacity(0.16)` 冲突，且装不下双行 + 左竖条。**`SidebarMenuItem` 一律不用**（见下表） |
+| 列表行 hover/选中 | `ListItem::new(id).selected(..)` | 自带 `list_hover` / `list_active`。**用它就吃它的选中色，与 S-7 的 `accent.opacity(0.16)` 二选一**——会话列表按 § 4.3 走手写 + S-7 |
 | 文件树 | `tree(&state, ..)` + `TreeItem` / `TreeState`（`ui/src/tree.rs:18`、`crates/base/src/tree.rs:97`） | **不自动缩进**——`TreeEntry::depth()` 拿层级后自己 `.pl(..)`；展开态由 `TreeState` 托管，不要自管集合 |
 | 树/列表右键菜单 | `Tree::context_menu(..)`（`ui/src/tree.rs:55`）、`PopupMenu`（`ui/src/menu/popup_menu.rs:283`） | 低频操作收这里，行内只留 1~2 个 |
 | 多行输入 | `Textarea::new(&state)`；state 用 `TextareaState::new(..).auto_grow(min,max).submit_on_enter(true)`（`crates/base/src/input/base/state.rs:4873`） | `auto_grow` 直接替掉手写的 `min(scrollHeight, N)` 高度同步 |
@@ -472,19 +510,17 @@ v_flex().items_end().mb_4()                    // 整条右对齐
     )
 ```
 
-> **v2.2 勘误**：此处曾写 `accent.opacity(…)`，前提是「本项目 accent=蓝」。经复核，gpui-component 的
-> `accent` 是 shadcn 语义的**中性 hover 色**（浅 neutral-100 / 深 neutral-800），10% 透明度铺在画布上
-> 不可见，T3 复验判红。气泡身份色改走 `cx.theme().blue`（base.blue：浅 blue-600 / 深 blue-400，
-> 与 pi-web `rgba(59,130,246,…)` 同族）；选中态边框用同源实色 `blue`。其余 `accent` 消费点
-> （列表/minimap 选中 0.16、焦点边框）**维持中性 accent**——pi-web 的 `--bg-selected` 同为中性灰，
-> 方向一致，是否也换蓝留待后续轮次统一评估。
+> 气泡身份色**必须是 `blue` 而不是 `accent`**（`accent` 在 gpui-component 是中性 hover 色，10% 铺在画布上不可见，
+> v2.2 T3 复验判红）。`blue` = base.blue，浅 blue-600 / 深 blue-400，与 pi-web `rgba(59,130,246,…)` 同族；
+> 选中态边框用同源实色 `blue`。S-25 的饱和度断言就是为了防止这里再退化成中性灰。
+> **其余 `accent` 消费点维持中性**（列表 / minimap 选中 0.16、焦点边框），未决部分见 § 2.1 待决项。
 
 - **不显示 `User` 角色标签**——右对齐 + 气泡底色已经完成了身份区分，再加标签就是重复编码，且违反 S-8；
-- 气泡内正文 `text_sm`、行高 1.6；
+- 气泡内正文 `text_sm`、行高走 `BODY_LINE_HEIGHT`（见 S-18）；
 - 图片附件在正文上方，`gap_1p5`、`rounded_md`、最大 240×240；
 - 行内操作（复制/编辑/分叉）与时间戳放气泡下方右侧一行，hover 才显形（S-9）。
 
-来源：`PIWEB_components/MessageView.tsx:365`（`alignItems: flex-end`、`marginBottom: 16`）、`:371`（`maxWidth: "85%"`）、`:375-385`（底色/边框/圆角 12/内距 8-12/字号 14/行高 1.6）、`PIWEB_app/globals.css:32,49`（`--user-bg`）
+来源：`PIWEB_components/MessageView.tsx:365`（`alignItems: flex-end`、`marginBottom: 16`）、`:371`（`maxWidth: "85%"`）、`:375-385`（底色/边框/圆角 12/内距 8-12/字号 14；**行高 1.6 是 pi-web 值，本项目统一用 1.7，见 S-18**）、`PIWEB_app/globals.css:32,49`（`--user-bg`）
 
 #### 助手消息
 
@@ -556,7 +592,7 @@ v_flex().p_2().rounded_md().border_1()
 ```
 
 - 边框：一律 `border.opacity(0.8)`（Zed `tool_card_border_color`，`thread_view.rs:11004`）；
-- header 底色：不加或 `muted.opacity(0.25)`（Zed `tool_card_header_bg` 是 element_background 混 2.5% 前景色，`thread_view.rs:10997`）；
+- header 底色：**不铺底**（与 § 2.3 一致）；
 - 状态：**小圆点或图标色**（pending=warning / success=success / error=danger / empty=muted_foreground）+ 状态文字用 `muted_foreground`；禁止状态色铺边框（现状 `border_color(color.opacity(0.7))` 必须改）；
 - 展开区多块之间 `border_t_1` 分隔；header 行高与文本行高一致（约 20px），`gap_1p5`。
 
@@ -573,7 +609,7 @@ v_flex().ml_1p5()          // 6px 左缩进
     .text_xs().text_color(cx.theme().muted_foreground)
 ```
 - 工具输出、thinking 内容、diff 展开均用此「左竖线 + 缩进」表达从属关系，**禁止再套一张卡片**；
-- 输出内小块间用 `gap_2`；Input JSON、输出文本用等宽字体（mono 13px）；
+- 输出内小块间用 `gap_2`；Input JSON、输出文本用等宽字体 + `text_xs`(12px)（见 S-21）；
 - 多段输出（Text/Ansi/Image/Diff）同竖线区内顺序排列，`gap_2`。
 
 ### 5.4 Thinking 折叠
@@ -581,7 +617,7 @@ v_flex().ml_1p5()          // 6px 左缩进
 参考 `thread_view.rs:7434`（render_thinking_block）：
 
 - header：`h_flex().gap_1p5().cursor_pointer()`，图标 `IconName::ToolThink`（或灯泡）小尺寸 + `muted_foreground`，标题「思考」`text_sm + font_semibold`；
-- chevron 右侧，hover 才显隐（`visible_on_hover` 语义，本项目可用 `hover` 控制 opacity）；
+- chevron 在右侧，**常驻**（见 § 4.4；hover 显隐会重新引入 § 6.1 #4 点名要修的可发现性缺陷）；
 - 展开内容：左竖线模式（同 5.3），`max_h(px(256.))` + 底部渐变遮罩；**遮罩态下不给内部滚动，改配「展开全部」按钮**——点击后去掉 `max_h`，让表项真实变高（理由见 S-22）；
 - **渐变遮罩的实现**（这是全文唯一的渐变，写死避免各写各的）：容器 `relative()`，底部叠一个绝对定位覆盖层，`h(px(32.))` + `bottom_0 left_0 right_0`，背景 `linear_gradient(0., linear_color_stop(cx.theme().background, 0.), linear_color_stop(cx.theme().background.opacity(0.), 1.))`。**不要试图用 `mask-image`**——GPUI 无此能力（§ 5.7）；
 - thinking **不套卡片边框**（它是消息流内的次级内容），只用左竖线区分层级；
@@ -603,7 +639,7 @@ v_flex().ml_1p5()          // 6px 左缩进
 - 容器：`border_t_1 + border`、`bg(background)`、内容 `px_2 py_2`；
 - **输入壳**：`rounded_xl`(12px)、`border_1`、`shadow_sm`（阴影豁免见 S-2）；越靠近输入焦点圆角越大是基线的一致规律；
 - **输入区高度走 `TextareaState::auto_grow(1, 8)`**（`crates/base/src/input/base/state.rs:4873`）——1 行起、约 8 行封顶，不要手写 `scrollHeight` 同步；
-- 工具行控件统一 `ghost` + `Size::Small`(30px)，图标钮正方；
+- 工具行控件统一 `ghost` + `Size::Small`（尺寸见 § 4.1 表），图标钮正方；
 - 左 = 附件 / 模型选择器；右 = 模式切换（`ToggleGroup::segmented()`）+ 发送主按钮（`primary`，唯一常驻主操作）；
 - **停止按钮只在运行态出现**，用 `.danger()`；
 - placeholder 按状态切换文案（空闲 / 可 steer / 运行中不可 steer），色 `muted_foreground`；
@@ -660,27 +696,46 @@ pi-web 基线里这样的容器共 **9 处**（用户气泡 300、超大消息 4
 
 ## 6. 禁止事项（红线）
 
-1. **禁止硬编码颜色**：一切颜色走 `cx.theme()` token；特殊色（如 diff 语义色）只能以 token + `opacity()` 派生。唯一例外：ANSI 16 色映射已在 `chat.rs::ansi_color` 统一处理，新增时必须在同一函数内扩展。
-2. **禁止边框套边框**：卡片内不允许再出现完整描边卡片；工具输出/thinking/diff 一律走左竖线 + 缩进。
-3. **禁止状态色铺满**：状态色不得作为卡片整体边框色（如 `border_color(color.opacity(0.7))`）、不得铺满卡片背景；只能点/竖条/图标/低透明度背景（≤0.2）。
-4. **禁止自造字号/圆角/间距**：只用第 3 节的刻度。`px(n)` 自定义值**白名单如下，此外一律不许**——minimap 面板宽 `176`、minimap 缩进 `7`/级（§ 5.5）、左竖线偏移 `18`（§ 5.3）、消息列 `max_w` `820`（S-13）、thinking `max_h` `256`（§ 5.4）、渐变遮罩高 `32`（§ 5.4）。新增白名单项必须改本条。**禁止通过改 `Theme::font_size` / rem 来整体缩放字号**（理由见 S-12）。
-5. **禁止 UI 字体混用**：正文/标题一律走 `theme.font_family`（微软雅黑 UI / Noto Sans SC），不得在组件内指定其他非等宽字体；等宽只能走 `mono_font_family`。
-6. **禁止在 14px 以下用 bold**；标题字重只用 `font_semibold`。
-7. **禁止行内超 3 片段**信息堆叠；次要信息进 tooltip。
-8. **禁止无 tooltip 的纯图标按钮**——**无例外**，工具栏也不例外（与 § 4.1 一致）。
-   > v2.0 及更早此条带「需全局有 aria-label」的括号：`aria-label` 是 web/ARIA 概念，GPUI 无对应物，且该例外让 § 4.1 的硬性要求失效。已删除。
-9. **禁止无状态反馈的 hover 空白**：可交互元素必须给 hover 背景（`muted` / `secondary_hover`）或边框色变化。
-10. **除用户消息外，`MessageRole` 的所有角色一律纯文本流**——不加卡片背景、不加气泡、不右对齐（Assistant / Compaction / BranchSummary / Custom / Unknown 全部适用）。用户消息是唯一例外，且只能按 S-14 的形态：右对齐、`max_w` 85%、`rounded_xl`、accent 弱底 + accent 弱边框。
-11. **禁止消息流通栏**：消息列必须有 `max_w` 与居中留白（S-13）。窗口越宽只允许留白变大，不允许行长变长。
-12. **禁止消息正文靠继承取字号/行高**：正文容器必须显式 `.text_sm()` + `.line_height(relative(1.7))`（S-12 / S-18）。
-13. **禁止在消息流表项内嵌套滚动容器**（S-22）：一律改「截断 + 展开」。
-14. **禁止低于 12px 的字号**（S-21）：要弱化用 dim 色，不要继续缩字。
-15. **禁止手搓已有组件**（S-19）：4.8 表中列出的场景必须复用 gpui-component。
-16. **禁止手算浮层坐标**：`Popover` 自带锚定、翻转避让与外点关闭，不要复刻 `getBoundingClientRect` 那套。
-17. **hover 显隐默认走 `.group()` + `.group_hover()`**，禁止给每个元素各配一个 `hovered: bool`。
-    **豁免**：当验收要求以「元素不在渲染树中」做结构断言时（`debug_bounds` 返回 `None`），必须用 hover state + `.when()`——因为 `.group_hover()` 配 `.invisible()` 的元素**仍占布局、`debug_bounds` 仍返回 `Some`**，两者不可兼得。此时 state 必须收敛到单个 `hovered_id: Option<Id>`，不得每行一个布尔。
-    > 本项目 `session_sidebar.rs` 的行内操作显隐即属该豁免（R9 验收 T2 ③ 要求 hover 前为 `None`）。
-18. **禁止在业务代码里排 z-index**：`Root` 统一管理 dialog / notification / popover 三层（见 § 4.6）。
+**本章是纯指针**（v2.3 起）——每条只写禁什么 + 定义点，不复述数值与条件。
+判红时以指向的条款为准；条款改了，红线自动跟着改。
+
+| # | 禁止 | 定义点 |
+|---|---|---|
+| 1 | 硬编码颜色（唯一例外：ANSI 16 色，且必须在 `chat.rs::ansi_color` 内统一扩展） | § 2 全章 |
+| 2 | 边框套边框（卡片内套完整描边卡片） | § 4.2、§ 5.3 |
+| 3 | 状态色铺满（作卡片整体边框色或铺满背景） | S-4 / S-10；`accent` 与 `blue` 不受此条约束，见 S-24 |
+| 4 | 自造字号 / 圆角 / 间距 | § 3.1、§ 3.3、§ 3.4；`px(n)` 白名单见下 |
+| 5 | UI 字体混用 | § 3.5 |
+| 6 | 14px 以下用 bold | S-21 |
+| 7 | 一行超 3 片段 | S-8（含「片段」判定规则） |
+| 8 | 无 tooltip 的纯图标按钮（**无例外**） | § 4.1 |
+| 9 | 无状态反馈的 hover 空白 | S-7、§ 4.4 |
+| 10 | 除用户消息外的任何角色上卡片底 / 气泡 / 右对齐（Assistant / Compaction / BranchSummary / Custom / Unknown 全适用） | S-14 是唯一例外，形态以 S-14 为准 |
+| 11 | 消息流通栏 | S-13 |
+| 12 | 消息正文靠继承取字号 / 行高 | S-12 / S-18 |
+| 13 | 消息流表项内嵌套滚动容器 | S-22 |
+| 14 | 低于 12px 的字号 | S-21 |
+| 15 | 手搓已有组件 | S-19（含两处已登记豁免） |
+| 16 | 手算浮层坐标 | § 4.6 |
+| 17 | 每元素各配一个 `hovered: bool`（默认走 `.group()` + `.group_hover()`） | § 4.8 末行；**豁免见下** |
+| 18 | 在业务代码里排 z-index | § 4.6 |
+
+**红线 4 的 `px(n)` 白名单**（此外一律不许；新增必须改本表）：
+
+| 值 | 用途 | 定义点 |
+|---|---|---|
+| `176` | minimap 面板宽 | § 5.5 |
+| `7` | minimap 缩进 / 级 | § 5.5 |
+| `12` | 会话树缩进 / 级 | § 4.3 |
+| `820` | 消息列 `max_w` | S-13 |
+| `256` | thinking `max_h` | § 5.4 |
+| `32` | 渐变遮罩高 | § 5.4 |
+| `240` | 消息内图片附件边长上限 | S-14 |
+| `56` | composer 附件缩略图边长 | § 5.6 |
+
+**红线 17 的豁免**：当验收要求以「元素不在渲染树中」做结构断言时（`debug_bounds` 返回 `None`），必须用 hover state + `.when()`——
+`.group_hover()` 配 `.invisible()` 的元素**仍占布局、`debug_bounds` 仍返回 `Some`**，两者不可兼得。
+此时 state 必须收敛到单个 `hovered_id: Option<Id>`，不得每行一个布尔。本项目 `session_sidebar.rs` 的行内操作显隐即属该豁免。
 
 ### 6.1 明确不照搬 pi-web 的部分
 
@@ -714,155 +769,66 @@ pi-web 是功能与阅读体验的对照基线，**不是逐像素复刻的对�
 
 ## 7. 来源文件索引（复核用）
 
-| 主题 | 文件 |
-|---|---|
-| ColorScale 12 步语义 | `ZED_crates/theme/src/scale.rs` |
-| 默认主题语义色全表（深/浅） | `ZED_crates/theme/src/default_colors.rs` |
-| UI 密度 / DynamicSpacing | `ZED_crates/theme/src/ui_density.rs`、`ZED_crates/ui/src/styles/spacing.rs` |
-| 字号体系（TextSize/Headline） | `ZED_crates/ui/src/styles/typography.rs` |
-| 层级与阴影（ElevationIndex） | `ZED_crates/ui/src/styles/elevation.rs` |
-| 语义色枚举（Color/status） | `ZED_crates/ui/src/styles/color.rs` |
-| 动画时长（50/150/300ms） | `ZED_crates/ui/src/styles/animation.rs` |
-| 按钮样式/尺寸 | `ZED_crates/ui/src/components/button/button_like.rs`、`button/button.rs` |
-| Callout（状态低透明背景） | `ZED_crates/ui/src/components/callout.rs` |
-| 用户消息/缩进/竖线 | `ZED_crates/agent_ui/src/conversation_view/thread_view.rs:6119`、`6506` |
-| 工具卡片/header/输出竖线 | 同上 `:8159`、`9961`、`10179`、`10408`、`10997` |
-| thinking 折叠 | 同上 `:7434` |
-| composer | 同上 `:4333` |
-| 组件库语义 token（radius/spacing/typography/shadow） | `GPC_crates/base/src/theme_tokens.rs` |
-| 组件库主题色面 | `GPC_crates/ui/src/theme/theme_color.rs` |
-| 组件库按钮变体 | `GPC_crates/ui/src/button/button.rs` |
-| gpui 便捷方法像素值（rounded/gap/text） | `ZED_crates/gpui_macros/src/styles.rs`、`ZED_crates/gpui/src/styled.rs` |
-| **消息列宽度/居中/左右留白** | `PIWEB_components/ChatWindow.tsx:72`（`CHAT_COLUMN_PADDING = 16`）、`:702-703` |
-| **用户消息气泡（对齐/宽度/圆角/内距/字号）** | `PIWEB_components/MessageView.tsx:147`（`USER_BUBBLE_MAX_HEIGHT = 300`）、`:365-385` |
-| **pi-web 主题变量（`--user-bg` 等）** | `PIWEB_app/globals.css:22-49`；基础字号 `:109`（html `font-size: 14px`）；正文行高 `:348` |
-| **pi-web 助手消息与模型名** | `PIWEB_components/MessageView.tsx:718-842`（模型名行 `:726-739`、用量 `:803`、时间戳 `:841`） |
-| **pi-web 工具卡与工具输出** | `PIWEB_components/MessageView.tsx:953-1315`（状态配色 `:972-973`、header `:983-1003`、结果区 `:1291-1309`） |
-| **pi-web diff（双栏 / 单栏兜底）** | `PIWEB_components/MessageView.tsx:1065-1263` |
-| **pi-web thinking** | `PIWEB_components/MessageView.tsx:904-945` |
-| **pi-web 处理详情分组与 live tail 例外** | `PIWEB_components/ChatWindow.tsx:195-245, 784-877`（不分组例外 `:806-813`） |
-| **pi-web NoticeShelf（状态色只点不铺的范本）** | `PIWEB_components/ChatWindow.tsx:649-663, 957-1003` |
-| **pi-web minimap（含大纲丢弃规则）** | `PIWEB_components/ChatMinimap.tsx:22-26, 100-121`、`ChatMinimap.module.css` |
-| **pi-web composer** | `PIWEB_components/ChatInput.tsx:1362-1382`（列宽）、`:1868-1931`（输入壳）、`:1985-2010`（发送）、`:1534-1860`（三个弹层） |
-| **pi-web 会话列表 / 文件树 / 顶栏 / 状态栏** | `PIWEB_components/SessionSidebar.tsx`、`FileExplorer.tsx`、`AppShell.tsx`、`ExtensionStatusBar.tsx` |
-| gpui-component 把 rem 钉到 `Theme::font_size` | `GPC_crates/ui/src/root.rs:547`（`window.set_rem_size`） |
-| gpui-component 组件清单（映射依据） | `GPC_crates/ui/src/`：`sidebar/`、`list/`、`tree.rs`、`button/`（含 `toggle.rs`、`dropdown_button.rs`、`button_group.rs`）、`popover.rs`、`hover_card.rs`、`tooltip.rs`、`dialog/`、`notification.rs`、`status_bar.rs`、`tab/`、`progress/`、`spinner.rs`、`badge.rs`、`tag.rs`、`separator.rs`、`description_list.rs`、`clipboard.rs`、`kbd.rs`、`text/`、`highlighter/`；`GPC_crates/base/src/resizable/`、`input/base/state.rs` |
-| 本项目主题初始化/字体 | `crates/ui/src/theme.rs` |
-| 本项目消息/工具/thinking/minimap | `crates/ui/src/chat.rs` |
-| 本项目会话侧栏 | `crates/app/src/session_sidebar.rs` |
-| 本项目 composer/面板 | `crates/app/src/panels.rs` |
-| 本项目窗口/工具栏/dock | `crates/app/src/workspace.rs` |
+**各条款的出处写在该条款正下方的「来源：」行**——那才是复核某个具体数值时该看的地方。
+本节只留两样在别处找不到的东西：**版本钉死表**，和**没有对应条款、但调研时用得上的参考位置**。
 
-> **路径前缀与版本钉死说明**
->
-> | 前缀 | 版本（以 `Cargo.lock` 为准） | 本地路径 |
-> |---|---|---|
-> | `ZED_` | `cc053a4a6fa2fd0e8793201ed9099466af1be0b1` | `~/.cargo/git/checkouts/zed-a70e2ad075855582/cc053a4/` |
-> | `GPC_` | `000114aad412b1a1b26cb65cd0c8ae9467fd396a` | `~/.cargo/git/checkouts/gpui-component-95ce574d8a0da8b8/000114a/` |
-> | `PIWEB_` | `v0.8.9` / `2a6e53710f6409e0cceb3de839a62f8cdf3ca3ca` | `vendor/upstream/pi-web-0.8.9/`（仓库内，`scripts/fetch-pi-web.ps1` 准备，`pins/*.manifest` 全量校验） |
->
-> **本文所有 `ZED_` / `GPC_` 行号以上表 rev 为准。** `~/.cargo/git/checkouts/` 是会被 cargo 回收的本地缓存，路径本身不可依赖——复核时先用 `Cargo.lock` 里的 sha 确认 rev，再定位。三者的 sha 由 `scripts/check-pins.*` 校验（`ZED_`/`GPC_` 校验 `Cargo.lock`，`PIWEB_` 校验目录内容）。
->
-> 以上均为只读调研路径，本规范不复制任何 Zed / gpui-component / pi-web 代码，仅提炼设计语言与实测数值。
->
-> > **勘误**：v2.0 及更早在此写 `ZED_CHECKOUT = .../bc538de/`，与 `Cargo.lock` 实际钉死的 `cc053a4` **不是同一个 revision**。已核对：本文引用到的 `gpui_macros/src/styles.rs` 在两个 rev 下内容与行号一致，故所引数值不受影响；但路径已更正为实际钉死的 rev。
+> v2.3 精简：原表 34 行里有 ~20 行是逐条「来源：」行的按主题重排，删。
+
+### 7.1 路径前缀与版本钉死
+
+| 前缀 | 版本（以 `Cargo.lock` 为准） | 本地路径 |
+|---|---|---|
+| `ZED_` | `cc053a4a6fa2fd0e8793201ed9099466af1be0b1` | `~/.cargo/git/checkouts/zed-a70e2ad075855582/cc053a4/` |
+| `GPC_` | `000114aad412b1a1b26cb65cd0c8ae9467fd396a` | `~/.cargo/git/checkouts/gpui-component-95ce574d8a0da8b8/000114a/` |
+| `PIWEB_` | `v0.8.9` / `2a6e53710f6409e0cceb3de839a62f8cdf3ca3ca` | `vendor/upstream/pi-web-0.8.9/`（仓库内，`scripts/fetch-pi-web.ps1` 准备，`pins/*.manifest` 全量校验） |
+
+**本文所有 `ZED_` / `GPC_` 行号以上表 rev 为准。** `~/.cargo/git/checkouts/` 是会被 cargo 回收的本地缓存，
+路径本身不可依赖——复核时先用 `Cargo.lock` 里的 sha 确认 rev，再定位。
+三者的 sha 由 `scripts/check-pins.*` 校验（`ZED_`/`GPC_` 校验 `Cargo.lock`，`PIWEB_` 校验目录内容）。
+
+以上均为只读调研路径，本规范不复制任何 Zed / gpui-component / pi-web 代码，仅提炼设计语言与实测数值。
+
+### 7.2 无对应条款的参考位置
+
+本表列出的东西**本规范没有为其立条款**，但调研或后续扩展时会用到；列在这里以免被当成遗漏而重新考古。
+
+| 主题 | 文件 | 说明 |
+|---|---|---|
+| 动画时长（50/150/300ms） | `ZED_crates/ui/src/styles/animation.rs` | 本规范**未规定动画**，全文无对应条款 |
+| Zed UI 密度档位 | `ZED_crates/theme/src/ui_density.rs` | 本项目只用默认密度，未做密度切换 |
+| Zed 按钮底层样式 | `ZED_crates/ui/src/components/button/button_like.rs` | § 4.1 的「对应 Zed」列出自此；本项目尺寸一律以 `GPC_` 实测为准 |
+| Zed 工具卡的其余分支 | `ZED_crates/agent_ui/src/conversation_view/thread_view.rs:9961`、`:10179` | § 5.2 只提炼了主结构 |
+| pi-web 助手消息全段（用量 `:803`、时间戳 `:841`） | `PIWEB_components/MessageView.tsx:718-842` | S-20 只提炼了模型名行 `:726-739` |
+| pi-web 工具卡全段 | `PIWEB_components/MessageView.tsx:953-1315` | § 6.1 #1/#2/#5 只摘了其中三处 |
+| pi-web thinking 全段 | `PIWEB_components/MessageView.tsx:904-945` | § 5.4 / § 6.1 #4 只摘了无 chevron 那处 `:910-930` |
+| pi-web 处理详情分组 | `PIWEB_components/ChatWindow.tsx:195-245, 784-877` | § 6.1 #3 与「值得照搬」#2 各摘一处 |
+| pi-web 用户气泡 `max-height: 300` | `PIWEB_components/MessageView.tsx:147` | S-22 列为 9 处嵌套滚动之一，本项目不照搬 |
+| pi-web 全局基础字号 `14px` | `PIWEB_app/globals.css:109` | 本项目**不跟随**这种 rem 整体缩放，理由见 S-12 / S-21 |
+| pi-web 消息列留白常量 | `PIWEB_components/ChatWindow.tsx:72`（`CHAT_COLUMN_PADDING = 16`） | S-13 引用的是其消费点 `:702` |
+| pi-web diff（双栏 / 单栏兜底） | `PIWEB_components/MessageView.tsx:1065-1263` | diff 渲染细则尚未成条款，只在 S-22 里禁了嵌套滚动与 `Table` |
+| pi-web composer 三个弹层 | `PIWEB_components/ChatInput.tsx:1534-1860` | § 5.6 只规定了 `/` 与 `@` 面板的实现路径 |
+| pi-web 会话列表 / 文件树 / 顶栏 / 状态栏 | `PIWEB_components/SessionSidebar.tsx`、`FileExplorer.tsx`、`AppShell.tsx`、`ExtensionStatusBar.tsx` | 外围面板的功能对照基线 |
+| pi-web minimap 大纲丢弃规则 | `PIWEB_components/ChatMinimap.tsx:100-121` | 结论已进 § 6.1「值得照搬」#4 |
+| pi-web NoticeShelf | `PIWEB_components/ChatWindow.tsx:649-663, 957-1003` | 结论已进 § 6.1「值得照搬」#3 |
+| gpui-component 把 rem 钉到 `Theme::font_size` | `GPC_crates/ui/src/root.rs:547` | S-12 的成因 |
+| gpui-component 组件清单（§ 4.8 映射依据） | `GPC_crates/ui/src/`：`sidebar/`、`list/`、`tree.rs`、`button/`、`popover.rs`、`hover_card.rs`、`tooltip.rs`、`dialog/`、`notification.rs`、`status_bar.rs`、`tab/`、`progress/`、`spinner.rs`、`badge.rs`、`tag.rs`、`separator.rs`、`description_list.rs`、`clipboard.rs`、`kbd.rs`、`text/`、`highlighter/`；`GPC_crates/base/src/resizable/`、`input/base/state.rs` | § 4.8 每行已单独标注路径 |
+
+### 7.3 本项目落地位置
+
+| 范围 | 文件 |
+|---|---|
+| 主题初始化 / 字体 / S-15 深色投影 / S-16 文本封装 | `crates/ui/src/theme.rs` |
+| 消息 / 工具卡 / thinking / minimap | `crates/ui/src/chat.rs` |
+| 会话侧栏 | `crates/app/src/session_sidebar.rs` |
+| composer / 面板 | `crates/app/src/panels.rs` |
+| 窗口 / 工具栏 / dock | `crates/app/src/workspace.rs` |
 
 ---
 
 ## 8. 修订记录
 
-### v2.2 —— T3 复验后的用户气泡色勘误
+已拆出至 [`UI设计规范-CHANGELOG.md`](UI设计规范-CHANGELOG.md)。
 
-T3 复验（浅色模式）判定用户气泡「颜色非常不明显」。核对后确认这是 v2.0/v2.1 遗留的**失实前提**，
-与 v2.1 勘误表同类：
-
-| 项 | v2.1 写的 | 实际 |
-|---|---|---|
-| `accent` | 「本项目 accent=蓝」（§ 2.1 多处） | gpui-component 默认主题的 `accent` 是 **shadcn 语义的中性 hover 色**（浅 `neutral-100` / 深 `neutral-800`），`opacity(0.10)` 铺在画布上不可见 |
-
-处置：
-
-- **用户气泡的身份色改走 `cx.theme().blue`**（base.blue：浅 blue-600 `#2563eb` / 深 blue-400 `#60a5fa`，与 pi-web `rgba(59,130,246,…)` 同族，深浅自适应）；透明度维持 0.10 底 / 0.2 边框不变；选中态边框用同源实色 `blue`；
-- `UserBubbleStyle` 增加 `selected_border` 字段，五值全部出自纯函数；§ 5.8 增加「深浅两种模式下边框饱和度 ≥ 0.5」的防回归断言——中性灰的饱和度趋近 0，这样气泡永远不可能再退化成看不见的灰；
-- **其余 `accent` 消费点不动**（列表/minimap 选中 `0.16`、焦点边框）：pi-web 的 `--bg-selected` 同为中性灰，中性 accent 在这些位置方向正确；是否统一换蓝留待后续轮次评估；
-- 同步修订处：§ 2.3 气泡行、§ 5.1 S-14 代码块与勘误注、S-24 表「身份标识」行、§ 5.8 S-14 行。
-
-### v2.1 —— 子代理审核后的勘误与收敛
-
-对 v2.0 做了两轮只读审核（事实核验 + 规范质量），共修 15 类问题。**审核发现 v2.0 存在会直接导致写错代码的失实数值**，故本次以勘误为主。
-
-**失实数值（照抄会写错代码）**
-
-| 项 | v2.0 写的 | 实际 | 出处 |
-|---|---|---|---|
-| 按钮尺寸 | `XSmall`=26 / `Small`=28~30 / `Medium`=32 | **20 / 24 / 32** | `GPC_.../button/button.rs:529-552`（`size_5`/`size_6`/`size_8`） |
-| 可点区域下限 | ≥22px | gpui-component 无 22px 档，改为 **≥24px**（S-23） | 同上 |
-| `radius_lg` | 12px | **`px(8.)`**，12px 是 `radius_tokens().xl` | `GPC_.../theme/mod.rs:460` |
-| `element_hover` / `panel_background` / `editor_background` | 当作本项目 token 使用 | **不存在**（Zed 词汇漏进「本项目落地」列） | `GPC_.../theme/theme_color.rs` 零命中 |
-| `ZED_CHECKOUT` | `bc538de` | **`cc053a4`**（`Cargo.lock` 实际钉死的 rev） | `Cargo.lock:1031` |
-
-**条款冲突（写成绝对句式却被本文件自己破例）**
-
-| 冲突 | 处置 |
-|---|---|
-| S-3「背景最多三级」vs 映射表里的五档背景 | S-3 改为只计**表面层级**，交互态与组件底明确不计入 |
-| S-4 / 红线 3「状态色不铺满」vs S-14 用户气泡用 accent 弱底 | 新增 **S-24**：`accent` 是强调色不是状态色，状态色只指 `success`/`warning`/`danger`/`info` 四色 |
-| S-2「阴影仅用于浮层」vs composer `shadow_sm` | S-2 增加 composer 输入壳这一处豁免并写明理由 |
-| S-17「禁止 `px(n)` 复刻奇值」vs 规范自己要求 7px 缩进、18px 竖线 | 红线 4 改为**明确白名单**（176 / 7 / 18 / 820 / 256 / 32），新增项须改红线 |
-| 红线 17「hover 一律走 `group_hover`」vs T2 ③ 要求 hover 前 `debug_bounds` 为 `None` | 红线 17 增加豁免：需结构断言时用 `hovered_id` state（`.group_hover()` + `.invisible()` 的元素仍占布局、`debug_bounds` 仍返回 `Some`，两者不可兼得） |
-| 红线 8 带 `aria-label` | 删除——web/ARIA 概念，撞立项文档红线 1，且该例外让 § 4.1 的硬性要求失效 |
-| S-12「正文必须 `text_sm`」vs 字号表留了 `text_base` 分支 | 删除该分支 |
-| 13px 等宽字号「为佳」/「`text_sm` 或 `text_xs` 就近取整」 | 定死：**等宽一律 `text_xs`(12px)，工具名/卡片标题一律 `text_sm`(14px)** |
-| minimap 缩进 § 3.2 写 `level*7`、§ 5.5 写 `(level-1)*7` | 数值全文只在 § 5.5 定义一次 |
-| S-16「dim 级统一派生」却在表里留了 0.5 与「0.7 可选」两个逃逸口 | 文本收敛为四档，第 3/4 档强制走 `dim_foreground(cx)` / `disabled_foreground(cx)` |
-| S-7 选中态给的是区间 0.12~0.16 | 定死 **0.16** |
-| 红线 10 只覆盖助手消息 | 改为「除用户消息外**所有**角色一律纯文本流」 |
-| 红线 18 在正文无对应条款 | § 4.6 补层叠顺序条款 |
-
-**新增条款**：S-23（可点区域下限 24px）、S-24（`accent` 是强调色）、**S-25（条款必须有机械可验证的落地形式）**。
-
-**新增章节 § 5.8「条款 → 断言」**——这是本次审核最有价值的产出。审核指出 S-13（消息列 820）、S-14（用户气泡）、S-18（行高）这三条影响面最大的条款**完全无法机械验证**（`debug_bounds` 只给位置与尺寸，断不了颜色、行高、`max_w`），只能靠目视，而目视结论无法阻止回归。§ 5.8 为每条指定了可断言的落地形式（抽纯函数 / 抽常量 / 加 `debug_selector`），并明确列出「只能目视、不许在 T2 里假装覆盖」的条款。
-
-**其余收敛**：S-20 标注「生效轮次 R10 起」并写死 `pi-render` 的接口变更（`Message.model: Option<ModelRef>`），同时强调 R9 内不得据此改动 `pi-render`；渐变遮罩补上实现路径（`linear_gradient` 覆盖层，此前是全文唯一没有落地 API 的视觉条款）；工具卡底色从「四种可能」定为「不铺底」；S-8 补「片段」判定规则；§ 5.5 补 minimap 选中竖条条款（R9 已实现但规范此前无依据）；清理「或 / 可用 / 若保留」等软措辞。
-
-### v2.0 —— 融合 pi-web 0.8.9 设计范本 + gpui-component 组件映射
-
-在 v1.1 基础上，对 pi-web 0.8.9 做了三块系统性调研（视觉基元 / 会话区 / 外围面板），把实测数值与组件映射融进规范。所有数值均取自钉死基线并标注行号，未凭观感发明。
-
-**新增条款**
-
-| 条款 | 内容 | 触发原因 |
-|---|---|---|
-| S-15 | 深色模式面板必须比画布亮，需在 `theme.rs` 覆写 | gpui-component 默认深色主题的层级方向与 pi-web **相反**（默认侧栏与画布同色），吃默认值会丢掉「面板浮起」的观感 |
-| S-16 | 三级文本，dim 级统一派生为 `muted_foreground.opacity(0.7)` | pi-web 的 `--text-dim` 被引用 216 次，gpui-component 只有两级文本 token |
-| S-17 | 从 pi-web 迁移数值时向 gpui 刻度取整，给出 6 个奇值的收敛表 | pi-web 间距是 1–32px 连续整数，奇值占 28% 且不构成设计意图 |
-| S-18 | 行高必须显式给，正文 `relative(1.7)` | 组件库 token 默认行高 1.43，比 pi-web 正文紧；只改字号不改行高仍然偏挤 |
-| S-19 | 4.8 组件映射总表所列场景必须复用 gpui-component | 本次调研的核心产出 |
-| S-20 | **助手消息默认展示模型名** | 验收意见；含 pi-web 精确规格与 R10 实现依赖说明 |
-| S-21 | 12px 是字号下限 | pi-web 大量 11/10/9px，桌面端可读性不足 |
-| S-22 | **禁止在消息流表项内嵌套滚动容器** | 迁移时最集中的一类破坏性差异，基线共 9 处 |
-
-**新增章节**：§ 4.8 组件映射总表（含「明确不用的组件」及理由）、§ 5.7 虚拟化 list 的硬约束、§ 6.1 明确不照搬 pi-web 的部分（14 条）+ 值得照搬的 4 条。
-
-**红线**从 12 条扩到 18 条。
-
-**一处 v1.1 遗留问题被本次调研纠正**：v1.0 从 Zed 抄来的「thinking 展开区 `max_h` + 内部滚动」，v1.1 曾作为「暂不实现的偏离」记录。调研查明这不是单点取舍，而是**整类做法都不能照搬**（基线 9 处同类容器），故升格为 S-22 禁令，并给出「截断 + 展开」的统一替代模式——保留 `max_h` 与渐变遮罩的视觉，只把内部滚动换成展开按钮。
-
-**基线分工确立**：消息流内部（列宽、用户消息形态、正文字号与行高）以 pi-web 为准；层级、状态表达、卡片结构、控件分级仍以 Zed 为准。§ 6.1 明确记录了不跟随基线的 14 处及理由，后续轮次不得以「pi-web 就是这么做的」为由改回。
-
-### v1.1 —— R9 T3 人工目视验收后修订
-
-验收方以同一会话对比 pi-web 与 GPUI-Pi 的主会话区，提出三条：① 用户 query 应为不同颜色的气泡且不左右顶格；② 主区需要左右留白；③ 整体字体比例偏大、阅读不适。核对后的处置：
-
-| # | 验收意见 | 与 v1.0 的关系 | 处置 |
-|---|---|---|---|
-| ① | 用户消息气泡化、不顶格 | **直接冲突**：v1.0 § 5.1 要求「底色与画布同源、不铺 accent」，§ 6 红线 10 禁止消息上底色 | 改写 § 5.1 为 **S-14 右对齐弱色气泡**；红线 10 相应放开且限定形态；§ 2.3、§ 3.2、§ 3.3 同步 |
-| ② | 主区左右留白 | **规范缺失**：v1.0 全文没有消息列宽度条款 | 新增 **S-13 消息列**（`max_w` 820 + 居中 + `px_4`）与红线 11 |
-| ③ | 字体比例偏大 | **不冲突**：v1.0 § 3.4 已要求消息正文 `text_sm`，是实现漏了没显式声明 | 新增 **S-12**，写明 rem 默认 16px 的陷阱与「不得改 rem 整体缩字」的理由；新增红线 12 |
-
-同时确立基线分工：**消息流内部以 pi-web 0.8.9 为准，其余仍以 Zed 为准**（见文首「来源基线」）。v1.0 的其余条款（层级、状态表达、卡片结构、控件分级、侧栏与 composer）全部保持不变。
-
-未采纳 pi-web 的部分，理由记录在此以免后续反复：
-
-- **不跟随 pi-web 的 html `font-size: 14px` 全局缩放**——本项目的间距与圆角刻度是 rem 派生的（§ 3.1 / § 3.3），改 rem 会让整套刻度失真，改为逐处显式声明字号（S-12）。
-- **不跟随用户气泡的 `max-height: 300px` + 内部滚动**——消息位于虚拟化 `list` 表项内，嵌套滚动容器会干扰 tail-follow 的高度测量；该项与 § 5.4 thinking 的 `max_h` 同属一类待评估项，留待后续轮次统一处理。
+本文件只承载**生效条款**；「某个值为什么变成现在这样」「v2.0 当初写错了什么」一律去 CHANGELOG 查。
+勘误内容不再回流正文——v2.1 与 v2.2 的勘误各有 1~4 处副本没改到（见 CHANGELOG v2.3 条目），
+根因就是勘误与条款混排时，改一处容易漏其余。

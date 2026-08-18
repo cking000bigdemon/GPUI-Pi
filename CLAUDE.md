@@ -11,11 +11,11 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 ## 六条红线
 
 1. **不引入 web 技术栈** —— 不加 WebView（含 `gpui-wry`）、不嵌 HTML 页面。Mermaid 按立项文档 § 一 直出源码。
-2. **不动上游钉版本** —— `Cargo.lock`、`PINNED_PI_VERSION` 与 `vendor/upstream/pi-0.84.2/`（`.gpui-pi-source-pin` marker + `pins/pi-0.84.2.manifest` 全量基线）是钉死点，`cargo update` 或源码身份漂移会被 `scripts/check-pins.*` 判红。要改版本先改立项文档 § 二。
+2. **不动上游钉版本** —— `Cargo.lock`、`PINNED_PI_VERSION` 与 `vendor/upstream/` 下两份上游源码是钉死点，版本号与 commit 身份以「上游源码在哪」一表为准；`cargo update` 或源码身份漂移会被 `scripts/check-pins.ps1` 判红（`.sh` 版是历史遗留，不作为判红依据）。要改版本先改立项文档 § 二。
 3. **不跨轮次改动** —— 发现前面轮次的问题写进 `rounds/BACKLOG.md`，不当场顺手改。
-4. **不放宽验收** —— 连续 2 次 validation 不过，写 `rounds/round-NN/BLOCKED.md` 停下呼人，禁止改标准让自己通过。
-5. **不写 `~/.pi` 的破坏性操作** —— 数据目录与终端 pi、pi-web-desktop 共享。能只读就只读，必须写走「临时文件 + rename」。
-6. **不把共享目录链接进 worktree** —— 从创建 worktree 起，禁止在其中建立任何指向主 checkout、其他 worktree 或外部共享目录的 Junction、目录 symlink 或其他 reparse point，尤其禁止链接 `vendor/`、`target/`、`.venv/`、`.pi/`。每个 worktree 的本地目录必须独立准备；上游参考源码走该 worktree 自己的 fetch 脚本，临时只读参考可直接读外部绝对路径，但不得挂载进 worktree。执行 `git worktree remove` 前必须检查 reparse point；发现任何目录链接就立即停止并呼人，禁止假设删除 worktree 只会删除链接本身——Git for Windows 可能沿 Junction 递归删除共享目标内容。
+4. **不放宽验收** —— 同一验收项经针对性整改后连续 2 次 validation 仍不过，写 `rounds/round-NN/BLOCKED.md` 停下呼人，禁止改标准让自己通过；日常迭代中的其他失败按流程图「不过就改，重跑」处理，不触发此条。
+5. **不写 `~/.pi` 的破坏性操作** —— 指用户主目录下的 pi 数据目录（与仓库根 gitignored 的 `.pi/` 日志目录同名异物，勿混淆），它与终端 pi、pi-web-desktop 共享。能只读就只读，必须写走「临时文件 + rename」。
+6. **不把共享目录链接进 worktree** —— 从创建 worktree 起，禁止在其中建立任何指向主 checkout、其他 worktree 或外部共享目录的 Junction、目录 symlink 或其他 reparse point，尤其禁止链接 `vendor/`、`target/`、`.venv/`、仓库 `.pi/` 与用户数据目录 `~/.pi`。执行 `git worktree remove` 前必须检查 reparse point；发现任何目录链接就立即停止并呼人，禁止假设删除 worktree 只会删除链接本身——Git for Windows 可能沿 Junction 递归删除共享目标内容。目录如何独立准备见「新 round 启动门禁」。
 
 ## 新 round 启动门禁
 
@@ -28,7 +28,7 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 .\scripts\check-pins.ps1
 ```
 
-开始实现前必须同时确认 `vendor/pi/pi.exe`、`vendor/upstream/pi-0.84.2/`、`vendor/upstream/pi-web-0.8.9/` 均存在，且 `check-pins` 全绿。任何一项缺失或准备失败都立即停止并呼人；禁止先寻找替代源码路径、边开发边补、读取主 checkout 的 `vendor` 顶替，或创建共享目录链接。这样每轮从第一分钟起就有完整运行时和钉死对照源码，不再把实现时间浪费在寻找缺失的 `vendor`。
+开始实现前必须同时确认 `vendor/pi/pi.exe`、`vendor/upstream/pi-0.84.2/`、`vendor/upstream/pi-web-0.8.9/` 均存在，且 `check-pins` 全绿。每个 worktree 的本地目录必须独立准备，上游参考源码走本 worktree 自己的 fetch 脚本。任何一项缺失或准备失败都立即停止并呼人；禁止先寻找替代源码路径、边开发边补、创建共享目录链接（红线 6），或读取主 checkout / 其他 worktree 的 `vendor/` 顶替。临时只读参考可以直接读外部绝对路径，但不得挂载进 worktree，且这一口径只适用于 `vendor/` 之外的资源（如 gpui-component clone）——上游对照在门禁通过前后都只走本 worktree 自己的 `vendor/`。这样每轮从第一分钟起就有完整运行时和钉死对照源码，不再把实现时间浪费在寻找缺失的 `vendor`。
 
 ## 每轮怎么跑
 
@@ -37,7 +37,9 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
                   ↓ 全绿
 读 rounds/round-NN/round-NN.md  →  实现  →  跑 validate  →  不过就改，重跑
                                                  ↓ 全绿
-                              commit + 更新 ROUNDS.md + 回填任务卡「本轮实测」
+        代码审查（按「代码审查工具路由」）→ 涉及 UI 则视觉审查，须 PASS
+                                                 ↓ 审查门禁通过
+                    commit + 更新仓库根 ROUNDS.md + 回填任务卡「本轮实测」
 ```
 
 ```powershell
@@ -49,10 +51,10 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 
 ## 轮次目录
 
-- `rounds/` 根目录只放全局文件：`README.md`、`TEMPLATE.md`、`BACKLOG.md`；
+- `rounds/` 根目录只放全局文件：`README.md`、`TEMPLATE.md`、`BACKLOG.md`；轮次总览 `ROUNDS.md` 在仓库根目录而非 `rounds/` 下，每轮收口时更新；
 - 每轮建立独立目录 `rounds/round-NN/`，任务卡固定为 `rounds/round-NN/round-NN.md`；
 - 属于该轮的管理产出（实测记录、阻塞报告、复盘、可提交的验收附件说明等）全部放在该目录下；阻塞报告固定命名为 `BLOCKED.md`；
-- 源码、脚本、fixture、构建产物仍放各自的标准目录，不为了“归档”复制进 `rounds/`；本地大日志与截图继续放 gitignored 的 `.pi/`，在任务卡中记录结论或引用路径；
+- 源码、脚本、fixture、构建产物仍放各自的标准目录，不为了“归档”复制进 `rounds/`；本地大日志与截图继续放仓库根 gitignored 的 `.pi/`（与红线 5 的用户数据目录 `~/.pi` 无关），在任务卡中记录结论或引用路径；
 - 新增或引用轮次文件时禁止恢复 `rounds/round-NN.md`、`rounds/BLOCKED-NN.md` 这类扁平路径。
 
 ## 代码审查工具路由
@@ -71,6 +73,16 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 - **DSV4 Pro 的 reviewer 任务必须从第一个字符开始用简体中文**，并在任务首部明确写“严禁英文前导语，调用工具前只能写中文”。它有时会先输出 `I'll review` / `Let me`，触发桌面端 `language-guard` 中断；此时工具层常只显示误导性的 `Operation aborted`；
 - DSV4 Pro 出现 `Operation aborted` 时，先查子代理 transcript 是否含 `[language-guard-restart]`。若存在，这是语言守卫中断，**不算模型/provider 启动失败，不得直接 fallback**；应保留 `deepseek/deepseek-v4-pro`，补强中文首字符约束后以 `context: fresh`、显式目标 `cwd` 重新运行，直到拿到完整审查结论；只有 transcript 无该标记且明确显示模型未登记、鉴权/限流或启动错误时，才按上一条 fallback；
 - 模型优先级不改变审查隔离要求：审查默认 `context: fresh`、只读、不与 writer 共用写权限。
+
+## 视觉还原度审查
+
+- 项目专用视觉 reviewer 为 `.agents/visual-reviewer.md`（运行时名称 `visual-reviewer`）。它是**能力层只读** agent，只允许 `read` / `grep` / `find` / `ls`，禁止 `bash`、`edit`、`write`、子代理和任何文件修改；不得用通用代码 reviewer 替代视觉 reviewer。
+- **触发条件**：本轮 diff 只要触及 `crates/ui/**`，或触及 `crates/app/**` 中的视图/组件/布局/样式渲染代码、Theme token、图标及其他视觉资源，就视为涉及 UI 层；即使改动位于其他路径，只要会改变用户可见的 UI 表现，也必须触发视觉 review。不得仅凭“没有改 `crates/ui`”而跳过。
+- 视觉 review 是代码 review 之后的独立门禁：普通代码 review 的阻断 findings 已关闭、主会话判定代码 review 通过后，才运行 `visual-reviewer`；视觉 review 不能替代代码 review，也不得提前与尚未稳定的实现并行给出终审结论。
+- 发起视觉 review 前，主会话或当前 writer 必须准备可比较证据：当前实现截图、目标截图/设计稿或明确规范基线、对应窗口尺寸与缩放、主题、交互状态、当前 diff、任务卡，以及 `docs/UI设计规范.md`。基线冲突时以规范文档为最高判据：目标截图/设计稿只是当轮还原目标，与规范不一致时先按「UI 设计规范」一节走规范修订，不得直接按设计稿判过。截图比较必须使用支持图片输入的模型。缺少当前截图、缺少明确视觉基线，或没有支持图片输入的模型可用时，结论只能是 `INSUFFICIENT_EVIDENCE`，不得标记视觉通过。
+- 视觉 reviewer 只判断还原度与规范符合度：几何与面板比例、对齐、间距、字体层级、颜色/对比度、组件形态、信息密度、状态表现、溢出/裁切/滚动，以及不同窗口尺寸下的稳定性。它不得把个人审美当作目标，不得扩展产品范围或审查业务逻辑。
+- 主会话负责接受或驳回视觉 findings；需要修复时保持视觉 review 前已经形成的 writer 归属。**视觉 review 之后产生的修复增量只允许修改 UI 表现代码**：限 `crates/ui/**`、`crates/app/**` 中纯视图/布局/样式渲染片段，以及直接对应的 UI 测试、视觉 fixture 和视觉资源；禁止修改 `crates/pi-rpc/**`、`crates/pi-data/**`、`crates/pi-render/**`，也禁止改 RPC、进程/会话控制、状态机、数据模型、持久化、协议及其他业务逻辑。
+- 若某条视觉 finding 必须依赖业务代码才能解决，立即停止该项视觉修复，将其标记为“非 UI 依赖”，另行进入普通开发与代码 review 流程；禁止借视觉修复顺手改业务代码。视觉修复完成后，先确认相对视觉 review 基线的增量没有越界，再对该 UI 增量完成必要代码复核并重新运行 `visual-reviewer`；最终视觉结论必须为 `PASS` 才能进入用户视觉验收或本轮收口。
 
 ## 平台归属
 
@@ -103,7 +115,7 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 | home 目录 | 走 `dirs` crate，别自己读 `HOME`（Windows 上是 `USERPROFILE`） |
 | 子进程终止 | 统一走 `pi_rpc` 的封装：Windows `taskkill /T /PID`，其余 `kill(-pgid)`。只杀父进程会留僵尸 |
 | 文件替换 | Windows 上被打开的文件不能删/改名 —— 写临时文件 + rename，rename 前确认句柄已关 |
-| 颜色/字体 | 颜色一律走 gpui-component 的 `Theme` 变量，禁止硬编码；字体族按平台条件编译（Windows 微软雅黑/Segoe UI，其余 Noto Sans CJK SC） |
+| 颜色/字体 | 一律走 `cx.theme()` token（gpui-component `Theme`），组件内禁止硬编码颜色值和字体名；字体族按平台条件编译，唯一注入点是 `crates/ui/src/theme.rs` 的 theme 初始化，改字体只改那里 |
 | 注释 | 中文。写**为什么**，不复述代码在做什么 |
 | clippy | `-D warnings`，不许 `#[allow]` 糊过去；确有必要时必须写明理由 |
 | PowerShell 脚本 | 改完**必须验证**，不许"照 sh 版翻译完就提交"（R0 因此红过一次 CI）：能跑的直接跑，跑不了的至少过一遍语法解析（`[Parser]::ParseFile`） |
@@ -127,10 +139,10 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 | 用途 | 位置 |
 |---|---|
 | 功能对照基线 pi-web 0.8.9 | 固定 `vendor/upstream/pi-web-0.8.9/`；运行 `.\\scripts\\fetch-pi-web.ps1` 准备，身份钉 `v0.8.9` / `2a6e53710f6409e0cceb3de839a62f8cdf3ca3ca`（`pins/pi-web-0.8.9.manifest` 全量校验） |
-| pi 0.84.2 源码（协议、trust 等实现权威参考） | 固定使用 `vendor/upstream/pi-0.84.2/`；运行 `.\\scripts\\fetch-pi-source.ps1` 准备，身份钉 `v0.84.2` / `914cf1472e715297caa30db4b9535d534a9eb718`；禁止引用会自动更新的 Pi Agent 安装目录 |
+| pi 0.84.2 源码（协议、trust 等实现权威参考） | 固定使用 `vendor/upstream/pi-0.84.2/`；运行 `.\\scripts\\fetch-pi-source.ps1` 准备，身份钉 `v0.84.2` / `914cf1472e715297caa30db4b9535d534a9eb718`（`.gpui-pi-source-pin` marker + `pins/pi-0.84.2.manifest` 全量校验）；禁止引用会自动更新的 Pi Agent 安装目录 |
 | RPC 协议权威文档 | `vendor/upstream/pi-0.84.2/packages/coding-agent/docs/rpc.md`，或 pi 发布包内 `vendor/pi/docs/rpc.md` |
 | 会话文件格式 | `vendor/upstream/pi-0.84.2/packages/coding-agent/docs/session-format.md`，或 pi 发布包内 `vendor/pi/docs/session-format.md` |
-| 组件库用法 | `git clone --depth 1 https://github.com/longbridge/gpui-component`，看 `crates/story/src/stories/` |
+| 组件库用法 | `git clone https://github.com/longbridge/gpui-component` 后 checkout 到 `Cargo.lock` 中 `gpui-component` 钉定的 rev（以 lock 文件为准），看 `crates/story/src/stories/`；禁止按 main HEAD 参考 |
 
 ## 协作
 
