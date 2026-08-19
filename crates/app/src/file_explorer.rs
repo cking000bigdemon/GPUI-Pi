@@ -754,7 +754,14 @@ impl Render for FileExplorerPanel {
                     .gap_1()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(div().flex_1().min_w_0().font_semibold().child("项目文件"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_lg()
+                            .font_semibold()
+                            .child("项目文件"),
+                    )
                     .child(
                         Button::new("upload-project-files")
                             .debug_selector(|| "upload-project-files".into())
