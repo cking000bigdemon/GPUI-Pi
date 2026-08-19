@@ -30,6 +30,8 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 
 开始实现前必须同时确认 `vendor/pi/pi.exe`、`vendor/upstream/pi-0.84.2/`、`vendor/upstream/pi-web-0.8.9/` 均存在，且 `check-pins` 全绿。每个 worktree 的本地目录必须独立准备，上游参考源码走本 worktree 自己的 fetch 脚本。任何一项缺失或准备失败都立即停止并呼人；禁止先寻找替代源码路径、边开发边补、创建共享目录链接（红线 6），或读取主 checkout / 其他 worktree 的 `vendor/` 顶替。临时只读参考可以直接读外部绝对路径，但不得挂载进 worktree，且这一口径只适用于 `vendor/` 之外的资源（如 gpui-component clone）——上游对照在门禁通过前后都只走本 worktree 自己的 `vendor/`。这样每轮从第一分钟起就有完整运行时和钉死对照源码，不再把实现时间浪费在寻找缺失的 `vendor`。
 
+本机缓存：fetch 脚本默认走 `D:\tmp\gpui-pi-cache`（环境变量 `GPUI_PI_CACHE` 可改路径，设 `OFF` 禁用；CI 已禁用）——缓存命中时只做本地校验与拷贝，不联网；缓存缺失或校验失败才联网拉取，并在缓存目录内覆盖更新。缓存目录位于仓库之外，`vendor` 里始终是每 worktree 独立的真实拷贝，不创建任何链接（红线 6 不受影响）。
+
 ## 每轮怎么跑
 
 ```

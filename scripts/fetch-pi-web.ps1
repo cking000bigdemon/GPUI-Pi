@@ -2,6 +2,9 @@
 # Same flow as fetch-pi-source.ps1: verify remote tag -> commit via the GitHub API
 # (annotated tags need a two-level lookup), verify archive SHA256, extract into a
 # same-volume temp dir, write the pin marker, full manifest comparison, then publish.
+#
+# 本机缓存：默认 D:\tmp\gpui-pi-cache，可用 GPUI_PI_CACHE 覆盖路径、设 OFF 禁用（CI 已禁用）。
+# 命中缓存时只做本地校验 + 拷贝，不联网；缓存缺失/损坏才联网拉取并在缓存目录内覆盖更新。
 $ErrorActionPreference = "Stop"
 
 $PiWebVersion = "0.8.9"
@@ -13,21 +16,11 @@ $Root         = Split-Path -Parent $PSScriptRoot
 $Dest         = Join-Path $Root "vendor\upstream\pi-web-$PiWebVersion"
 $SourceUrl    = "https://codeload.github.com/$Repo/tar.gz/refs/tags/$PiWebTag"
 $Check        = Join-Path $Root "scripts\check-pi-web-pin.ps1"
+. (Join-Path $Root "scripts\pi-cache-utils.ps1")
 
-if (Test-Path -LiteralPath $Dest -PathType Container) {
-    & $Check -Dir $Dest
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "OK  vendor\upstream\pi-web-$PiWebVersion already exists and matches baseline ($PiWebTag @ $PiWebCommit)"
-        exit 0
-    }
-    Write-Error "Stable reference directory failed verification; delete it first to re-fetch: $Dest"
-    exit 1
-}
-
-$TmpRoot = Join-Path (Split-Path -Parent $Dest) (".fetch-tmp-" + [guid]::NewGuid())
-New-Item -ItemType Directory -Path $TmpRoot | Out-Null
-
-try {
+# 下载 + 校验 + 解压 + 写 marker + 全量比对，全部就绪才返回内容根目录（位于 $TmpRoot 下）。
+$Download = {
+    param([string]$TmpRoot)
     $Archive = Join-Path $TmpRoot "pi-web.tar.gz"
     $Extract = Join-Path $TmpRoot "extract"
     New-Item -ItemType Directory -Path $Extract | Out-Null
@@ -82,13 +75,50 @@ try {
         "source=$SourceUrl"
     ) | Set-Content -LiteralPath (Join-Path $SourceRoot ".gpui-pi-web-source-pin") -Encoding ascii
 
-    Write-Host "==> Full verification against baseline manifest before publish"
+    Write-Host "==> Full verification against baseline manifest"
     & $Check -Dir $SourceRoot
     if ($LASTEXITCODE -ne 0) { throw "Pinned reference verification failed" }
 
-    Write-Host "==> Publish to stable directory"
-    Move-Item -LiteralPath $SourceRoot -Destination $Dest
+    return $SourceRoot
+}
 
+# 1) vendor 快路径：已存在且与基线逐字节一致，直接收工（不联网、不碰缓存）。
+if (Test-Path -LiteralPath $Dest -PathType Container) {
+    & $Check -Dir $Dest
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "OK  vendor\upstream\pi-web-$PiWebVersion already exists and matches baseline ($PiWebTag @ $PiWebCommit)"
+        exit 0
+    }
+    Write-Warning "vendor\upstream\pi-web-$PiWebVersion failed verification; will re-publish from cache or network"
+}
+
+# 把已校验的源树拷贝成 vendor 目录并复验。vendor 内是真实拷贝，不建任何链接。
+function Publish-PiWebToVendor([string]$Source) {
+    Write-Host "==> Publish to vendor\upstream\pi-web-$PiWebVersion"
+    if (Test-Path -LiteralPath $Dest) { Remove-Item -LiteralPath $Dest -Recurse -Force }
+    Copy-Item -LiteralPath $Source -Destination $Dest -Recurse
+    & $Check -Dir $Dest
+    if ($LASTEXITCODE -ne 0) { throw "published vendor tree failed verification: $Dest" }
+}
+
+# 2) 缓存路径：命中则本机拷贝；缺失/损坏则联网刷新缓存（在缓存目录内覆盖）。
+$CacheRoot = Get-PiCacheRoot
+if ($CacheRoot) {
+    $CacheItem = Ensure-PiCacheItem -CacheRoot $CacheRoot -Name "pi-web-$PiWebVersion" `
+        -CheckScript $Check -Download $Download
+    Write-Host "==> cache hit; publishing from $CacheItem"
+    Publish-PiWebToVendor -Source $CacheItem
+    Write-Host "OK  vendor\upstream\pi-web-$PiWebVersion ($PiWebTag @ $PiWebCommit)"
+    exit 0
+}
+
+# 3) 兜底（缓存不可用）：维持原直连流程 —— 临时目录建在目标父目录下、同卷，
+#    发布走同一个「拷贝 + 复验」函数。
+$TmpRoot = Join-Path (Split-Path -Parent $Dest) (".fetch-tmp-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $TmpRoot | Out-Null
+try {
+    $Verified = & $Download $TmpRoot
+    Publish-PiWebToVendor -Source $Verified
     Write-Host "OK  vendor\upstream\pi-web-$PiWebVersion ($PiWebTag @ $PiWebCommit)"
 }
 finally {

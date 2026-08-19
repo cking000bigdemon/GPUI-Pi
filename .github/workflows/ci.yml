@@ -14,6 +14,9 @@ jobs:
   windows:
     name: windows (阻断)
     runs-on: windows-latest
+    env:
+      # 缓存只对本机反复跑门禁有意义；CI runner 每次都是全新机器，直接联网拉取。
+      GPUI_PI_CACHE: OFF
     steps:
       - uses: actions/checkout@v4
       - name: 工具链（由 rust-toolchain.toml 决定版本）
