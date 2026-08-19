@@ -1,0 +1,2 @@
+// GPUI Windows 后端固定从资源 ID 1 加载窗口图标。
+1 ICON "app-icon.ico"
