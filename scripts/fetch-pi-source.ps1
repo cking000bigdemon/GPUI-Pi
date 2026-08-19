@@ -1,10 +1,10 @@
 ﻿# Fetch the pinned pi source into a stable directory outside auto-updated desktop app files.
 # This source tree is read-only reference material; fetch-pi.ps1 still provides the runtime binary.
 #
-# Publish flow: download the codeload tag archive -> verify archive SHA256 -> extract into a
-# temp dir under vendor\upstream (same volume as the target, so the final move is an atomic
-# rename) -> write the pin marker -> full manifest comparison via check-pi-source-pin.ps1
-# -> publish only after everything matches.
+# 本机缓存：默认 D:\tmp\gpui-pi-cache，可用 GPUI_PI_CACHE 覆盖路径、设 OFF 禁用（CI 已禁用）。
+# 命中缓存时只做本地校验 + 拷贝，不联网；缓存缺失/损坏才联网拉取并在缓存目录内覆盖更新。
+# 发布流程：下载 codeload tag 归档 -> 校验归档 SHA256 -> 解压 -> 写 pin marker ->
+# 全量 manifest 比对（check-pi-source-pin.ps1）-> 发布。缓存与 vendor 都只收已校验内容。
 $ErrorActionPreference = "Stop"
 
 $PiVersion = "0.84.2"
@@ -16,24 +16,11 @@ $Root      = Split-Path -Parent $PSScriptRoot
 $Dest      = Join-Path $Root "vendor\upstream\pi-$PiVersion"
 $SourceUrl = "https://codeload.github.com/$Repo/tar.gz/refs/tags/$PiTag"
 $Check     = Join-Path $Root "scripts\check-pi-source-pin.ps1"
+. (Join-Path $Root "scripts\pi-cache-utils.ps1")
 
-if (Test-Path -LiteralPath $Dest -PathType Container) {
-    & $Check -Dir $Dest
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "OK  vendor\upstream\pi-$PiVersion already exists and matches baseline ($PiTag @ $PiCommit)"
-        exit 0
-    }
-    Write-Error "Stable source directory failed verification; delete it first to re-fetch: $Dest"
-    exit 1
-}
-
-# Temp dir lives under the target parent so the final move stays on one volume.
-# The system temp dir (usually C:) and the repo drive (D:) may differ; a cross-volume
-# move degrades to copy+delete and can leave a half-published tree on interruption.
-$TmpRoot = Join-Path (Split-Path -Parent $Dest) (".fetch-tmp-" + [guid]::NewGuid())
-New-Item -ItemType Directory -Path $TmpRoot | Out-Null
-
-try {
+# 下载 + 校验 + 解压 + 写 marker + 全量比对，全部就绪才返回内容根目录（位于 $TmpRoot 下）。
+$Download = {
+    param([string]$TmpRoot)
     $Archive = Join-Path $TmpRoot "pi-source.tar.gz"
     $Extract = Join-Path $TmpRoot "extract"
     New-Item -ItemType Directory -Path $Extract | Out-Null
@@ -84,13 +71,50 @@ try {
         "source=$SourceUrl"
     ) | Set-Content -LiteralPath (Join-Path $SourceRoot ".gpui-pi-source-pin") -Encoding ascii
 
-    Write-Host "==> Full verification against baseline manifest before publish"
+    Write-Host "==> Full verification against baseline manifest"
     & $Check -Dir $SourceRoot
     if ($LASTEXITCODE -ne 0) { throw "Pinned source verification failed" }
 
-    Write-Host "==> Publish to stable directory"
-    Move-Item -LiteralPath $SourceRoot -Destination $Dest
+    return $SourceRoot
+}
 
+# 1) vendor 快路径：已存在且与基线逐字节一致，直接收工（不联网、不碰缓存）。
+if (Test-Path -LiteralPath $Dest -PathType Container) {
+    & $Check -Dir $Dest
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "OK  vendor\upstream\pi-$PiVersion already exists and matches baseline ($PiTag @ $PiCommit)"
+        exit 0
+    }
+    Write-Warning "vendor\upstream\pi-$PiVersion failed verification; will re-publish from cache or network"
+}
+
+# 把已校验的源树拷贝成 vendor 目录并复验。vendor 内是真实拷贝，不建任何链接。
+function Publish-PiSourceToVendor([string]$Source) {
+    Write-Host "==> Publish to vendor\upstream\pi-$PiVersion"
+    if (Test-Path -LiteralPath $Dest) { Remove-Item -LiteralPath $Dest -Recurse -Force }
+    Copy-Item -LiteralPath $Source -Destination $Dest -Recurse
+    & $Check -Dir $Dest
+    if ($LASTEXITCODE -ne 0) { throw "published vendor tree failed verification: $Dest" }
+}
+
+# 2) 缓存路径：命中则本机拷贝；缺失/损坏则联网刷新缓存（在缓存目录内覆盖）。
+$CacheRoot = Get-PiCacheRoot
+if ($CacheRoot) {
+    $CacheItem = Ensure-PiCacheItem -CacheRoot $CacheRoot -Name "pi-source-$PiVersion" `
+        -CheckScript $Check -Download $Download
+    Write-Host "==> cache hit; publishing from $CacheItem"
+    Publish-PiSourceToVendor -Source $CacheItem
+    Write-Host "OK  vendor\upstream\pi-$PiVersion ($PiTag @ $PiCommit)"
+    exit 0
+}
+
+# 3) 兜底（缓存不可用）：维持原直连流程 —— 临时目录建在目标父目录下、同卷，
+#    发布走同一个「拷贝 + 复验」函数。
+$TmpRoot = Join-Path (Split-Path -Parent $Dest) (".fetch-tmp-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $TmpRoot | Out-Null
+try {
+    $Verified = & $Download $TmpRoot
+    Publish-PiSourceToVendor -Source $Verified
     Write-Host "OK  vendor\upstream\pi-$PiVersion ($PiTag @ $PiCommit)"
 }
 finally {
