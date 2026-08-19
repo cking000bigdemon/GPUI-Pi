@@ -1,6 +1,6 @@
 # Round 19 — Windows 应用图标
 
-> 执行方：**Windows** · 状态：进行中（本地验收完成，等待 PR）
+> 执行方：**Windows** · 状态：进行中（PR [#21](https://github.com/cking000bigdemon/GPUI-Pi/pull/21) 待审）
 
 ## 目标
 
@@ -61,3 +61,4 @@
 - 用户在实际 release 客户端审核后明确回复“通过”，并在 10 分钟窗口内回传任务栏与 Alt+Tab 两张完整截图。
 - 独立代码审查使用 `claude-code-review` 两轮完成：首轮 2 项 medium 已关闭；复审无 correctness / security 阻断项，仅余 MSVC-only 范围外及错误信息可读性的 low 建议。
 - 图标由用户提供的原始 PNG 在本地用高质量缩放生成多尺寸 PNG-compressed ICO；未将 2.5 MiB 原始图片复制进仓库，来源文件名与 SHA-256 已在本任务卡留档。
+- 提交 `2c83a35` 已推送至 `origin/WinClaude/round-19`，PR [#21](https://github.com/cking000bigdemon/GPUI-Pi/pull/21) 已创建；PR 描述包含最终 validation 实际回显摘要、测试数字、代码审查与截图视觉审查结论。
