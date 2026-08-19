@@ -1,6 +1,6 @@
 # Round 11 — 文件浏览器、文件查看器与上传
 
-> 执行方：**Windows** · 状态：本地验收完成，待 PR / CI
+> 执行方：**Windows** · 状态：已完成（PR #18，GitHub CI 全绿）
 
 ## 目标
 
@@ -60,6 +60,7 @@
 
 - 新 worktree 启动门禁：`fetch-pi.ps1`、`fetch-pi-source.ps1`、`fetch-pi-web.ps1` 与 `check-pins.ps1` 全绿；钉死的 pi `0.84.2`、pi-web `0.8.9`、gpui / gpui-component 身份均未漂移。
 - 最终完整验收：`./scripts/validate.ps1` 于 2026-08-19 通过，退出码 `0`；实际覆盖 pins、`cargo fmt --check`、workspace clippy `-D warnings`、workspace tests、`cargo build --release`。
+- GitHub：PR [#18](https://github.com/cking000bigdemon/GPUI-Pi/pull/18) 的唯一阻断 job `windows (阻断)` 于 2026-08-19 全绿（run `32206009824`，用时约 7m30s）。
 - 最终测试数字：app `47 passed / 1 ignored`，UI `19 passed`，pi-data unit `38 passed`，pi-data integration `13 passed`，pi-render `30 passed`，pi-rpc `20 passed`；5 个真实 pi / 付费模型测试按显式环境门禁保持 ignored。
 - 安全实测：Windows junction 逃逸稳定被拒；上传覆盖走同目录临时文件 + `MoveFileExW` 原子发布并确认无 `.tmp` 残留；预检后目标被抢占会重新拒绝；根与上传双 generation 均拒绝陈旧异步结果。
 - 图片安全预算：编码体积 `10 MiB`、单边 `16384`、总解码像素 `4000 万`、GIF `200` 帧；SVG / HTML / PDF / DOCX 不执行、不渲染，明确降级为不支持预览。
