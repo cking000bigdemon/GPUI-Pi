@@ -12,6 +12,8 @@ use gpui_component::{
 };
 use gpui_pi_ui::{AppShell, WorkspaceTabBar, theme};
 
+use crate::file_explorer::FileExplorerPanel;
+use crate::main_panel::MainPanel;
 use crate::panels::ChatPanel;
 #[cfg(test)]
 use crate::panels::LayoutProbe;
@@ -21,9 +23,12 @@ use crate::trust_prompt::prompt_project_trust;
 const MAIN_DOCK_ID: &str = "gpui-pi-main-dock";
 const MAIN_DOCK_VERSION: usize = 1;
 pub(crate) const SIDEBAR_WIDTH: f32 = 280.;
+pub(crate) const FILES_WIDTH: f32 = 320.;
 
 pub struct Workspace {
     dock_area: gpui::Entity<DockArea>,
+    file_explorer: gpui::Entity<FileExplorerPanel>,
+    main_panel: gpui::Entity<MainPanel>,
     selected_directory: Option<PathBuf>,
     selected_session: Option<SessionSelected>,
     _appearance_subscription: Subscription,
@@ -65,7 +70,7 @@ impl Workspace {
             }
             panel
         });
-        let workspace = cx.new(|cx| {
+        let chat = cx.new(|cx| {
             let panel = ChatPanel::new(window, cx);
             #[cfg(test)]
             if let Some(probe) = probe.clone() {
@@ -73,6 +78,15 @@ impl Workspace {
             }
             panel
         });
+        let file_explorer = cx.new(|cx| {
+            let panel = FileExplorerPanel::new(window, cx);
+            #[cfg(test)]
+            if let Some(probe) = probe.clone() {
+                return panel.with_probe(probe);
+            }
+            panel
+        });
+        let workspace = cx.new(|cx| MainPanel::new(chat.clone(), &file_explorer, window, cx));
 
         dock_area.update(cx, |dock_area, cx| {
             dock_area.set_center(DockItem::panel(Arc::new(workspace.clone())), window, cx);
@@ -83,9 +97,17 @@ impl Workspace {
                 window,
                 cx,
             );
+            dock_area.set_right_dock(
+                DockItem::panel(Arc::new(file_explorer.clone())),
+                Some(px(FILES_WIDTH)),
+                false,
+                window,
+                cx,
+            );
             dock_area.set_dock_collapsible(
                 Edges {
                     left: true,
+                    right: true,
                     ..Default::default()
                 },
                 window,
@@ -99,14 +121,23 @@ impl Workspace {
             theme::sync_system_theme(window, cx);
             cx.notify();
         });
-        let chat_panel = workspace.clone();
-        let session_subscription = cx.subscribe(
+        let chat_panel = chat.clone();
+        let file_panel = file_explorer.clone();
+        let main_content = workspace.clone();
+        let session_subscription = cx.subscribe_in(
             &sidebar,
-            move |workspace, _, event: &SessionSelected, cx| {
+            window,
+            move |workspace, _, event: &SessionSelected, window, cx| {
                 workspace.selected_directory = Some(event.cwd.clone());
                 workspace.selected_session = Some(event.clone());
                 chat_panel.update(cx, |panel, cx| {
                     panel.load_selection(event.clone(), cx);
+                });
+                file_panel.update(cx, |panel, cx| {
+                    panel.set_root(Some(event.cwd.clone()), window, cx);
+                });
+                main_content.update(cx, |panel, cx| {
+                    panel.set_root(Some(event.cwd.clone()), cx);
                 });
                 cx.notify();
             },
@@ -114,6 +145,8 @@ impl Workspace {
 
         Self {
             dock_area,
+            file_explorer,
+            main_panel: workspace,
             selected_directory: None,
             selected_session: None,
             _appearance_subscription: appearance_subscription,
@@ -131,6 +164,13 @@ impl Workspace {
             dock_area.toggle_dock(DockPlacement::Left, window, cx);
         });
         // Dock 自身的 notify 不会重绘 Dock 外的工具栏；这里同步刷新图标和 tooltip。
+        cx.notify();
+    }
+
+    fn toggle_files(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.dock_area.update(cx, |dock_area, cx| {
+            dock_area.toggle_dock(DockPlacement::Right, window, cx);
+        });
         cx.notify();
     }
 
@@ -158,6 +198,12 @@ impl Workspace {
                 let _ = workspace.update(cx, |workspace, cx| {
                     workspace.selected_directory = Some(path.clone());
                     workspace.selected_session = None;
+                    workspace.file_explorer.update(cx, |panel, cx| {
+                        panel.set_root(Some(path.clone()), window, cx);
+                    });
+                    workspace.main_panel.update(cx, |panel, cx| {
+                        panel.set_root(Some(path.clone()), cx);
+                    });
                     cx.notify();
                 });
                 prompt_project_trust(pi_data::agent_dir(), &path, window, cx);
@@ -229,6 +275,20 @@ impl Render for Workspace {
         } else {
             "展开侧栏"
         };
+        let files_open = self
+            .dock_area
+            .read(cx)
+            .is_dock_open(DockPlacement::Right, cx);
+        let files_toggle_icon = if files_open {
+            IconName::PanelRight
+        } else {
+            IconName::PanelRightOpen
+        };
+        let files_toggle_tooltip = if files_open {
+            "收起文件面板"
+        } else {
+            "展开文件面板"
+        };
         let toolbar = h_flex()
             .debug_selector(|| "workspace-toolbar".into())
             .h(gpui::px(38.))
@@ -257,6 +317,15 @@ impl Render for Workspace {
                     .child(WorkspaceTabBar::new(self.tab_label()).tooltip(self.tab_tooltip())),
             )
             .child(
+                Button::new("toggle-files-panel")
+                    .debug_selector(move || format!("files-toggle-{files_open}"))
+                    .ghost()
+                    .small()
+                    .icon(files_toggle_icon)
+                    .tooltip(files_toggle_tooltip)
+                    .on_click(cx.listener(Self::toggle_files)),
+            )
+            .child(
                 Button::new("choose-project-directory")
                     .debug_selector(|| "choose-project-directory".into())
                     .ghost()
@@ -268,6 +337,7 @@ impl Render for Workspace {
             );
 
         div()
+            .id("workspace-root")
             .size_full()
             .child(AppShell::new(title_bar, toolbar, self.dock_area.clone()))
             .children(sheet_layer)
@@ -377,6 +447,23 @@ mod tests {
         let reopened_workspace = probe.workspace.get();
         assert!(reopened_workspace.origin.x >= px(200.));
         assert!(reopened_workspace.size.width < px(1000.));
+    }
+
+    #[gpui::test]
+    fn files_panel_defaults_closed_and_toolbar_toggle_opens_it(cx: &mut TestAppContext) {
+        let probe = LayoutProbe::default();
+        let mut visual = render_workspace(cx, size(px(1200.), px(800.)), probe.clone());
+        assert!(visual.debug_bounds("file-explorer-panel").is_none());
+        let toggle = visual
+            .debug_bounds("files-toggle-false")
+            .expect("files toggle missing");
+        visual.simulate_click(toggle.center(), Default::default());
+        for _ in 0..8 {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.run_until_parked();
+        }
+        assert!(visual.debug_bounds("files-toggle-true").is_some());
+        assert!(probe.files.get().size.width > px(0.));
     }
 
     #[gpui::test]

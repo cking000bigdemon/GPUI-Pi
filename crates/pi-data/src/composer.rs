@@ -343,7 +343,9 @@ fn walk_file_index(cwd: &Path) -> FileIndex {
             let Ok(metadata) = fs::symlink_metadata(&path) else {
                 continue;
             };
-            if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+            if crate::fs_util::is_link_like(&metadata)
+                || crate::fs_util::is_any_reparse_point(&metadata)
+            {
                 continue;
             }
             if metadata.is_dir() {
@@ -370,19 +372,6 @@ fn walk_file_index(cwd: &Path) -> FileIndex {
         entries: build_entries_from_files(files),
         truncated,
     }
-}
-
-#[cfg(windows)]
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-    metadata.file_attributes()
-        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-        != 0
-}
-
-#[cfg(not(windows))]
-fn is_reparse_point(_: &fs::Metadata) -> bool {
-    false
 }
 
 pub fn detect_image_format(bytes: &[u8]) -> Result<SupportedImageFormat, ImageValidationError> {

@@ -3,8 +3,8 @@
 //! 配置会被多个 pi 客户端共享，因此不在这里做会丢未知字段的强类型重写；调用方
 //! 修改 `serde_json::Value` 后，通过同目录临时文件原子替换。
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -120,115 +120,8 @@ pub(crate) fn write_bytes_atomic_if<E>(
 where
     E: From<io::Error>,
 {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(E::from)?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.json");
-    let mut last_collision = None;
-    let mut verify_before_replace = Some(verify_before_replace);
-
-    for _ in 0..100 {
-        let temp_path = parent.join(format!(".{file_name}-{:016x}.tmp", next_temp_nonce()));
-        let mut file = match open_private_temp(&temp_path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                last_collision = Some(error);
-                continue;
-            }
-            Err(error) => return Err(E::from(error)),
-        };
-        let result = (|| {
-            file.write_all(bytes).map_err(E::from)?;
-            file.flush().map_err(E::from)?;
-            file.sync_all().map_err(E::from)?;
-            drop(file);
-            verify_before_replace
-                .take()
-                .expect("revision verifier is called once")()?;
-            replace_file(&temp_path, path).map_err(E::from)?;
-            sync_directory(parent);
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
-        }
-        return result;
-    }
-    Err(E::from(last_collision.unwrap_or_else(|| {
-        io::Error::other("无法创建唯一临时文件")
-    })))
+    crate::fs_util::write_bytes_atomic_if(path, bytes, verify_before_replace)
 }
-
-fn open_private_temp(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
-}
-
-fn next_temp_nonce() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as u64);
-    now ^ u64::from(std::process::id()) ^ COUNTER.fetch_add(1, Ordering::Relaxed)
-}
-
-#[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(source, destination)
-}
-
-#[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    use windows_sys::Win32::Foundation::GetLastError;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    // SAFETY: 两个 UTF-16 缓冲都以 NUL 结尾，并在调用期间保持有效。
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        // SAFETY: 紧跟失败的 Win32 调用读取线程局部错误码。
-        let code = unsafe { GetLastError() };
-        Err(io::Error::from_raw_os_error(code as i32))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) {
-    if let Ok(directory) = File::open(path) {
-        let _ = directory.sync_all();
-    }
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
