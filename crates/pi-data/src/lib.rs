@@ -11,6 +11,8 @@ use std::path::PathBuf;
 pub mod composer;
 pub mod config;
 pub mod extensions;
+pub mod files;
+mod fs_util;
 pub mod project;
 pub mod session;
 pub mod session_actions;
@@ -30,6 +32,14 @@ pub use config::{
 };
 pub use extensions::{
     ExtensionDiagnostic, ExtensionInfo, ExtensionKind, ExtensionScan, scan_extensions,
+};
+pub use files::{
+    FILE_INDEX_HARD_LIMIT, FILE_INDEX_MAX_DEPTH, FILE_SEARCH_RESULT_LIMIT, FILE_TREE_LIMIT,
+    FileAccessError, FileContent, FileNode, FileNodeKind, FileTreeSnapshot,
+    IMAGE_PREVIEW_MAX_BYTES, ImageFileContent, ImageKind, MAX_UPLOAD_FILE_BYTES,
+    MAX_UPLOAD_TOTAL_BYTES, ProjectFiles, TEXT_PREVIEW_MAX_BYTES, TextFileContent, UploadCandidate,
+    UploadConflictStrategy, UploadInspection, UploadItemError, UploadReport, language_for_path,
+    validate_upload_name,
 };
 pub use project::{
     GroupedSession, PathPlatform, ProjectGroup, ProjectInfo, group_sessions, native_platform,

@@ -125,6 +125,7 @@ pub(crate) struct LayoutProbe {
     pub sidebar: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
     pub sidebar_prepaints: std::rc::Rc<std::cell::Cell<usize>>,
     pub workspace: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
+    pub files: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
 }
 
 #[cfg(not(test))]
@@ -149,6 +150,14 @@ impl LayoutProbe {
 
     #[cfg(not(test))]
     fn record_workspace(&self, _: gpui::Bounds<gpui::Pixels>) {}
+
+    #[cfg(test)]
+    pub(crate) fn record_files(&self, bounds: gpui::Bounds<gpui::Pixels>) {
+        self.files.set(bounds);
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn record_files(&self, _: gpui::Bounds<gpui::Pixels>) {}
 }
 
 impl ChatPanel {
