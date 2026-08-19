@@ -27,6 +27,7 @@ rounds/
 - 阻塞报告固定为 `rounds/round-NN/BLOCKED.md`，不再使用根目录下的 `BLOCKED-NN.md`。
 - 源码、脚本、测试 fixture 仍放 `crates/`、`scripts/`、`tests/` 等标准位置，不复制到轮次目录。
 - 本地截图、原始 validation 日志等大文件放 gitignored 的 `.pi/`；需要留档时，在任务卡记录摘要、关键数字和可复现命令。
+- 涉及 UI 的 round 必须填写任务卡「视觉审查」字段。用户在截图请求发出后 10 分钟内未完整回传，或明确拒绝截图时，可用 `CODE_ONLY` 兜底；通过后固定记录 `CODE_ONLY_PASS`、`截图验证：未提供（SCREENSHOT_NOT_PROVIDED）` 及 `TIMEOUT_10M | USER_DECLINED`。该标记不等于真实截图验证，但不阻塞后续 PR 流程。
 
 ## 示例
 

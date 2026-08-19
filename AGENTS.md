@@ -39,10 +39,11 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
                   ↓ 全绿
 读 rounds/round-NN/round-NN.md  →  实现  →  跑 validate  →  不过就改，重跑
                                                  ↓ 全绿
-        代码审查（按「代码审查工具路由」）→ 涉及 UI 则视觉审查，须 PASS：
-              主代理出「截图请求清单」（页面路由 + 截图要求）→ 用户截图回传
-              → 运行 visual-reviewer
-                                                 ↓ 审查门禁通过
+        代码审查（按「代码审查工具路由」）→ 涉及 UI 则视觉审查：
+              主代理出截图请求清单并记录 10 分钟窗口
+              ├─ 截止前完整回传 → SCREENSHOT review，须 PASS
+              └─ 用户拒绝或超时 → CODE_ONLY review，须 CODE_ONLY_PASS
+                                                 ↓ 任一路径通过并回填 round 标记
                     commit + 更新仓库根 ROUNDS.md + 回填任务卡「本轮实测」
 ```
 
@@ -83,11 +84,14 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 - 项目专用视觉 reviewer 为 `.agents/visual-reviewer.md`（运行时名称 `visual-reviewer`）。它是**能力层只读** agent，只允许 `read` / `grep` / `find` / `ls`，禁止 `bash`、`edit`、`write`、子代理和任何文件修改；不得用通用代码 reviewer 替代视觉 reviewer。
 - **触发条件**：本轮 diff 只要触及 `crates/ui/**`，或触及 `crates/app/**` 中的视图/组件/布局/样式渲染代码、Theme token、图标及其他视觉资源，就视为涉及 UI 层；即使改动位于其他路径，只要会改变用户可见的 UI 表现，也必须触发视觉 review。不得仅凭“没有改 `crates/ui`”而跳过。
 - 视觉 review 是代码 review 之后的独立门禁：普通代码 review 的阻断 findings 已关闭、主会话判定代码 review 通过后，才运行 `visual-reviewer`；视觉 review 不能替代代码 review，也不得提前与尚未稳定的实现并行给出终审结论。
-- 发起视觉 review 前，主会话或当前 writer 必须准备可比较证据：目标截图/设计稿或明确规范基线、对应窗口尺寸与缩放、主题、交互状态、当前 diff、任务卡，以及 `docs/UI设计规范.md`；其中**当前实现截图一律走用户回传**——主代理无法直接操作 GUI 应用（GPUI 桌面客户端）导航与截图，禁止自行臆造或从旧轮次/上游实现借用。主代理先产出「截图请求清单」，逐页给出：页面路由/导航路径（启动方式、窗口布局、到达该视图的操作序列、所需前置状态如会话内容/消息类型/工具调用等）、窗口尺寸与缩放、主题、交互状态（默认/hover/选中/错误/空态等）及该页对应的目标基线引用；随后请用户按清单操作应用并截图回传，主代理将截图保存到仓库根 gitignored 的 `.pi/` 下（按轮次分目录，路径随任务卡或审查请求引用给出）后再运行 `visual-reviewer`。基线冲突时以规范文档为最高判据：目标截图/设计稿只是当轮还原目标，与规范不一致时先按「UI 设计规范」一节走规范修订，不得直接按设计稿判过。截图比较必须使用支持图片输入的模型。
-- 截图未回传或回传不齐（缺页面、缺状态、尺寸/主题不符）时，视觉审查只能给出 `INSUFFICIENT_EVIDENCE`，不得标记视觉通过；补齐证据后重跑。缺少明确视觉基线或没有支持图片输入的模型可用时同样只能给出 `INSUFFICIENT_EVIDENCE`。
-- 视觉 reviewer 只判断还原度与规范符合度：几何与面板比例、对齐、间距、字体层级、颜色/对比度、组件形态、信息密度、状态表现、溢出/裁切/滚动，以及不同窗口尺寸下的稳定性。它不得把个人审美当作目标，不得扩展产品范围或审查业务逻辑。
+- 发起视觉 review 前，主会话或当前 writer 必须准备目标截图/设计稿或明确规范基线、对应窗口尺寸与缩放、主题、交互状态、当前 diff、任务卡，以及 `docs/UI设计规范.md`。来自主会话聊天附件的所有图片证据都**不得假设子代理能够继承**，`context: fork` 也不能替代图片落盘。当前实现截图一律走用户回传：主代理无法直接操作 GUI 应用（GPUI 桌面客户端）导航与截图，禁止自行臆造或从旧轮次/上游实现借用；主代理先产出「截图请求清单」，逐页给出页面路由/导航路径（启动方式、窗口布局、操作序列、所需前置状态）、窗口尺寸与缩放、主题、交互状态及对应目标基线引用。
+- **10 分钟截图窗口**：主代理发出完整截图请求清单时，必须记录含时区的 ISO-8601 `requested_at`，并计算 `deadline = requested_at + 10 分钟`。用户明确拒绝提供截图时立即进入 `CODE_ONLY`，无需等待截止；用户未明确拒绝时不得忙等或反复催促，可结束当前 turn，待会话在截止后继续时执行兜底。截止前收到的截图只有在请求清单所需页面/状态全部齐全时才算“完整回传”；缺图、缺状态或尺寸/主题不符均按未完整回传处理。
+- **`SCREENSHOT` 模式（首选）**：用户在截止前完整回传截图后，使用 **pi harness** 的主代理运行 `.\scripts\export-visual-evidence.ps1 -Round round-NN -ExpectedImageCount N`（只读 `$env:PI_SESSION_FILE`）；分多条消息回传时传精确的 `-EntryId id1,id2`，或以 `requested_at` 运行 `-AllSince -Since <ISO-8601>`。主代理必须核对 manifest 的 `actualImageCount == ExpectedImageCount` 且 `selectedEntries` 确属本次回传，禁止修改 `~/.pi` 下的会话 JSONL。使用 **Claude Code / codex 等非 pi harness** 时不得假设存在 `$env:PI_SESSION_FILE`，应请用户把图片保存到 `.pi/visual-review/round-NN/evidence/`，或使用该 harness 能提供的本地附件路径。随后将每张图片绝对路径及其证据角色、页面路由、窗口尺寸与缩放、主题、交互状态和对应目标基线显式传给 `visual-reviewer`，以 `SCREENSHOT` 模式审查；结论必须为 `PASS`。本模式中缺少可读路径、证据元数据或图片输入模型时只能给出 `INSUFFICIENT_EVIDENCE`，不得冒充通过。
+- **`CODE_ONLY` 兜底模式（不阻塞 PR）**：仅在用户明确拒绝（`USER_DECLINED`），或截止时间已过且完整截图仍未提供（`TIMEOUT_10M`）时启用。主代理必须把兜底原因、`requested_at`、`deadline`、当前 diff（正文或可由 `read` 读取的 diff 文件绝对路径）、变更文件清单、任务卡、目标基线以及 `docs/UI设计规范.md` 显式传给 `visual-reviewer`，要求其只从代码层审查 Theme token、硬编码颜色/字体、组件与样式结构、布局约束、溢出/截断/滚动、可见状态分支及相关 UI 测试。该模式不要求图片，结论只能为 `CODE_ONLY_PASS` 或 `CODE_ONLY_FAIL`；`CODE_ONLY_PASS` 仅表示未发现代码层视觉阻断项，不等于截图还原度 `PASS`，但允许继续创建/推进 PR；`CODE_ONLY_FAIL` 仍阻塞，修复后必须重跑同模式审查。
+- 走 `CODE_ONLY_PASS` 时，`rounds/round-NN/round-NN.md` 必须固定记录：`视觉审查模式：CODE_ONLY`、`视觉审查结论：CODE_ONLY_PASS`、`截图验证：未提供（SCREENSHOT_NOT_PROVIDED）`、`兜底原因：TIMEOUT_10M | USER_DECLINED`、`requested_at`、`deadline`，并注明“仅完成纯代码层视觉审查，未验证真实渲染；不阻塞 PR”。若截图后来补齐，可追加 `SCREENSHOT` review 并将结论升级为 `PASS`，但不得回写成此前已经完成截图验证。
+- `SCREENSHOT` 模式判断实际还原度与规范符合度，包括几何与面板比例、对齐、间距、字体层级、颜色/对比度、组件形态、信息密度、状态表现、溢出/裁切/滚动及不同窗口尺寸下的稳定性；`CODE_ONLY` 模式只能判断上述问题在静态代码中可证实的部分，不得推断真实像素结果。两种模式都不得把个人审美当作目标、扩展产品范围或审查业务逻辑。
 - 主会话负责接受或驳回视觉 findings；需要修复时保持视觉 review 前已经形成的 writer 归属。**视觉 review 之后产生的修复增量只允许修改 UI 表现代码**：限 `crates/ui/**`、`crates/app/**` 中纯视图/布局/样式渲染片段，以及直接对应的 UI 测试、视觉 fixture 和视觉资源；禁止修改 `crates/pi-rpc/**`、`crates/pi-data/**`、`crates/pi-render/**`，也禁止改 RPC、进程/会话控制、状态机、数据模型、持久化、协议及其他业务逻辑。
-- 若某条视觉 finding 必须依赖业务代码才能解决，立即停止该项视觉修复，将其标记为“非 UI 依赖”，另行进入普通开发与代码 review 流程；禁止借视觉修复顺手改业务代码。视觉修复完成后，先确认相对视觉 review 基线的增量没有越界，再对该 UI 增量完成必要代码复核并重新运行 `visual-reviewer`；最终视觉结论必须为 `PASS` 才能进入用户视觉验收或本轮收口。
+- 若某条视觉 finding 必须依赖业务代码才能解决，立即停止该项视觉修复，将其标记为“非 UI 依赖”，另行进入普通开发与代码 review 流程；禁止借视觉修复顺手改业务代码。视觉修复完成后，先确认相对视觉 review 基线的增量没有越界，再对该 UI 增量完成必要代码复核并以原审查模式重新运行 `visual-reviewer`。最终门禁结论必须为 `PASS`，或在上述兜底条件成立且 round 标记完整时为 `CODE_ONLY_PASS`；二者均可继续 PR 流程，但只有 `PASS` 可以宣称完成截图视觉验证。
 
 ## 平台归属
 

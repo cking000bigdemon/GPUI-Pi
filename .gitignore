@@ -14,7 +14,8 @@ Thumbs.db
 .vscode/*
 !.vscode/extensions.json
 
-# 本地配置与日志
+# 本地配置、会话证据与日志
+/.pi/
 /.env
 /.env.local
 *.log
