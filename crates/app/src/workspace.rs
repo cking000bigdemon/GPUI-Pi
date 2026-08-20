@@ -17,7 +17,7 @@ use crate::main_panel::MainPanel;
 use crate::panels::ChatPanel;
 #[cfg(test)]
 use crate::panels::LayoutProbe;
-use crate::session_sidebar::{SessionSelected, SessionSidebar};
+use crate::session_sidebar::{SessionSelected, SessionSidebar, WorktreeSelected};
 use crate::trust_prompt::prompt_project_trust;
 
 const MAIN_DOCK_ID: &str = "gpui-pi-main-dock";
@@ -27,12 +27,14 @@ pub(crate) const FILES_WIDTH: f32 = 320.;
 
 pub struct Workspace {
     dock_area: gpui::Entity<DockArea>,
+    sidebar: gpui::Entity<SessionSidebar>,
     file_explorer: gpui::Entity<FileExplorerPanel>,
     main_panel: gpui::Entity<MainPanel>,
     selected_directory: Option<PathBuf>,
     selected_session: Option<SessionSelected>,
     _appearance_subscription: Subscription,
     _session_subscription: Subscription,
+    _worktree_subscription: Subscription,
 }
 
 impl Workspace {
@@ -143,15 +145,35 @@ impl Workspace {
             },
         );
 
+        let worktree_subscription = cx.subscribe_in(
+            &sidebar,
+            window,
+            move |workspace, _, event: &WorktreeSelected, window, cx| {
+                workspace.apply_browsing_root(event.cwd.clone(), window, cx);
+            },
+        );
+
         Self {
             dock_area,
+            sidebar,
             file_explorer,
             main_panel: workspace,
             selected_directory: None,
             selected_session: None,
             _appearance_subscription: appearance_subscription,
             _session_subscription: session_subscription,
+            _worktree_subscription: worktree_subscription,
         }
+    }
+
+    fn apply_browsing_root(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_directory = Some(cwd.clone());
+        self.file_explorer.update(cx, |panel, cx| {
+            panel.set_root(Some(cwd.clone()), window, cx)
+        });
+        self.main_panel
+            .update(cx, |panel, cx| panel.set_root(Some(cwd), cx));
+        cx.notify();
     }
 
     fn toggle_sidebar(
@@ -203,6 +225,9 @@ impl Workspace {
                     });
                     workspace.main_panel.update(cx, |panel, cx| {
                         panel.set_root(Some(path.clone()), cx);
+                    });
+                    workspace.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.set_browsing_cwd(Some(path.clone()), cx);
                     });
                     cx.notify();
                 });
@@ -370,6 +395,38 @@ mod tests {
             visual.run_until_parked();
         }
         visual
+    }
+
+    #[gpui::test]
+    fn worktree_selection_updates_explorer_and_main_roots(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            gpui_pi_ui::theme::init_fonts(cx).expect("test font init failed");
+        });
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let output = captured.clone();
+        let window = cx.open_window(size(px(1000.), px(700.)), move |window, cx| {
+            let workspace =
+                cx.new(|cx| Workspace::new_with_probe(window, cx, LayoutProbe::default()));
+            *output.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let workspace = captured.borrow().clone().unwrap();
+        let selected = PathBuf::from("C:/fixture/worktree-b");
+        let _ = window.update(cx, |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.apply_browsing_root(selected.clone(), window, cx);
+                assert_eq!(workspace.selected_directory.as_ref(), Some(&selected));
+                assert_eq!(
+                    workspace.file_explorer.read(cx).root_for_test(),
+                    Some(selected.as_path())
+                );
+                assert_eq!(
+                    workspace.main_panel.read(cx).root_for_test(),
+                    Some(selected.as_path())
+                );
+            });
+        });
     }
 
     #[gpui::test]

@@ -1241,6 +1241,7 @@ impl Drop for ChatPanel {
 }
 
 impl EventEmitter<PanelEvent> for ChatPanel {}
+impl EventEmitter<crate::main_panel::OpenFileRequest> for ChatPanel {}
 
 impl Focusable for ChatPanel {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -1314,7 +1315,21 @@ impl Render for ChatPanel {
                 .child(div().text_sm().child(message.clone()))
                 .into_any_element(),
             ChatStatus::Ready(document) => {
+                let tail_panel = cx.entity();
+                let written_source_root = document.cwd.clone();
                 gpui_pi_ui::ChatWindow::new(document.clone(), self.list_state.clone())
+                    .on_open_written_file({
+                        let panel = cx.entity();
+                        move |relative_path, cx| {
+                            let source_root = written_source_root.clone();
+                            panel.update(cx, |_, cx| {
+                                cx.emit(crate::main_panel::OpenFileRequest {
+                                    source_root,
+                                    relative_path,
+                                });
+                            });
+                        }
+                    })
                     .model_names(self.model_names.clone())
                     .show_minimap(self.minimap_visible)
                     .expanded_tools(Arc::new(self.expanded_tools.clone()))
@@ -1340,7 +1355,7 @@ impl Render for ChatPanel {
                         }
                     })
                     .on_tail_attachment_change(move |attached, _, cx| {
-                        panel.update(cx, |panel, cx| {
+                        tail_panel.update(cx, |panel, cx| {
                             panel.tail_attached = attached;
                             if !attached {
                                 panel.list_state.pause_following_tail();
@@ -1952,6 +1967,7 @@ mod tests {
             timestamp: None,
             label: None,
             model: None,
+            written_files: Vec::new(),
             blocks: vec![pi_render::Block::Markdown(pi_render::MarkdownBlock {
                 source: (0..line_count)
                     .map(|line| format!("{prefix} line {line}"))
@@ -1981,6 +1997,7 @@ mod tests {
         Arc::new(ConversationDocument {
             session_id: document.session_id.clone(),
             source_path: document.source_path.clone(),
+            cwd: PathBuf::new(),
             messages: messages.into(),
             items: items.into(),
             minimap: document.minimap.clone(),
@@ -1996,6 +2013,7 @@ mod tests {
             timestamp: None,
             label: None,
             model: None,
+            written_files: Vec::new(),
             blocks: vec![pi_render::Block::Thinking(
                 (0..160)
                     .map(|line| format!("Expanded process detail {line}"))
@@ -2013,6 +2031,7 @@ mod tests {
         Arc::new(ConversationDocument {
             session_id: "active-tail".to_owned(),
             source_path: PathBuf::from("active-tail.jsonl"),
+            cwd: PathBuf::new(),
             messages: Arc::from([user.clone(), process_message]),
             items: Arc::from([
                 ConversationItem::Message(user),
@@ -2042,6 +2061,7 @@ mod tests {
         Arc::new(ConversationDocument {
             session_id: active.session_id.clone(),
             source_path: active.source_path.clone(),
+            cwd: PathBuf::new(),
             messages: messages.into(),
             items: Arc::from([
                 ConversationItem::Message(user),
@@ -2292,6 +2312,7 @@ mod tests {
         let active = Arc::new(ConversationDocument {
             session_id: history.session_id.clone(),
             source_path: history.source_path.clone(),
+            cwd: PathBuf::new(),
             messages: history.messages.clone(),
             items: active_items.into(),
             minimap: history.minimap.clone(),
@@ -2304,6 +2325,7 @@ mod tests {
         let settled = Arc::new(ConversationDocument {
             session_id: history.session_id.clone(),
             source_path: history.source_path.clone(),
+            cwd: PathBuf::new(),
             messages: history.messages.clone(),
             items: settled_items.into(),
             minimap: history.minimap.clone(),

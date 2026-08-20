@@ -4,6 +4,7 @@
 
 mod chat;
 mod file_workspace;
+mod git_workspace;
 mod project_trust_dialog;
 mod shell;
 mod tab_bar;
@@ -11,6 +12,10 @@ pub mod theme;
 
 pub use chat::{ChatMinimap, ChatWindow, MarkdownBody, MessageView};
 pub use file_workspace::{WorkspaceContentTab, WorkspaceContentTabs};
+pub use git_workspace::{
+    DiffView, GitChangeItem, GitChangeKind, GitChangesModel, GitChangesView, TurnWrittenFiles,
+    render_diff_block,
+};
 pub use project_trust_dialog::project_trust_dialog;
 pub use shell::AppShell;
 pub use tab_bar::WorkspaceTabBar;

@@ -20,7 +20,10 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::{main_panel::OpenFileRequest, panels::LayoutProbe};
+use crate::{
+    main_panel::{OpenDiffRequest, OpenFileRequest},
+    panels::LayoutProbe,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExplorerStatus {
@@ -52,6 +55,9 @@ pub struct FileExplorerPanel {
     upload_generation: u64,
     status: ExplorerStatus,
     index: Option<Arc<pi_data::FileIndex>>,
+    git_status: Option<Arc<pi_data::GitStatusSnapshot>>,
+    git_model: Option<Arc<gpui_pi_ui::GitChangesModel>>,
+    git_error: Option<String>,
     directory_ids: Arc<HashSet<String>>,
     tree_state: gpui::Entity<TreeState>,
     search: gpui::Entity<InputState>,
@@ -91,6 +97,9 @@ impl FileExplorerPanel {
             upload_generation: 0,
             status: ExplorerStatus::Empty,
             index: None,
+            git_status: None,
+            git_model: None,
+            git_error: None,
             directory_ids: Arc::new(HashSet::new()),
             tree_state,
             search,
@@ -102,6 +111,11 @@ impl FileExplorerPanel {
             _search_subscription: search_subscription,
             _tree_subscription: tree_subscription,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_for_test(&self) -> Option<&std::path::Path> {
+        self.root.as_deref()
     }
 
     #[cfg(test)]
@@ -121,6 +135,9 @@ impl FileExplorerPanel {
         }
         self.root = root;
         self.index = None;
+        self.git_status = None;
+        self.git_model = None;
+        self.git_error = None;
         self.pending_tree_items = None;
         self.search_results.clear();
         self.upload_state = UploadState::Idle;
@@ -157,8 +174,41 @@ impl FileExplorerPanel {
                 .await;
             let _ = panel.update(cx, |panel, cx| {
                 if panel.finish_refresh(generation, result) {
+                    panel.start_git_refresh(cx);
                     cx.notify();
                 }
+            });
+        })
+        .detach();
+    }
+
+    fn start_git_refresh(&self, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let generation = self.root_generation;
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |panel, cx| {
+            let result = executor
+                .spawn(async move { pi_data::git_status(root) })
+                .await;
+            let _ = panel.update(cx, |panel, cx| {
+                if generation != panel.root_generation {
+                    return;
+                }
+                match result {
+                    Ok(snapshot) => {
+                        panel.git_model = Some(Arc::new(git_changes_model(&snapshot)));
+                        panel.git_status = Some(Arc::new(snapshot));
+                        panel.git_error = None;
+                    }
+                    Err(error) => {
+                        panel.git_status = None;
+                        panel.git_model = None;
+                        panel.git_error = Some(error.to_string());
+                    }
+                }
+                cx.notify();
             });
         })
         .detach();
@@ -526,6 +576,7 @@ impl FileExplorerPanel {
                                 );
                             }
                             panel.start_refresh(cx);
+                            panel.start_git_refresh(cx);
                         }
                         Err(error) => window.push_notification(
                             Notification::error(format!("上传失败：{error}")),
@@ -540,7 +591,21 @@ impl FileExplorerPanel {
     }
 
     fn open_relative(&mut self, relative_path: PathBuf, cx: &mut Context<Self>) {
-        cx.emit(OpenFileRequest { relative_path });
+        if let Some(source_root) = self.root.clone() {
+            cx.emit(OpenFileRequest {
+                source_root,
+                relative_path,
+            });
+        }
+    }
+
+    fn open_diff(&mut self, relative_path: PathBuf, cx: &mut Context<Self>) {
+        if let Some(source_root) = self.root.clone() {
+            cx.emit(OpenDiffRequest {
+                source_root,
+                relative_path,
+            });
+        }
     }
 
     fn render_search_results(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -649,6 +714,7 @@ impl FileExplorerPanel {
 
 impl EventEmitter<PanelEvent> for FileExplorerPanel {}
 impl EventEmitter<OpenFileRequest> for FileExplorerPanel {}
+impl EventEmitter<OpenDiffRequest> for FileExplorerPanel {}
 
 impl Focusable for FileExplorerPanel {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -708,6 +774,12 @@ impl Render for FileExplorerPanel {
                 ExplorerStatus::Ready(_) => self.render_tree(cx),
             }
         };
+        let git_changes = self.git_model.clone().map(|model| {
+            let panel = cx.entity();
+            gpui_pi_ui::GitChangesView::new(model).on_open_diff(move |path, cx| {
+                panel.update(cx, |panel, cx| panel.open_diff(path, cx));
+            })
+        });
         let diagnostic = match &self.status {
             ExplorerStatus::Ready(snapshot) => {
                 let mut parts = Vec::new();
@@ -782,6 +854,18 @@ impl Render for FileExplorerPanel {
                             .on_click(cx.listener(Self::handle_refresh)),
                     ),
             )
+            .when_some(git_changes, |view, changes| view.child(changes))
+            .when_some(self.git_error.clone(), |view, error| {
+                view.child(
+                    div()
+                        .debug_selector(|| "git-status-error".into())
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .child(format!("Git 状态读取失败：{error}")),
+                )
+            })
             .child(
                 div()
                     .debug_selector(|| "file-search-input".into())
@@ -815,6 +899,32 @@ impl Render for FileExplorerPanel {
                 )
             })
             .child(div().flex_1().min_h_0().child(body))
+    }
+}
+
+fn git_changes_model(snapshot: &pi_data::GitStatusSnapshot) -> gpui_pi_ui::GitChangesModel {
+    gpui_pi_ui::GitChangesModel {
+        is_git_repository: snapshot.is_git_repository,
+        files: snapshot
+            .files
+            .iter()
+            .map(|file| gpui_pi_ui::GitChangeItem {
+                relative_path: file.relative_path.clone(),
+                kind: match file.kind {
+                    pi_data::GitFileStatusKind::Modified => gpui_pi_ui::GitChangeKind::Modified,
+                    pi_data::GitFileStatusKind::Added => gpui_pi_ui::GitChangeKind::Added,
+                    pi_data::GitFileStatusKind::Deleted => gpui_pi_ui::GitChangeKind::Deleted,
+                    pi_data::GitFileStatusKind::Renamed => gpui_pi_ui::GitChangeKind::Renamed,
+                    pi_data::GitFileStatusKind::Untracked => gpui_pi_ui::GitChangeKind::Untracked,
+                    pi_data::GitFileStatusKind::Conflict => gpui_pi_ui::GitChangeKind::Conflict,
+                },
+            })
+            .collect(),
+        total_files: snapshot.total_files,
+        files_truncated: snapshot.files_truncated,
+        additions: snapshot.additions,
+        deletions: snapshot.deletions,
+        line_stats_truncated: snapshot.line_stats_truncated,
     }
 }
 
@@ -878,6 +988,44 @@ mod tests {
         panel.pending_tree_items = Some((items, Arc::new(directory_ids)));
         panel.status = ExplorerStatus::Ready(Arc::new(snapshot));
         panel
+    }
+
+    #[test]
+    fn git_changes_model_preserves_empty_non_git_and_truncation_states() {
+        let snapshot = pi_data::GitStatusSnapshot {
+            is_git_repository: false,
+            repository_root: None,
+            files: Vec::new(),
+            total_files: 0,
+            files_truncated: false,
+            additions: 0,
+            deletions: 0,
+            line_stats_truncated: false,
+        };
+        let model = git_changes_model(&snapshot);
+        assert!(!model.is_git_repository);
+        assert!(model.files.is_empty());
+
+        let snapshot = pi_data::GitStatusSnapshot {
+            is_git_repository: true,
+            repository_root: Some(PathBuf::from("C:/repo")),
+            files: vec![pi_data::GitFileStatus {
+                relative_path: PathBuf::from("a.txt"),
+                original_path: None,
+                kind: pi_data::GitFileStatusKind::Modified,
+                index_status: ' ',
+                worktree_status: 'M',
+            }],
+            total_files: 501,
+            files_truncated: true,
+            additions: 1,
+            deletions: 2,
+            line_stats_truncated: true,
+        };
+        let model = git_changes_model(&snapshot);
+        assert!(model.files_truncated);
+        assert_eq!(model.total_files, 501);
+        assert_eq!(model.files[0].relative_path, PathBuf::from("a.txt"));
     }
 
     #[gpui::test]

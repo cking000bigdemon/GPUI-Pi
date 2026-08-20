@@ -1,6 +1,7 @@
 use pi_render::{
-    Block, ConversationItem, LiveAssistantUpdate, LiveBlockKind, LiveEvent, LivePhase,
-    LiveSessionReducer, ModelRef, ToolOutput, ToolStatus,
+    Block, ConversationDocument, ConversationItem, LiveAssistantUpdate, LiveBlockKind, LiveEvent,
+    LivePhase, LiveSessionReducer, MarkdownBlock, Message, MessageRole, MinimapNode, ModelRef,
+    ToolOutput, ToolStatus,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -187,6 +188,93 @@ fn completed_history_is_arc_cached_across_draft_frames() {
         let frame = reducer.document();
         assert!(Arc::ptr_eq(&completed, &frame.messages[0]));
     }
+}
+
+#[test]
+fn static_history_items_and_minimap_are_reused_across_draft_frames() {
+    let history_message = Arc::new(Message {
+        id: "history".to_owned(),
+        role: MessageRole::Assistant,
+        timestamp: None,
+        label: None,
+        model: None,
+        written_files: Vec::new(),
+        blocks: vec![Block::Markdown(MarkdownBlock {
+            source: "fixed history".to_owned(),
+        })],
+    });
+    let history = ConversationDocument {
+        session_id: "s".to_owned(),
+        source_path: "fixture.jsonl".into(),
+        cwd: std::env::temp_dir(),
+        messages: Arc::from([history_message.clone()]),
+        items: Arc::from([ConversationItem::Message(history_message.clone())]),
+        minimap: Arc::from([MinimapNode {
+            message_id: "history".to_owned(),
+            turn: 0,
+            role: MessageRole::Assistant,
+            label: "history".to_owned(),
+            level: None,
+        }]),
+        diagnostics: Arc::from([]),
+    };
+    let mut reducer = LiveSessionReducer::new(history);
+    reducer.apply(LiveEvent::AgentStart);
+    reducer.apply(LiveEvent::MessageStart {
+        message: json!({"role":"assistant","content":[]}),
+    });
+    for delta in ["a", "b", "c"] {
+        reducer.apply(LiveEvent::MessageUpdate(LiveAssistantUpdate::BlockDelta {
+            index: 0,
+            kind: LiveBlockKind::Text,
+            delta: delta.to_owned(),
+        }));
+        let frame = reducer.document();
+        assert!(matches!(
+            &frame.items[0],
+            ConversationItem::Message(message) if Arc::ptr_eq(message, &history_message)
+        ));
+        assert_eq!(frame.minimap[0].message_id, "history");
+        assert_eq!(frame.minimap[0].turn, 0);
+    }
+}
+
+#[test]
+fn history_and_live_minimap_turns_are_continuous() {
+    let user = Arc::new(Message {
+        id: "history-user".to_owned(),
+        role: MessageRole::User,
+        timestamp: None,
+        label: None,
+        model: None,
+        written_files: Vec::new(),
+        blocks: vec![Block::Markdown(MarkdownBlock {
+            source: "old".to_owned(),
+        })],
+    });
+    let history = ConversationDocument {
+        session_id: "s".to_owned(),
+        source_path: "fixture.jsonl".into(),
+        cwd: std::env::temp_dir(),
+        messages: Arc::from([user.clone()]),
+        items: Arc::from([ConversationItem::Message(user)]),
+        minimap: Arc::from([MinimapNode {
+            message_id: "history-user".to_owned(),
+            turn: 1,
+            role: MessageRole::User,
+            label: "old".to_owned(),
+            level: None,
+        }]),
+        diagnostics: Arc::from([]),
+    };
+    let mut reducer = LiveSessionReducer::new(history);
+    reducer.apply(LiveEvent::AgentStart);
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({"id":"live-user","role":"user","content":"new"}),
+    });
+    let document = reducer.document();
+    assert_eq!(document.minimap[0].turn, 1);
+    assert_eq!(document.minimap[1].turn, 2);
 }
 
 #[test]
