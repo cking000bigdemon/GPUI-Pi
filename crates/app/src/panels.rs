@@ -59,6 +59,7 @@ pub struct ChatPanel {
     expanded_tools: HashSet<String>,
     expanded_processes: HashSet<String>,
     rpc_error: Option<String>,
+    host_extension_degradation: Option<String>,
     activity_generation: u64,
     calibration_generation: u64,
     _composer_subscription: Subscription,
@@ -230,6 +231,7 @@ impl ChatPanel {
             expanded_tools: HashSet::new(),
             expanded_processes: HashSet::new(),
             rpc_error: None,
+            host_extension_degradation: None,
             activity_generation: 0,
             calibration_generation: 0,
             _composer_subscription: subscription,
@@ -291,10 +293,26 @@ impl ChatPanel {
         .detach();
     }
 
+    fn begin_active_generation(&mut self) -> u64 {
+        self.active_generation = self.active_generation.wrapping_add(1);
+        self.host_extension_degradation = None;
+        self.activity_generation = 0;
+        self.calibration_generation = 0;
+        self.active_generation
+    }
+
+    fn clear_rpc_error(&mut self) {
+        self.rpc_error = None;
+    }
+
+    fn set_host_extension_degradation(&mut self, diagnostic: Option<&str>) {
+        self.host_extension_degradation = diagnostic.map(str::to_owned);
+    }
+
     pub fn load_selection(&mut self, selection: SessionSelected, cx: &mut Context<Self>) {
         self.save_current_draft(cx);
         self.load_generation = self.load_generation.wrapping_add(1);
-        self.active_generation = self.active_generation.wrapping_add(1);
+        self.begin_active_generation();
         let generation = self.load_generation;
         if let Some(active) = self.active.take() {
             active.shutdown();
@@ -303,6 +321,7 @@ impl ChatPanel {
             title: selection.title.clone(),
         };
         self.rpc_error = None;
+        self.host_extension_degradation = None;
         self.draft_key = Some(selection.id.clone());
         self.composer_cwd = Some(selection.cwd.clone());
         self.file_index = None;
@@ -389,11 +408,8 @@ impl ChatPanel {
         let ChatStatus::Ready(history) = &self.status else {
             return;
         };
-        self.active_generation = self.active_generation.wrapping_add(1);
-        self.activity_generation = 0;
-        self.calibration_generation = 0;
-        let generation = self.active_generation;
         let history = history.clone();
+        let generation = self.begin_active_generation();
         let session_path = history.source_path.clone();
         let cwd = session_cwd(&session_path).unwrap_or_else(|| PathBuf::from("."));
         let result = ActiveSession::spawn(
@@ -442,6 +458,7 @@ impl ChatPanel {
             | PumpMessage::ControlFinished { generation, .. }
             | PumpMessage::ToolRestartFinished { generation, .. }
             | PumpMessage::Calibrated { generation, .. }
+            | PumpMessage::Diagnostic { generation, .. }
             | PumpMessage::Stopped { generation, .. } => *generation,
         };
         if generation != self.active_generation {
@@ -453,10 +470,15 @@ impl ChatPanel {
             }
             return false;
         }
+        if let PumpMessage::Diagnostic { message, .. } = message {
+            self.host_extension_degradation = Some(message);
+            return false;
+        }
         if let PumpMessage::ToolRestartFinished { preset, result, .. } = message {
             self.control_operation = None;
             match result {
                 Ok(active) => {
+                    self.set_host_extension_degradation(active.startup_diagnostic());
                     self.active = Some(*active);
                     self.tool_preset = preset;
                     self.rpc_error = None;
@@ -514,7 +536,7 @@ impl ChatPanel {
                 ..
             } => match result {
                 Ok(()) => {
-                    self.rpc_error = None;
+                    self.clear_rpc_error();
                 }
                 Err((kind, error)) => {
                     if intent == RpcIntent::Abort {
@@ -570,7 +592,7 @@ impl ChatPanel {
                 match result {
                     Ok(controls) => {
                         self.apply_controls(controls);
-                        self.rpc_error = None;
+                        self.clear_rpc_error();
                     }
                     Err(error) => {
                         self.rpc_error = Some(format!("切换会话控制失败：{error}"));
@@ -579,6 +601,7 @@ impl ChatPanel {
                 }
             }
             PumpMessage::ToolRestartFinished { .. } => {}
+            PumpMessage::Diagnostic { .. } => {}
             PumpMessage::Calibrated {
                 calibration,
                 result,
@@ -708,11 +731,9 @@ impl ChatPanel {
         let cwd = session_cwd(&session_path).unwrap_or_else(|| PathBuf::from("."));
         self.control_operation = Some(ControlOperation::Tools);
         self.rpc_error = None;
-        self.active_generation = self.active_generation.wrapping_add(1);
-        self.activity_generation = 0;
-        self.calibration_generation = 0;
+        let generation = self.begin_active_generation();
         active.restart_with_tools(
-            self.active_generation,
+            generation,
             official_binary(),
             session_path,
             cwd,
@@ -1474,6 +1495,20 @@ impl Render for ChatPanel {
                                 .child(summary),
                         )
                     })
+                    .when_some(
+                        self.host_extension_degradation.clone(),
+                        |view, diagnostic| {
+                            view.child(
+                                div()
+                                    .debug_selector(|| "host-extension-degradation".into())
+                                    .px_3()
+                                    .py_1()
+                                    .text_xs()
+                                    .text_color(cx.theme().warning)
+                                    .child(diagnostic),
+                            )
+                        },
+                    )
                     .when_some(self.rpc_error.clone(), |view, error| {
                         view.child(
                             div()
@@ -2648,6 +2683,69 @@ mod tests {
                 "missing {selector}"
             );
         }
+    }
+
+    #[gpui::test]
+    fn host_extension_degradation_is_generation_scoped_and_survives_successes(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, _| {
+            panel.active_generation = 4;
+            panel.host_extension_degradation = None;
+
+            assert!(!panel.handle_pump(PumpMessage::Diagnostic {
+                generation: 4,
+                message: "项目命令环境扩展未加载：denied".to_owned(),
+            }));
+            assert_eq!(
+                panel.host_extension_degradation.as_deref(),
+                Some("项目命令环境扩展未加载：denied")
+            );
+
+            panel.rpc_error = Some("temporary".to_owned());
+            panel.clear_rpc_error();
+            assert!(panel.rpc_error.is_none());
+            assert_eq!(
+                panel.host_extension_degradation.as_deref(),
+                Some("项目命令环境扩展未加载：denied")
+            );
+
+            assert!(!panel.handle_pump(PumpMessage::Diagnostic {
+                generation: 3,
+                message: "stale".to_owned(),
+            }));
+            assert_eq!(
+                panel.host_extension_degradation.as_deref(),
+                Some("项目命令环境扩展未加载：denied")
+            );
+
+            assert_eq!(panel.begin_active_generation(), 5);
+            assert!(panel.host_extension_degradation.is_none());
+
+            panel.set_host_extension_degradation(Some("still degraded"));
+            assert_eq!(
+                panel.host_extension_degradation.as_deref(),
+                Some("still degraded")
+            );
+            panel.set_host_extension_degradation(None);
+            assert!(panel.host_extension_degradation.is_none());
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.set_host_extension_degradation(Some("项目命令环境扩展未加载：denied"));
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        assert!(visual.debug_bounds("host-extension-degradation").is_some());
+
+        panel.update(cx, |panel, cx| {
+            panel.set_host_extension_degradation(None);
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        assert!(visual.debug_bounds("host-extension-degradation").is_none());
     }
 
     #[gpui::test]

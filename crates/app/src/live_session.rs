@@ -184,6 +184,10 @@ pub enum PumpMessage {
         calibration: u64,
         result: Result<ConversationDocument, String>,
     },
+    Diagnostic {
+        generation: u64,
+        message: String,
+    },
     Stopped {
         generation: u64,
         error: Option<String>,
@@ -195,6 +199,7 @@ pub struct ActiveSession {
     client: Client,
     reducer: LiveSessionReducer,
     pump: UnboundedSender<PumpMessage>,
+    startup_diagnostic: Option<String>,
 }
 
 struct ActiveSessionSpawn {
@@ -228,6 +233,12 @@ impl ActiveSession {
             pump,
             true,
         )?;
+        if let Some(message) = active.startup_diagnostic.clone() {
+            let _ = active.pump.unbounded_send(PumpMessage::Diagnostic {
+                generation,
+                message,
+            });
+        }
         Ok((active, receiver))
     }
 
@@ -236,11 +247,12 @@ impl ActiveSession {
         pump: UnboundedSender<PumpMessage>,
         refresh_metadata: bool,
     ) -> Result<Self, String> {
-        let mut config = ClientConfig::new(spawn.binary);
-        config.current_dir = Some(spawn.cwd);
-        config.initial_session = Some(spawn.session_path);
-        config.args = vec!["--no-context-files".into()];
-        spawn.tool_preset.append_args(&mut config.args);
+        let (config, diagnostic) = active_session_config(
+            spawn.binary,
+            spawn.session_path,
+            spawn.cwd,
+            spawn.tool_preset,
+        );
         let session_path = config
             .initial_session
             .clone()
@@ -253,6 +265,7 @@ impl ActiveSession {
             client,
             reducer: LiveSessionReducer::new(spawn.history),
             pump,
+            startup_diagnostic: diagnostic,
         };
         if refresh_metadata {
             active.refresh_metadata();
@@ -274,6 +287,10 @@ impl ActiveSession {
 
     pub fn reducer_mut(&mut self) -> &mut LiveSessionReducer {
         &mut self.reducer
+    }
+
+    pub fn startup_diagnostic(&self) -> Option<&str> {
+        self.startup_diagnostic.as_deref()
     }
 
     pub fn document(&mut self) -> ConversationDocument {
@@ -394,11 +411,21 @@ impl ActiveSession {
                     )
                     .map(Box::new)
                 });
+                let diagnostic = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|active| active.startup_diagnostic.clone());
                 let _ = pump.unbounded_send(PumpMessage::ToolRestartFinished {
                     generation,
                     preset,
                     result,
                 });
+                if let Some(message) = diagnostic {
+                    let _ = pump.unbounded_send(PumpMessage::Diagnostic {
+                        generation,
+                        message,
+                    });
+                }
             })
             .expect("failed to spawn tool restart thread");
     }
@@ -512,6 +539,41 @@ const fn slash_source_order(source: pi_rpc::SlashCommandSource) -> u8 {
         pi_rpc::SlashCommandSource::Prompt => 1,
         pi_rpc::SlashCommandSource::Skill => 2,
     }
+}
+
+fn active_session_config(
+    binary: PathBuf,
+    session_path: PathBuf,
+    cwd: PathBuf,
+    tool_preset: ToolPreset,
+) -> (ClientConfig, Option<String>) {
+    active_session_config_with_materializer(binary, session_path, cwd, tool_preset, || {
+        pi_rpc::materialize_host_extension()
+    })
+}
+
+fn active_session_config_with_materializer(
+    binary: PathBuf,
+    session_path: PathBuf,
+    cwd: PathBuf,
+    tool_preset: ToolPreset,
+    materialize: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> (ClientConfig, Option<String>) {
+    let mut config = ClientConfig::new(binary);
+    config.current_dir = Some(cwd);
+    config.initial_session = Some(session_path);
+    config.args = vec!["--no-context-files".into()];
+    let diagnostic = match materialize() {
+        Ok(host_extension) => {
+            config
+                .args
+                .extend(["-e".into(), host_extension.into_os_string()]);
+            None
+        }
+        Err(error) => Some(format!("项目命令环境扩展未加载：{error}")),
+    };
+    tool_preset.append_args(&mut config.args);
+    (config, diagnostic)
 }
 
 pub fn official_binary() -> PathBuf {
@@ -795,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_presets_generate_explicit_allowlists() {
+    fn active_session_config_always_loads_host_extension_without_changing_tool_presets() {
         let expected = [
             (ToolPreset::Inherit, None),
             (ToolPreset::None, Some("")),
@@ -804,15 +866,53 @@ mod tests {
             (ToolPreset::Full, Some("bash,read,edit,write,grep,find,ls")),
         ];
         for (preset, allowlist) in expected {
-            let mut args = Vec::new();
-            preset.append_args(&mut args);
+            let (config, diagnostic) = active_session_config(
+                PathBuf::from("pi.exe"),
+                PathBuf::from("session.jsonl"),
+                PathBuf::from("project"),
+                preset,
+            );
+            assert!(diagnostic.is_none());
+            assert_eq!(config.args[0], "--no-context-files");
+            assert_eq!(config.args[1], "-e");
+            let extension_path = Path::new(&config.args[2]);
+            assert!(extension_path.is_file());
+            assert_eq!(
+                extension_path.file_name().and_then(|name| name.to_str()),
+                Some("project-command-environment.ts")
+            );
             match allowlist {
-                Some(allowlist) => {
-                    assert_eq!(args, ["--tools", allowlist].map(std::ffi::OsString::from));
-                }
-                None => assert!(args.is_empty()),
+                Some(allowlist) => assert_eq!(
+                    &config.args[3..],
+                    &["--tools", allowlist].map(std::ffi::OsString::from)
+                ),
+                None => assert_eq!(config.args.len(), 3),
             }
         }
+    }
+
+    #[test]
+    fn active_session_config_degrades_without_extension_and_reports_diagnostic() {
+        let (config, diagnostic) = active_session_config_with_materializer(
+            PathBuf::from("pi.exe"),
+            PathBuf::from("session.jsonl"),
+            PathBuf::from("project"),
+            ToolPreset::ReadOnly,
+            || {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+            },
+        );
+        assert_eq!(
+            config.args,
+            ["--no-context-files", "--tools", "read,grep,find,ls"].map(std::ffi::OsString::from)
+        );
+        assert_eq!(
+            diagnostic.as_deref(),
+            Some("项目命令环境扩展未加载：denied")
+        );
     }
 
     #[test]
