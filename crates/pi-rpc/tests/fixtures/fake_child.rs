@@ -18,9 +18,9 @@ fn main() {
     if session_file.is_none() {
         session_file = env::var_os("PI_RPC_FAKE_SESSION").map(PathBuf::from);
     }
-    let session_file =
+    let mut session_file =
         session_file.unwrap_or_else(|| env::temp_dir().join("pi-rpc-fake-session.jsonl"));
-    let session_id = session_file
+    let mut session_id = session_file
         .file_stem()
         .and_then(|name| name.to_str())
         .unwrap_or("fake-session")
@@ -53,6 +53,13 @@ fn main() {
     ]);
     let mut current_model = available_models[0].clone();
     let mut thinking_level = "off".to_owned();
+    let mut auto_compaction = true;
+    let mut leaf_id = Some("assistant-leaf".to_owned());
+    let mut get_state_failures = env::var("PI_RPC_FAKE_GET_STATE_FAILURES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let command_log = env::var_os("PI_RPC_FAKE_COMMAND_LOG").map(PathBuf::from);
     let tool_allowlist = env::args_os()
         .collect::<Vec<_>>()
         .windows(2)
@@ -70,6 +77,11 @@ fn main() {
         let value: Value = serde_json::from_str(&line).unwrap();
         let id = value.get("id").cloned().unwrap_or(Value::Null);
         let command = value["type"].as_str().unwrap();
+        if let Some(path) = command_log.as_ref() {
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).append(true);
+            writeln!(options.open(path).unwrap(), "{command}").unwrap();
+        }
         if command == "prompt" {
             let message = value["message"].as_str().unwrap_or_default();
             if message == "stream" {
@@ -164,6 +176,10 @@ fn main() {
             writeln!(stdout, "{}", json!({"type":"agent_start"})).unwrap();
         }
         let response = match command {
+            "get_state" if get_state_failures > 0 => {
+                get_state_failures -= 1;
+                json!({"id":id,"type":"response","command":"get_state","success":false,"error":"injected get_state failure"})
+            }
             "get_state" => json!({
                 "id": id,
                 "type": "response",
@@ -179,7 +195,7 @@ fn main() {
                     "followUpMode": "all",
                     "sessionFile": (!ephemeral).then_some(&session_file),
                     "sessionId": session_id,
-                    "autoCompactionEnabled": true,
+                    "autoCompactionEnabled": auto_compaction,
                     "messageCount": 0,
                     "pendingMessageCount": 0
                 }
@@ -223,6 +239,59 @@ fn main() {
             "set_thinking_level" => {
                 thinking_level = value["level"].as_str().unwrap_or("off").to_owned();
                 json!({"id":id,"type":"response","command":"set_thinking_level","success":true})
+            }
+            "set_auto_compaction" => {
+                auto_compaction = value["enabled"].as_bool().unwrap_or(true);
+                json!({"id":id,"type":"response","command":command,"success":true})
+            }
+            "set_auto_retry" => {
+                let enabled = value["enabled"].as_bool().unwrap_or(true);
+                json!({"id":id,"type":"response","command":command,"success":true,"data":{"enabled":enabled}})
+            }
+            "abort_retry" => json!({"id":id,"type":"response","command":command,"success":true}),
+            "get_tree" => json!({
+                "id":id,"type":"response","command":command,"success":true,
+                "data":{"tree":[{"entry":{"type":"message","id":"user-root","parentId":null,"timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"fork me"}},"children":[{"entry":{"type":"message","id":"assistant-leaf","parentId":"user-root","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":"answer"}},"children":[]}]}],"leafId":leaf_id}
+            }),
+            "get_fork_messages" => {
+                json!({"id":id,"type":"response","command":command,"success":true,"data":{"messages":[{"entryId":"user-root","text":"fork me"}]}})
+            }
+            "switch_session" => {
+                session_file = PathBuf::from(value["sessionPath"].as_str().unwrap());
+                session_id = session_file
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("switched")
+                    .to_owned();
+                leaf_id = Some("assistant-leaf".to_owned());
+                json!({"id":id,"type":"response","command":command,"success":true,"data":{"cancelled":false}})
+            }
+            "fork" => {
+                let source = value["entryId"].as_str().unwrap_or("user-root");
+                session_file = session_file.with_file_name("forked-session.jsonl");
+                session_id = "forked-session".to_owned();
+                leaf_id = Some(source.to_owned());
+                json!({"id":id,"type":"response","command":command,"success":true,"data":{"text":"fork me","cancelled":false}})
+            }
+            "clone" => {
+                session_file = session_file.with_file_name("cloned-session.jsonl");
+                session_id = "cloned-session".to_owned();
+                json!({"id":id,"type":"response","command":command,"success":true,"data":{"cancelled":false}})
+            }
+            "compact" => {
+                writeln!(
+                    stdout,
+                    "{}",
+                    json!({"type":"compaction_start","reason":"manual"})
+                )
+                .unwrap();
+                writeln!(stdout, "{}", json!({"type":"compaction_end","reason":"manual","result":{"summary":"compact fixture","firstKeptEntryId":"user-root","tokensBefore":10,"estimatedTokensAfter":3},"aborted":false,"willRetry":false})).unwrap();
+                json!({"id":id,"type":"response","command":command,"success":true,"data":{"summary":"compact fixture","firstKeptEntryId":"user-root","tokensBefore":10,"estimatedTokensAfter":3}})
+            }
+            "export_html" => {
+                let path = PathBuf::from(value["outputPath"].as_str().unwrap());
+                std::fs::write(&path, "<!doctype html><title>fixture</title>").unwrap();
+                json!({"id":id,"type":"response","command":command,"success":true,"data":{"path":path}})
             }
             "get_commands" => json!({
                 "id":id,

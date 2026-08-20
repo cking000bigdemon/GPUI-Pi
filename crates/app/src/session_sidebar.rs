@@ -24,6 +24,7 @@ use pi_data::{
     export_session_jsonl, list_sessions, rename_session,
 };
 
+use crate::live_session::export_historical_html;
 use crate::panels::LayoutProbe;
 use crate::trust_prompt::prompt_project_trust;
 
@@ -146,7 +147,7 @@ impl SessionSidebar {
         self
     }
 
-    fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.load_generation = self.load_generation.wrapping_add(1);
         let generation = self.load_generation;
         self.status = SidebarStatus::Loading;
@@ -599,6 +600,69 @@ impl SessionSidebar {
         });
     }
 
+    fn export_session_html(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.busy_actions.insert(id.clone()) {
+            return;
+        }
+        let Some(summary) = self.summaries.iter().find(|item| item.id == id).cloned() else {
+            self.busy_actions.remove(&id);
+            return;
+        };
+        let start = if summary.cwd.is_dir() {
+            summary.cwd.clone()
+        } else {
+            PathBuf::from(".")
+        };
+        let file_name = format!("pi-session-{}.html", summary.id);
+        let receiver = cx.prompt_for_new_path(&start, Some(&file_name));
+        let executor = cx.background_executor().clone();
+        cx.notify();
+        cx.spawn_in(window, async move |sidebar, cx| {
+            let destination = receiver.await.ok().into_iter().flatten().flatten().next();
+            let result = if let Some(destination) = destination {
+                Some(
+                    executor
+                        .spawn(async move {
+                            export_historical_html(summary.path.clone(), destination)
+                        })
+                        .await,
+                )
+            } else {
+                None
+            };
+            let _ = cx.update(|window, cx| {
+                let _ = sidebar.update(cx, |sidebar, cx| {
+                    sidebar.busy_actions.remove(&id);
+                    match result {
+                        Some(Ok(export)) => {
+                            if let Some(warning) = export.cleanup_warning {
+                                window.push_notification(
+                                    Notification::warning(format!(
+                                        "会话 HTML 已导出到 {}，但导出进程清理失败：{warning}",
+                                        export.path.display()
+                                    )),
+                                    cx,
+                                );
+                            } else {
+                                window.push_notification(
+                                    Notification::success("会话 HTML 已导出"),
+                                    cx,
+                                );
+                            }
+                        }
+                        Some(Err(error)) => window.push_notification(
+                            Notification::error(format!("HTML 导出失败：{error}")),
+                            cx,
+                        ),
+                        None => {}
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
     fn export_session(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         if !self.busy_actions.insert(id.clone()) {
             return;
@@ -658,6 +722,7 @@ impl SessionSidebar {
         let rename_id = id.clone();
         let delete_id = id.clone();
         let export_id = id.clone();
+        let export_html_id = id.clone();
         let selected = self.selected_id.as_deref() == Some(&node.id);
         let busy = self.busy_actions.contains(&node.id);
         // 规范 S-8：一行不堆超过 3 个片段，所以元信息拆两行，分支名进 tooltip。
@@ -762,6 +827,23 @@ impl SessionSidebar {
                                                     move |this, _, window, cx| {
                                                         this.start_rename(
                                                             rename_id.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new(format!("export-html-{}", node.id))
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(IconName::File)
+                                                .tooltip("导出 HTML")
+                                                .disabled(busy)
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.export_session_html(
+                                                            export_html_id.clone(),
                                                             window,
                                                             cx,
                                                         )

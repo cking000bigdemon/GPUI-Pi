@@ -24,6 +24,9 @@ use crate::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+const REBIND_CALIBRATION_ATTEMPTS: usize = 3;
+const REBIND_CALIBRATION_TIMEOUT: Duration = Duration::from_secs(2);
+const REBIND_CALIBRATION_DELAY: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -111,6 +114,14 @@ pub enum ClientError {
     Supervisor(String),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionRebindOutcome<T> {
+    /// 非幂等主命令已经成功返回的数据；校准失败不得遮蔽它。
+    pub data: T,
+    /// `None` 表示命令被用户取消且没有切换会话；`Err` 表示主命令成功但元数据校准失败。
+    pub calibration: Option<Result<RpcSessionState, ClientError>>,
+}
+
 struct PendingRequest {
     tx: Sender<Result<RpcResponse, ClientError>>,
 }
@@ -194,6 +205,64 @@ impl Client {
     }
 
     pub fn request(&self, command: Command, timeout: Duration) -> Result<RpcResponse, ClientError> {
+        let resume_hint = rebind_resume_hint(&command);
+        let rebinds_session = is_session_rebind(&command);
+        let response = self.request_once(command, timeout)?;
+        if response.success && rebinds_session && !response_cancelled(&response) {
+            self.prepare_resume_target(resume_hint);
+            if let Err(error) = self.calibrate_resume_session() {
+                broadcast(
+                    &self.shared,
+                    ClientEvent::Lifecycle(LifecycleEvent::Stderr {
+                        line: format!(
+                            "session command succeeded but resume metadata calibration failed: {error}"
+                        ),
+                    }),
+                );
+            }
+        }
+        Ok(response)
+    }
+
+    /// 发送一次非幂等会话切换命令，并把后续校准结果与主结果分开返回。
+    ///
+    /// 调用方看到 `Ok` 即可确认主命令只发送了一次且已经成功；`calibration=Err`
+    /// 只能作为“成功但元数据未知”处理，禁止把主命令自动重试。
+    pub fn request_session_rebind_data<T: for<'de> serde::Deserialize<'de>>(
+        &self,
+        command: Command,
+        timeout: Duration,
+    ) -> Result<SessionRebindOutcome<T>, ClientError> {
+        debug_assert!(is_session_rebind(&command));
+        let resume_hint = rebind_resume_hint(&command);
+        let response = self.request_once(command, timeout)?;
+        if !response.success {
+            return Err(ClientError::Rpc {
+                command: response.command,
+                message: response.error.unwrap_or_else(|| "unknown RPC error".into()),
+            });
+        }
+        let cancelled = response_cancelled(&response);
+        if !cancelled {
+            // 即使主结果 data 意外无法解码，也先撤销旧恢复目标，避免成功切换后崩溃回旧会话。
+            self.prepare_resume_target(resume_hint);
+        }
+        let data = response
+            .decode_data()
+            .map_err(|error| ClientError::Decode(error.to_string()))?;
+        let calibration = if cancelled {
+            None
+        } else {
+            Some(self.calibrate_resume_session())
+        };
+        Ok(SessionRebindOutcome { data, calibration })
+    }
+
+    fn request_once(
+        &self,
+        command: Command,
+        timeout: Duration,
+    ) -> Result<RpcResponse, ClientError> {
         if self.shared.shutdown.load(Ordering::Acquire) {
             return Err(ClientError::NotRunning);
         }
@@ -216,13 +285,48 @@ impl Client {
             return Err(error);
         }
         match rx.recv_timeout(timeout) {
-            Ok(result) => result,
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) => Err(error),
             Err(RecvTimeoutError::Timeout) => {
                 self.shared.pending.lock().unwrap().remove(&id);
                 Err(ClientError::Timeout { id })
             }
             Err(RecvTimeoutError::Disconnected) => Err(ClientError::ProcessExited { id }),
         }
+    }
+
+    fn prepare_resume_target(&self, resume_hint: Option<PathBuf>) {
+        // switch 可立即使用调用方给出的路径；fork/clone/new_session 的目标未知时先清空，
+        // 宁可恢复成新会话，也不能在校准窗口内崩溃后静默回到旧会话。
+        self.set_resume_session(resume_hint);
+    }
+
+    fn calibrate_resume_session(&self) -> Result<RpcSessionState, ClientError> {
+        let mut last_error = None;
+        for attempt in 0..REBIND_CALIBRATION_ATTEMPTS {
+            match self.request_once(Command::GetState, REBIND_CALIBRATION_TIMEOUT) {
+                Ok(response) if response.success => {
+                    let state = response
+                        .decode_data::<RpcSessionState>()
+                        .map_err(|error| ClientError::Decode(error.to_string()))?;
+                    self.set_resume_session(state.session_file.clone().map(PathBuf::from));
+                    return Ok(state);
+                }
+                Ok(response) => {
+                    last_error = Some(ClientError::Rpc {
+                        command: response.command,
+                        message: response.error.unwrap_or_else(|| "unknown RPC error".into()),
+                    });
+                }
+                Err(error) => last_error = Some(error),
+            }
+            if attempt + 1 < REBIND_CALIBRATION_ATTEMPTS {
+                thread::sleep(REBIND_CALIBRATION_DELAY);
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            ClientError::Supervisor("session metadata calibration exhausted".into())
+        }))
     }
 
     pub fn request_data<T: for<'de> serde::Deserialize<'de>>(
@@ -274,6 +378,32 @@ impl Drop for Client {
             let _ = self.shutdown();
         }
     }
+}
+
+fn is_session_rebind(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::NewSession { .. }
+            | Command::SwitchSession { .. }
+            | Command::Fork { .. }
+            | Command::Clone
+    )
+}
+
+fn rebind_resume_hint(command: &Command) -> Option<PathBuf> {
+    match command {
+        Command::SwitchSession { session_path } => Some(PathBuf::from(session_path)),
+        _ => None,
+    }
+}
+
+fn response_cancelled(response: &RpcResponse) -> bool {
+    response
+        .data
+        .as_ref()
+        .and_then(|data| data.get("cancelled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn write_json<T: serde::Serialize>(shared: &Shared, value: &T) -> Result<(), ClientError> {

@@ -3,6 +3,7 @@
 //! 上游会话是可追加且可扩展的。这里对稳定 envelope 强类型，对消息正文和未知
 //! entry 保留原始 JSON，避免上游新增字段时让历史会话整体不可读。
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -118,6 +119,21 @@ pub enum SessionEntry {
 }
 
 impl SessionEntry {
+    pub fn base(&self) -> &EntryBase {
+        match self {
+            Self::Message { base, .. }
+            | Self::ModelChange { base, .. }
+            | Self::ThinkingLevelChange { base, .. }
+            | Self::Compaction { base, .. }
+            | Self::BranchSummary { base, .. }
+            | Self::Custom { base, .. }
+            | Self::CustomMessage { base, .. }
+            | Self::Label { base, .. }
+            | Self::SessionInfo { base, .. }
+            | Self::Unknown { base, .. } => base,
+        }
+    }
+
     pub fn entry_type(&self) -> &str {
         match self {
             Self::Message { .. } => "message",
@@ -155,6 +171,258 @@ pub struct SessionFile {
     pub header: SessionHeader,
     pub entries: Vec<SessionEntry>,
     pub diagnostics: Vec<SessionDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBranchNode {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub children: Vec<String>,
+    pub depth: usize,
+    pub entry_type: String,
+    pub preview: String,
+    pub role: Option<String>,
+    pub label: Option<String>,
+    pub forkable_user_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionBranchTree {
+    /// 按稳定的深度优先顺序展开，UI 无需递归即可渲染深树。
+    pub nodes: Vec<SessionBranchNode>,
+    pub active_leaf_id: Option<String>,
+    pub active_path: HashSet<String>,
+    pub diagnostics: Vec<String>,
+}
+
+impl SessionFile {
+    /// 构建只读分支投影。损坏 parentId、重复 id、自环与环都只产生诊断，绝不递归。
+    pub fn branch_tree(&self) -> SessionBranchTree {
+        self.branch_tree_at_leaf(None)
+    }
+
+    /// RPC `get_tree.leafId` 是活会话的权威 leaf；缺失或无效时才回退到 JSONL 末项。
+    pub fn branch_tree_at_leaf(&self, authoritative_leaf_id: Option<&str>) -> SessionBranchTree {
+        let mut diagnostics = Vec::new();
+        let mut by_id = HashMap::<String, usize>::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            let Some(id) = entry.base().id.as_ref() else {
+                continue;
+            };
+            if by_id.insert(id.clone(), index).is_some() {
+                diagnostics.push(format!("重复 entry id {id}；使用最后一条"));
+            }
+        }
+        let fallback_leaf_id = self
+            .entries
+            .iter()
+            .rev()
+            .find_map(|entry| entry.base().id.clone());
+        let active_leaf_id = authoritative_leaf_id
+            .filter(|leaf_id| by_id.contains_key(*leaf_id))
+            .map(str::to_owned)
+            .or_else(|| {
+                if let Some(leaf_id) = authoritative_leaf_id {
+                    diagnostics.push(format!(
+                        "RPC 权威 leafId {leaf_id} 不在本地 JSONL；回退到末项"
+                    ));
+                }
+                fallback_leaf_id
+            });
+        let active_path = branch_path_ids(
+            &self.entries,
+            &by_id,
+            active_leaf_id.as_deref(),
+            &mut diagnostics,
+        );
+
+        let mut children = HashMap::<String, Vec<String>>::new();
+        let mut roots = Vec::new();
+        for entry in &self.entries {
+            let Some(id) = entry.base().id.as_ref() else {
+                continue;
+            };
+            match entry.base().parent_id.as_ref() {
+                Some(parent) if parent != id && by_id.contains_key(parent) => {
+                    children.entry(parent.clone()).or_default().push(id.clone());
+                }
+                Some(parent) if parent == id => {
+                    diagnostics.push(format!("entry {id} 自己指向自己；按 root 展示"));
+                    roots.push(id.clone());
+                }
+                Some(parent) => {
+                    diagnostics.push(format!("entry {id} 找不到 parentId {parent}；按 root 展示"));
+                    roots.push(id.clone());
+                }
+                None => roots.push(id.clone()),
+            }
+        }
+
+        let mut labels = HashMap::<String, String>::new();
+        for entry in &self.entries {
+            if let SessionEntry::Label {
+                target_id: Some(target),
+                label: Some(label),
+                ..
+            } = entry
+            {
+                labels.insert(target.clone(), normalize_preview(label, 80));
+            }
+        }
+
+        let mut ordered = Vec::new();
+        let mut visited = HashSet::new();
+        let mut stack = roots
+            .iter()
+            .rev()
+            .map(|id| (id.clone(), 0_usize))
+            .collect::<Vec<_>>();
+        // 没有 root 通常意味着环；仍须把所有条目作为安全的顶层候选展示。
+        for id in by_id.keys() {
+            if !roots.contains(id) {
+                stack.push((id.clone(), 0));
+            }
+        }
+        while let Some((id, depth)) = stack.pop() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            let Some(index) = by_id.get(&id).copied() else {
+                continue;
+            };
+            let entry = &self.entries[index];
+            let child_ids = children.get(&id).cloned().unwrap_or_default();
+            for child in child_ids.iter().rev() {
+                stack.push((child.clone(), depth.saturating_add(1)));
+            }
+            let (preview, role, forkable_user_message) = entry_preview(entry);
+            ordered.push(SessionBranchNode {
+                id: id.clone(),
+                parent_id: entry.base().parent_id.clone(),
+                children: child_ids,
+                depth,
+                entry_type: entry.entry_type().to_owned(),
+                preview,
+                role,
+                label: labels.get(&id).cloned(),
+                forkable_user_message,
+            });
+        }
+        if visited.len() != by_id.len() {
+            diagnostics.push("部分环形条目无法从 root 到达；已作为顶层安全展示".to_owned());
+        }
+        SessionBranchTree {
+            nodes: ordered,
+            active_leaf_id,
+            active_path,
+            diagnostics,
+        }
+    }
+
+    /// 返回目标 leaf 的只读路径副本；原 JSONL 与当前 leaf 均不修改。
+    pub fn project_to_leaf(&self, leaf_id: &str) -> Option<Self> {
+        let by_id = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.base().id.as_ref().map(|id| (id.clone(), index)))
+            .collect::<HashMap<_, _>>();
+        let mut diagnostics = Vec::new();
+        let path = branch_path_indexes(&self.entries, &by_id, Some(leaf_id), &mut diagnostics)?;
+        let entries = path
+            .into_iter()
+            .map(|index| self.entries[index].clone())
+            .collect();
+        let mut projected = self.clone();
+        projected.entries = entries;
+        projected.diagnostics.extend(
+            diagnostics
+                .into_iter()
+                .map(|message| SessionDiagnostic { line: 0, message }),
+        );
+        Some(projected)
+    }
+}
+
+fn branch_path_ids(
+    entries: &[SessionEntry],
+    by_id: &HashMap<String, usize>,
+    leaf_id: Option<&str>,
+    diagnostics: &mut Vec<String>,
+) -> HashSet<String> {
+    branch_path_indexes(entries, by_id, leaf_id, diagnostics)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|index| entries[index].base().id.clone())
+        .collect()
+}
+
+fn branch_path_indexes(
+    entries: &[SessionEntry],
+    by_id: &HashMap<String, usize>,
+    leaf_id: Option<&str>,
+    diagnostics: &mut Vec<String>,
+) -> Option<Vec<usize>> {
+    let leaf_id = leaf_id?;
+    let mut index = *by_id.get(leaf_id)?;
+    let mut path = Vec::new();
+    let mut visited = HashSet::new();
+    loop {
+        let entry = &entries[index];
+        let id = entry.base().id.as_ref()?;
+        if !visited.insert(id.clone()) {
+            diagnostics.push(format!("parentId 在 {id} 形成循环；目标分支不可投影"));
+            return None;
+        }
+        path.push(index);
+        let Some(parent_id) = entry.base().parent_id.as_ref() else {
+            break;
+        };
+        let Some(parent) = by_id.get(parent_id).copied() else {
+            diagnostics.push(format!(
+                "目标分支 {id} 找不到 parentId {parent_id}；保留可达路径"
+            ));
+            break;
+        };
+        index = parent;
+    }
+    path.reverse();
+    Some(path)
+}
+
+fn entry_preview(entry: &SessionEntry) -> (String, Option<String>, Option<String>) {
+    if let SessionEntry::Message { message, .. } = entry {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let text = message_text(message).unwrap_or_default();
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let forkable =
+            (role.as_deref() == Some("user") && !normalized.is_empty()).then(|| normalized.clone());
+        let fallback = role.as_deref().map_or("message", |role| role);
+        return (
+            if text.trim().is_empty() {
+                format!("[{fallback}]")
+            } else {
+                normalize_preview(&text, 80)
+            },
+            role,
+            forkable,
+        );
+    }
+    (entry.entry_type().replace('_', " "), None, None)
+}
+
+fn normalize_preview(value: &str, limit: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let preview = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -731,6 +999,86 @@ mod tests {
         assert_eq!(metrics.cumulative_tokens, 164);
         assert!((metrics.cumulative_cost - 1.0).abs() < f64::EPSILON);
         assert_eq!(metrics.recent_context_tokens, Some(99));
+    }
+
+    #[test]
+    fn branch_tree_projects_active_path_labels_previews_and_forkable_users() {
+        let session = parse(concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n",
+            "{\"type\":\"message\",\"id\":\"root\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"  root   prompt  \"}}\n",
+            "{\"type\":\"message\",\"id\":\"old\",\"parentId\":\"root\",\"message\":{\"role\":\"assistant\",\"content\":\"old branch\"}}\n",
+            "{\"type\":\"message\",\"id\":\"new\",\"parentId\":\"root\",\"message\":{\"role\":\"assistant\",\"content\":\"new branch\"}}\n",
+            "{\"type\":\"label\",\"id\":\"label\",\"parentId\":\"new\",\"targetId\":\"new\",\"label\":\"Chosen branch\"}\n"
+        ));
+        let tree = session.branch_tree();
+        assert_eq!(tree.active_leaf_id.as_deref(), Some("label"));
+        assert!(tree.active_path.contains("root"));
+        assert!(tree.active_path.contains("new"));
+        assert!(!tree.active_path.contains("old"));
+        let root = tree.nodes.iter().find(|node| node.id == "root").unwrap();
+        assert_eq!(root.children, ["old", "new"]);
+        assert_eq!(root.preview, "root prompt");
+        assert_eq!(root.forkable_user_message.as_deref(), Some("root prompt"));
+        let selected = tree.nodes.iter().find(|node| node.id == "new").unwrap();
+        assert_eq!(selected.label.as_deref(), Some("Chosen branch"));
+    }
+
+    #[test]
+    fn rpc_leaf_overrides_append_last_active_path() {
+        let session = parse(concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n",
+            "{\"type\":\"message\",\"id\":\"root\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"root\"}}\n",
+            "{\"type\":\"message\",\"id\":\"authoritative\",\"parentId\":\"root\",\"message\":{\"role\":\"assistant\",\"content\":\"active\"}}\n",
+            "{\"type\":\"message\",\"id\":\"appended-sibling\",\"parentId\":\"root\",\"message\":{\"role\":\"assistant\",\"content\":\"later on disk\"}}\n"
+        ));
+        assert_eq!(
+            session.branch_tree().active_leaf_id.as_deref(),
+            Some("appended-sibling")
+        );
+        let tree = session.branch_tree_at_leaf(Some("authoritative"));
+        assert_eq!(tree.active_leaf_id.as_deref(), Some("authoritative"));
+        assert!(tree.active_path.contains("authoritative"));
+        assert!(!tree.active_path.contains("appended-sibling"));
+    }
+
+    #[test]
+    fn projection_is_read_only_and_rejects_cycles_without_recursing() {
+        let session = parse(concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n",
+            "{\"type\":\"message\",\"id\":\"root\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"root\"}}\n",
+            "{\"type\":\"message\",\"id\":\"left\",\"parentId\":\"root\",\"message\":{\"role\":\"assistant\",\"content\":\"left\"}}\n",
+            "{\"type\":\"message\",\"id\":\"right\",\"parentId\":\"root\",\"message\":{\"role\":\"assistant\",\"content\":\"right\"}}\n",
+            "{\"type\":\"future\",\"id\":\"orphan\",\"parentId\":\"missing\"}\n",
+            "{\"type\":\"future\",\"id\":\"cycle-a\",\"parentId\":\"cycle-b\"}\n",
+            "{\"type\":\"future\",\"id\":\"cycle-b\",\"parentId\":\"cycle-a\"}\n"
+        ));
+        let projected = session.project_to_leaf("left").unwrap();
+        assert_eq!(projected.entries.len(), 2);
+        assert_eq!(projected.entries[1].base().id.as_deref(), Some("left"));
+        assert_eq!(session.entries.len(), 6, "源会话不可修改");
+        assert!(session.project_to_leaf("cycle-a").is_none());
+        let tree = session.branch_tree();
+        assert_eq!(tree.nodes.len(), 6);
+        assert!(tree.diagnostics.iter().any(|line| line.contains("missing")));
+    }
+
+    #[test]
+    fn deep_linear_tree_is_iterative() {
+        let mut text = "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n".to_owned();
+        for index in 0..10_000 {
+            let parent = if index == 0 {
+                "null".to_owned()
+            } else {
+                format!("\"n{}\"", index - 1)
+            };
+            text.push_str(&format!(
+                "{{\"type\":\"future\",\"id\":\"n{index}\",\"parentId\":{parent}}}\n"
+            ));
+        }
+        let session = parse(&text);
+        let tree = session.branch_tree();
+        assert_eq!(tree.nodes.len(), 10_000);
+        assert_eq!(tree.active_path.len(), 10_000);
     }
 
     #[test]

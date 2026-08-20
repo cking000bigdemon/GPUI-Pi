@@ -100,6 +100,17 @@ pub fn write_settings(agent_dir: impl AsRef<Path>, value: &Value) -> Result<(), 
     write_json_atomic(settings_path(agent_dir), value)
 }
 
+/// RPC 0.84.2 的 get_state 不返回 auto-retry；这里只读共享设置作为初值，
+/// 后续修改仍交给官方 set_auto_retry 原子持久化。
+pub fn read_auto_retry_enabled(agent_dir: impl AsRef<Path>) -> Result<bool, ConfigError> {
+    let settings = read_settings(agent_dir)?;
+    Ok(settings
+        .get("retry")
+        .and_then(|retry| retry.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true))
+}
+
 pub fn read_trust(agent_dir: impl AsRef<Path>) -> Result<Value, ConfigError> {
     read_json(trust_path(agent_dir))
 }
@@ -147,6 +158,14 @@ mod tests {
         write_json_atomic(&path, &value).unwrap();
         assert_eq!(read_json(&path).unwrap(), value);
         assert_eq!(dir.path().read_dir().unwrap().count(), 1);
+    }
+
+    #[test]
+    fn auto_retry_defaults_true_and_reads_explicit_setting() {
+        let dir = tempdir().unwrap();
+        assert!(read_auto_retry_enabled(dir.path()).unwrap());
+        write_settings(dir.path(), &json!({"retry": {"enabled": false}})).unwrap();
+        assert!(!read_auto_retry_enabled(dir.path()).unwrap());
     }
 
     #[test]
