@@ -63,7 +63,7 @@
 
 ## 视觉审查
 
-- 代码审查结论：APPROVE（最终独立 Claude Code review，findings=0；session id `d7a84502-a73c-4c12-8afb-80bb58c92e0c`）
+- 代码审查结论：APPROVE（rebase 到最新 `main` 后的最终集成增量复审，findings=0；session id `1acdd687-b21c-44d5-9452-1d1d3c9fadc0`；此前完整独立审查 session id `d7a84502-a73c-4c12-8afb-80bb58c92e0c`）
 - 视觉审查模式：SCREENSHOT
 - 视觉审查结论：PASS
 - 截图验证：已提供 5 张（SCREENSHOT_PROVIDED）；用户明确“就这5张，够了”
@@ -72,18 +72,18 @@
 - `deadline`：`2026-08-20T14:38:13.1068366+08:00`
 - 证据消息：entryId `1c5a7105`，messageTimestamp `2026-08-20T14:17:28.505+08:00`，截止前回传
 - 证据 manifest：`D:/variFlight_work/GPUI-Pi-round-16/.pi/visual-review/round-16/evidence/manifest-64c6924f394d28e7.json`；`actualImageCount=expectedImageCount=5`
-- 审查报告：`D:/variFlight_work/GPUI-Pi-round-16/.pi/visual-review/round-16/visual-review-final.md`
+- 审查报告：`D:/variFlight_work/GPUI-Pi-round-16/.pi/visual-review/round-16/visual-review-final.md`；rebase 后 UI 增量复核：`D:/variFlight_work/GPUI-Pi-round-16/.pi/visual-review/round-16/visual-review-post-integration.md`（SCREENSHOT / PASS）
 - 已验证：宽屏浅色/深色主题、认证/未认证、API 类型 warning、Provider ID mismatch 禁用、登录指引与 success notification；无阻断视觉 findings。
-- 非阻断残余：未实拍 800×560 最小窗口和 JSONC 重写 warning 像素态；代码已有 800×560 GPUI 测试，不宣称这两项已完成截图验证。
+- 非阻断残余：未实拍 800×560 最小窗口、JSONC 重写 warning 像素态及 busy provider 行当前像素态；代码已有 800×560 GPUI 测试，rebase 后视觉增量复核确认 busy 行使用 muted/非 pointer/无 hover 语义且未改变 sheet 几何，不宣称上述三项已完成截图验证。
 
 ## 本轮实测
 
 - 数据层：`model_config` focused tests 18 项通过。`write_api_key` 改为字段级更新，保留既有 `env` 与未知字段，拒绝覆盖 OAuth/未知非 api_key 类型；`remove_api_key` 只移除 `key`，env/profile/ADC/AWS/未知字段仍保留，仅纯 `{type,key}` 才删除整条。auth summary 区分 env-only 配置与真正存在的可移除 key。其余 revision、未知 API、JSONC trivia、literal secret 与外部引用测试继续通过。
-- CLI / 网络：`model_service` focused tests 16 项通过。新增 `InvalidProviderId` / `InvalidArgument`，provider 白名单错误明确列出允许字符，内部 curl/header 参数校验不再误报服务响应格式；其余官方 literal secret、loopback HTTP、stdout/curl/chunked 测试继续通过。
+- CLI / 网络：`model_service` focused tests 20 项通过。rebase 后集成 review 修复：HTTPS curl stdin config 启用 `raw`，使 Transfer-Encoding header 与原始 chunked body 保持一致并由统一解析器限额解码；TCP Host 对非默认端口携带 `host:port` 且保留 IPv6 方括号；curl exit 28 映射 Timeout，35/58/59/60 映射不泄密 TLS 错误；stdout EOF 后继续在原 deadline/cancel 循环中 `try_wait`，超时/取消强杀进程树并 wait 收尸。既有 provider 参数、literal secret、loopback HTTP 与响应限额测试继续通过。
 - 登录：系统绝对路径 `cmd.exe` + `start /wait` 只启动官方 pi 交互 TUI，pi argv 不再包含 `/login` 或 provider prompt，避免 initial prompt 产生计费请求。面板常驻文案、启动前通知和返回通知均要求用户在终端内手动输入精确 `/login <provider>`；等待仍可取消且最长 15 分钟，退出后无论退出码均执行 `auth check --no-refresh` 校准。
-- UI / 状态：`model_config` focused tests 9 项通过。Discover/Test/Login/API Key 四类 provider-bound 操作统一复用 selected provider 与 Provider ID 输入一致性守卫；不一致时按钮禁用且直接调用在读取密钥、构造请求前失败，统一提示先保存。连通性只有 Reachable 使用 success，AuthenticationRequired / RateLimited / ServerError 使用 warning。env-only auth 不显示为可移除 Key，`remove_api_key Ok(false)` 使用中性提示并 refresh；unsupported API 文案继续区分未知原值与缺失值。
-- focused validation：`cargo test -p pi-data model_config -- --nocapture`（18 passed，exit 0）；`cargo test -p gpui-pi model_service -- --nocapture`（16 passed，exit 0）；`cargo test -p gpui-pi model_config -- --nocapture`（9 passed，exit 0）；`cargo clippy -p gpui-pi -p pi-data --all-targets -- -D warnings`（exit 0）；`cargo fmt --all -- --check` 与 `git diff --check`（exit 0）。
-- 全量 validation：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/validate.ps1` exit 0；pins、fmt、clippy、workspace tests（app 82 passed / 1 ignored；ui 24；pi-data 65 + integration；pi-render 19 + integration；pi-rpc 8 + client 12）与 release build 全绿，末行 `VALIDATE OK`。
+- UI / 状态：`model_config` focused tests 10 项通过。rebase 后集成 review 修复 provider 列表在任意 busy 操作期间拒绝用户切换，并使用 muted/非 pointer 视觉语义；内部首次选择与 refresh 仍可按原边界运行。测试验证 busy 时 selected provider、generation 与 busy 集合均不变。其余 provider-bound 一致性守卫、连通性通知级别、env-only auth 和 unsupported API 行为继续通过。
+- focused validation：`cargo test -p pi-data model_config -- --nocapture`（18 passed，exit 0）；`cargo test -p gpui-pi model_service -- --nocapture`（20 passed，exit 0）；`cargo test -p gpui-pi model_config -- --nocapture`（10 passed，exit 0）；`cargo clippy -p gpui-pi -p pi-data --all-targets -- -D warnings`（exit 0）；`cargo fmt --all -- --check` 与 `git diff --check`（exit 0）。
+- 全量 validation：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/validate.ps1` exit 0；pins、fmt、clippy、workspace tests（app 95 passed / 1 ignored；ui 26；pi-data 70 + integration；pi-render 19 + integration；pi-rpc 12 + client 15）与 release build 全绿，末行 `VALIDATE OK`。
 - 视觉 SCREENSHOT review：已完成并 PASS，5 张截图证据与审查报告见上方记录。
 - T3 用户路径：用户于 `2026-08-20` 确认 `cliproxy-dmit` 与 `deepseek` 两家真实 provider 的 API Key/OAuth 认证状态均正常；刷新/发现后可看到并选择真实模型，且已完成至少一次明确授权的真实连通性测试，结果 OK。未记录、展示或提交任何密钥/token 正文。
 - 收口状态：T1–T3、独立代码审查与 SCREENSHOT 视觉审查均通过；待创建 PR 并提交 GitHub CI。

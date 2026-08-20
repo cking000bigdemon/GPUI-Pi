@@ -72,6 +72,7 @@ pub enum ModelServiceError {
     UnsupportedScheme,
     InsecureRemoteHttp,
     Connect,
+    Tls,
     Timeout,
     Cancelled,
     ResponseTooLarge,
@@ -101,6 +102,7 @@ impl fmt::Display for ModelServiceError {
             Self::UnsupportedScheme => formatter.write_str("只允许访问 http(s) 模型端点"),
             Self::InsecureRemoteHttp => formatter.write_str("非 loopback 模型端点必须使用 HTTPS"),
             Self::Connect => formatter.write_str("连接模型服务失败"),
+            Self::Tls => formatter.write_str("模型服务 TLS 连接或证书校验失败"),
             Self::Timeout => formatter.write_str("模型服务请求超时"),
             Self::Cancelled => formatter.write_str("操作已取消"),
             Self::ResponseTooLarge => {
@@ -499,7 +501,7 @@ fn tcp_request(
     let mut request = format!(
         "{method} {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\nAccept: application/json\r\nContent-Length: {}\r\n",
         url.path,
-        url.host,
+        tcp_host_header(url),
         body.len()
     )
     .into_bytes();
@@ -547,6 +549,14 @@ fn tcp_request(
         }
     }
     parse_http_response(&response, response_limit)
+}
+
+fn tcp_host_header(url: &ParsedUrl) -> String {
+    if url.port == 80 {
+        url.host.clone()
+    } else {
+        format!("{}:{}", url.host, url.port)
+    }
 }
 
 fn write_with_deadline(
@@ -677,9 +687,17 @@ fn curl_request(
         ModelServiceError::ResponseTooLarge,
     )?;
     if !status.success() {
-        return Err(ModelServiceError::Connect);
+        return Err(curl_exit_error(status.code()));
     }
     parse_http_response(&output, response_limit)
+}
+
+fn curl_exit_error(code: Option<i32>) -> ModelServiceError {
+    match code {
+        Some(28) => ModelServiceError::Timeout,
+        Some(35 | 58 | 59 | 60) => ModelServiceError::Tls,
+        _ => ModelServiceError::Connect,
+    }
 }
 
 fn curl_command(
@@ -700,6 +718,8 @@ fn curl_command(
     push_curl_config(&mut config, "silent", None)?;
     push_curl_config(&mut config, "show-error", None)?;
     push_curl_config(&mut config, "include", None)?;
+    // --include 会保留 Transfer-Encoding；--raw 保证 body 也保持原始分块，由统一解析器限额解码。
+    push_curl_config(&mut config, "raw", None)?;
     push_curl_config(&mut config, "request", Some(method))?;
     push_curl_config(
         &mut config,
@@ -854,34 +874,29 @@ fn wait_for_child_output(
 ) -> Result<(ExitStatus, Vec<u8>), ModelServiceError> {
     let started = Instant::now();
     let mut exit_status = None;
+    let mut completed_output = None;
     loop {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
-            let _ = pi_rpc::kill_process_tree(child.id());
+            kill_and_reap(child);
             return Err(ModelServiceError::Cancelled);
         }
         if started.elapsed() >= timeout {
-            let _ = pi_rpc::kill_process_tree(child.id());
+            kill_and_reap(child);
             return Err(timeout_error);
         }
-        match receiver.try_recv() {
-            Ok(OutputRead::Complete(output)) => {
-                let status = match exit_status {
-                    Some(status) => status,
-                    None => child
-                        .wait()
-                        .map_err(|error| ModelServiceError::CliSpawn(error.to_string()))?,
-                };
-                return Ok((status, output));
+        if completed_output.is_none() {
+            match receiver.try_recv() {
+                Ok(OutputRead::Complete(output)) => completed_output = Some(output),
+                Ok(OutputRead::TooLarge) => {
+                    kill_and_reap(child);
+                    return Err(too_large_error);
+                }
+                Ok(OutputRead::Failed) => return Err(ModelServiceError::InvalidResponse),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(ModelServiceError::InvalidResponse);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
-            Ok(OutputRead::TooLarge) => {
-                let _ = pi_rpc::kill_process_tree(child.id());
-                return Err(too_large_error);
-            }
-            Ok(OutputRead::Failed) => return Err(ModelServiceError::InvalidResponse),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return Err(ModelServiceError::InvalidResponse);
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
         }
         if exit_status.is_none() {
             match child.try_wait() {
@@ -890,8 +905,18 @@ fn wait_for_child_output(
                 Err(error) => return Err(ModelServiceError::CliSpawn(error.to_string())),
             }
         }
+        if let Some(status) = exit_status
+            && let Some(output) = completed_output.take()
+        {
+            return Ok((status, output));
+        }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn kill_and_reap(child: &mut Child) {
+    let _ = pi_rpc::kill_process_tree(child.id());
+    let _ = child.wait();
 }
 
 #[cfg(windows)]
@@ -1309,6 +1334,27 @@ mod tests {
     }
 
     #[test]
+    fn curl_raw_mode_keeps_chunked_body_consistent_with_shared_parser() {
+        let url = ParsedUrl::parse("https://api.example.test/v1/models").unwrap();
+        let (_, config) = curl_command("GET", &url, &[], None, Duration::from_secs(3)).unwrap();
+        assert!(config.lines().any(|line| line == "raw"));
+
+        // curl 未使用 --raw 时会留下 chunked header，却交付已解码 JSON；共享解析器必须不接受该矛盾形态。
+        let decoded_curl_shape =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{\"data\":[]}";
+        assert!(matches!(
+            parse_http_response(decoded_curl_shape, 1024),
+            Err(ModelServiceError::InvalidResponse)
+        ));
+
+        let raw_body = b"B\r\n{\"data\":[]}\r\n0\r\n\r\n";
+        let mut raw_response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        raw_response.extend_from_slice(raw_body);
+        let parsed = parse_http_response(&raw_response, 1024).unwrap();
+        assert_eq!(parsed.body, br#"{"data":[]}"#);
+    }
+
+    #[test]
     fn curl_sensitive_headers_are_only_in_stdin_config() {
         let url = ParsedUrl::parse("https://api.example.test/v1/models").unwrap();
         let secret = "secret\\\"value";
@@ -1329,6 +1375,41 @@ mod tests {
     }
 
     #[test]
+    fn tcp_host_header_includes_only_non_default_port_and_preserves_ipv6_brackets() {
+        assert_eq!(
+            tcp_host_header(&ParsedUrl::parse("http://localhost:11434/v1").unwrap()),
+            "localhost:11434"
+        );
+        assert_eq!(
+            tcp_host_header(&ParsedUrl::parse("http://127.0.0.1/v1").unwrap()),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            tcp_host_header(&ParsedUrl::parse("http://[::1]:8080/v1").unwrap()),
+            "[::1]:8080"
+        );
+    }
+
+    #[test]
+    fn curl_exit_codes_map_without_response_or_secret_details() {
+        assert!(matches!(
+            curl_exit_error(Some(28)),
+            ModelServiceError::Timeout
+        ));
+        for code in [35, 58, 59, 60] {
+            let error = curl_exit_error(Some(code));
+            assert!(matches!(error, ModelServiceError::Tls));
+            assert_eq!(error.to_string(), "模型服务 TLS 连接或证书校验失败");
+        }
+        for code in [1, 6, 7, 22] {
+            assert!(matches!(
+                curl_exit_error(Some(code)),
+                ModelServiceError::Connect
+            ));
+        }
+    }
+
+    #[test]
     fn curl_config_rejects_newlines_and_nul() {
         let mut config = String::new();
         assert!(push_curl_config(&mut config, "header", Some("x: a\nb")).is_err());
@@ -1343,6 +1424,83 @@ mod tests {
         assert!(matches!(
             parse_http_response(response, 4),
             Err(ModelServiceError::ResponseTooLarge)
+        ));
+    }
+
+    #[test]
+    fn stdout_eof_does_not_disable_child_timeout_or_cancellation() {
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("close-stdout.ps1");
+        fs::write(
+            &script,
+            r#"$signature = @'
+using System;
+using System.Runtime.InteropServices;
+public static class StdoutCloser {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+}
+'@
+Add-Type -TypeDefinition $signature
+[Console]::Out.Flush()
+[StdoutCloser]::CloseHandle([StdoutCloser]::GetStdHandle(-11)) | Out-Null
+Start-Sleep -Seconds 10
+"#,
+        )
+        .unwrap();
+
+        let spawn = || {
+            let mut child = Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    script.to_str().unwrap(),
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let reader = spawn_bounded_stdout_reader(child.stdout.take().unwrap(), 1024);
+            (child, reader)
+        };
+
+        let (mut timed_child, timed_reader) = spawn();
+        let started = Instant::now();
+        assert!(matches!(
+            wait_for_child_output(
+                &mut timed_child,
+                timed_reader,
+                Duration::from_millis(500),
+                None,
+                ModelServiceError::CliTimeout,
+                ModelServiceError::CliOutputTooLarge,
+            ),
+            Err(ModelServiceError::CliTimeout)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let (mut cancelled_child, cancelled_reader) = spawn();
+        let cancel = CancellationToken::default();
+        let cancel_later = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(250));
+            cancel_later.cancel();
+        });
+        assert!(matches!(
+            wait_for_child_output(
+                &mut cancelled_child,
+                cancelled_reader,
+                Duration::from_secs(5),
+                Some(&cancel),
+                ModelServiceError::CliTimeout,
+                ModelServiceError::CliOutputTooLarge,
+            ),
+            Err(ModelServiceError::Cancelled)
         ));
     }
 

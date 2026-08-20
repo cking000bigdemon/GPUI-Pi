@@ -84,6 +84,10 @@ impl ModelConfigState {
         true
     }
 
+    fn can_select_provider(&self) -> bool {
+        self.busy.is_empty()
+    }
+
     fn select(&mut self, provider: String, preserve_refresh: bool) {
         self.selected_provider = Some(provider);
         self.error = None;
@@ -299,6 +303,9 @@ impl ModelConfigPanel {
     }
 
     fn select_provider(&mut self, provider: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.can_select_provider() {
+            return;
+        }
         self.select_provider_inner(provider, false, window, cx);
     }
 
@@ -884,9 +891,10 @@ impl Render for ModelConfigPanel {
                 .w_full()
                 .p_2()
                 .rounded_md()
-                .cursor_pointer()
+                .when(!busy, |row| row.cursor_pointer())
+                .when(busy, |row| row.opacity(0.55))
                 .when(is_selected, |row| row.bg(cx.theme().accent.opacity(0.16)))
-                .hover(|row| row.bg(cx.theme().muted))
+                .when(!busy, |row| row.hover(|row| row.bg(cx.theme().muted)))
                 .on_click(move |_, window, cx| {
                     panel.update(cx, |panel, cx| {
                         panel.select_provider(id.clone(), window, cx)
@@ -1250,6 +1258,24 @@ mod tests {
         assert!(state.busy.contains(&ModelAction::Refresh));
         assert!(state.finish(ModelAction::Refresh, refresh));
         assert!(state.busy.is_empty());
+    }
+
+    #[test]
+    fn busy_state_blocks_user_provider_selection_without_mutation() {
+        let mut state = ModelConfigState {
+            selected_provider: Some("openai".into()),
+            ..Default::default()
+        };
+        let generation = state.begin(ModelAction::Save).unwrap();
+        let busy = state.busy.clone();
+
+        if state.can_select_provider() {
+            state.select("anthropic".into(), false);
+        }
+
+        assert_eq!(state.selected_provider.as_deref(), Some("openai"));
+        assert_eq!(state.generation, generation);
+        assert_eq!(state.busy, busy);
     }
 
     #[test]
