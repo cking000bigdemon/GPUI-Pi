@@ -72,4 +72,6 @@
 - `cargo test -p pi-rpc`：unit `12 passed`、client `12 passed`、真实 tests 默认 `10 ignored`；`cargo test -p gpui-pi`：`59 passed / 1 ignored`。
 - 完整 `scripts/validate.ps1` 输出 `VALIDATE OK`：pins、fmt、workspace clippy `-D warnings`、workspace tests、release build 全绿。主要计数：app `59 passed / 1 ignored`、UI `24 passed`、pi-data unit `47 passed`、pi-render unit `19 passed`、live reducer `13 passed`、pi-rpc unit `12 passed` + client `12 passed`。
 - 独立代码终审最终结论 `approve`，无 blocking/high/medium findings；视觉审查最终结论 `SCREENSHOT / PASS`，无阻断项。
+- PR 创建后合入已包含 R13 的 `origin/main`（`d3aca23`），冲突解决同时保留 R13 的 `agent_dir`、会话控制结果/状态条与 R15 的 host extension 配置、generation-scoped degradation warning；集成终审再次 `approve`。
+- 合入 R13 后完整 `scripts/validate.ps1` 再次输出 `VALIDATE OK`：app `65 passed / 1 ignored`、UI `26 passed`、pi-data unit `52 passed`、pi-render unit `19 passed`、live reducer `13 passed`、pi-rpc unit `12 passed` + client `15 passed`；R15 五条真实 pi 零 token T2 再次逐项通过。
 - `Cargo.lock` 保持无 diff；实现提交 `534e7a3` 已推送，PR [#24](https://github.com/cking000bigdemon/GPUI-Pi/pull/24) 已创建；`ROUNDS.md` 已回填为 PR 待审。

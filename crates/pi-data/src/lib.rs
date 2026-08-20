@@ -28,8 +28,9 @@ pub use composer::{
     merge_restored_submission, validate_image_batch,
 };
 pub use config::{
-    ConfigError, models_path, read_json, read_models, read_settings, read_trust, settings_path,
-    trust_path, write_json_atomic, write_models, write_settings, write_trust,
+    ConfigError, models_path, read_auto_retry_enabled, read_json, read_models, read_settings,
+    read_trust, settings_path, trust_path, write_json_atomic, write_models, write_settings,
+    write_trust,
 };
 pub use extensions::{
     ExtensionDiagnostic, ExtensionInfo, ExtensionKind, ExtensionScan, scan_extensions,
@@ -52,9 +53,10 @@ pub use project::{
     project_identity_key, project_identity_key_for, resolve_project,
 };
 pub use session::{
-    EntryBase, SessionDiagnostic, SessionEntry, SessionError, SessionFile, SessionHeader,
-    SessionList, SessionListDiagnostic, SessionMetrics, SessionRevision, SessionSummary,
-    list_sessions, load_session, read_session_summary, session_metrics,
+    EntryBase, SessionBranchNode, SessionBranchTree, SessionDiagnostic, SessionEntry, SessionError,
+    SessionFile, SessionHeader, SessionList, SessionListDiagnostic, SessionMetrics,
+    SessionRevision, SessionSummary, list_sessions, load_session, read_session_summary,
+    session_metrics,
 };
 pub use session_actions::{
     SessionActionError, delete_leaf_session, export_session_jsonl, rename_session,

@@ -12,9 +12,10 @@ use pi_render::{
 };
 
 use pi_rpc::{
-    AssistantMessageEvent, AvailableModelsData, Client, ClientConfig, ClientEvent, Command,
-    CommandsData, ImageContent, ImageKind, Model, RpcEvent, RpcSessionState, RpcSlashCommand,
-    StreamingBehavior, ThinkingLevel, ThinkingLevelsData,
+    AssistantMessageEvent, AvailableModelsData, Client, ClientConfig, ClientEvent, CloneData,
+    Command, CommandsData, CompactionResult, ExportPathData, ForkData, ImageContent, ImageKind,
+    Model, RpcEvent, RpcSessionState, RpcSlashCommand, StreamingBehavior, ThinkingLevel,
+    ThinkingLevelsData, TreeData,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -107,6 +108,12 @@ pub struct SessionControls {
     pub thinking_level: ThinkingLevel,
     pub models: Vec<Model>,
     pub thinking_levels: Vec<ThinkingLevel>,
+    pub session_file: Option<PathBuf>,
+    pub session_id: String,
+    pub tree: TreeData,
+    pub auto_compaction_enabled: bool,
+    pub auto_retry_enabled: bool,
+    pub is_compacting: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +121,14 @@ pub enum ControlOperation {
     Model,
     Thinking,
     Tools,
+    Compact,
+    AutoCompaction,
+    AutoRetry,
+    AbortRetry,
+    Fork,
+    Clone,
+    SwitchSession,
+    ExportHtml,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,6 +136,61 @@ pub enum ControlRequest {
     SetModel { provider: String, model_id: String },
     CycleModel,
     SetThinking(ThinkingLevel),
+    Compact,
+    SetAutoCompaction(bool),
+    SetAutoRetry(bool),
+    AbortRetry,
+    Fork { entry_id: String },
+    Clone,
+    SwitchSession { path: PathBuf },
+    ExportHtml { output_path: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ControlOutcome {
+    Controls(SessionControls),
+    Compacted(CompactionResult),
+    Forked {
+        data: ForkData,
+        controls: SessionControls,
+    },
+    ForkCancelled(ForkData),
+    Cloned {
+        data: CloneData,
+        controls: SessionControls,
+    },
+    CloneCancelled,
+    Switched(SessionControls),
+    SwitchCancelled,
+    RebindCalibrationFailed {
+        operation: ControlOperation,
+        message: String,
+        fork_data: Option<ForkData>,
+    },
+    Exported(ExportPathData),
+    RetryAborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRuntimeEvent {
+    CompactionStarted,
+    CompactionEnded {
+        error: Option<String>,
+    },
+    RetryStarted {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        error: String,
+    },
+    RetryEnded {
+        success: bool,
+        attempt: u32,
+        error: Option<String>,
+    },
+    AgentEnded {
+        will_retry: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -154,6 +224,7 @@ pub enum PumpMessage {
     Events {
         generation: u64,
         events: Vec<LiveEvent>,
+        runtime_events: Vec<SessionRuntimeEvent>,
     },
     RequestFinished {
         generation: u64,
@@ -172,7 +243,8 @@ pub enum PumpMessage {
     },
     ControlFinished {
         generation: u64,
-        result: Result<SessionControls, String>,
+        operation: ControlOperation,
+        result: Result<ControlOutcome, String>,
     },
     ToolRestartFinished {
         generation: u64,
@@ -200,6 +272,7 @@ pub struct ActiveSession {
     reducer: LiveSessionReducer,
     pump: UnboundedSender<PumpMessage>,
     startup_diagnostic: Option<String>,
+    agent_dir: Option<PathBuf>,
 }
 
 struct ActiveSessionSpawn {
@@ -220,6 +293,26 @@ impl ActiveSession {
         history: ConversationDocument,
         tool_preset: ToolPreset,
     ) -> Result<(Self, UnboundedReceiver<PumpMessage>), String> {
+        Self::spawn_with_agent_dir(
+            generation,
+            binary,
+            session_path,
+            cwd,
+            history,
+            tool_preset,
+            pi_data::agent_dir(),
+        )
+    }
+
+    fn spawn_with_agent_dir(
+        generation: u64,
+        binary: PathBuf,
+        session_path: PathBuf,
+        cwd: PathBuf,
+        history: ConversationDocument,
+        tool_preset: ToolPreset,
+        agent_dir: Option<PathBuf>,
+    ) -> Result<(Self, UnboundedReceiver<PumpMessage>), String> {
         let (pump, receiver) = mpsc::unbounded();
         let active = Self::spawn_with_pump(
             ActiveSessionSpawn {
@@ -232,6 +325,7 @@ impl ActiveSession {
             },
             pump,
             true,
+            agent_dir,
         )?;
         if let Some(message) = active.startup_diagnostic.clone() {
             let _ = active.pump.unbounded_send(PumpMessage::Diagnostic {
@@ -246,13 +340,20 @@ impl ActiveSession {
         spawn: ActiveSessionSpawn,
         pump: UnboundedSender<PumpMessage>,
         refresh_metadata: bool,
+        agent_dir: Option<PathBuf>,
     ) -> Result<Self, String> {
-        let (config, diagnostic) = active_session_config(
+        let (mut config, diagnostic) = active_session_config(
             spawn.binary,
             spawn.session_path,
             spawn.cwd,
             spawn.tool_preset,
         );
+        if let Some(agent_dir) = agent_dir.as_ref() {
+            config.env.push((
+                pi_data::AGENT_DIR_ENV.into(),
+                agent_dir.as_os_str().to_owned(),
+            ));
+        }
         let session_path = config
             .initial_session
             .clone()
@@ -266,6 +367,7 @@ impl ActiveSession {
             reducer: LiveSessionReducer::new(spawn.history),
             pump,
             startup_diagnostic: diagnostic,
+            agent_dir,
         };
         if refresh_metadata {
             active.refresh_metadata();
@@ -365,18 +467,28 @@ impl ActiveSession {
 
     pub fn refresh_metadata(&self) {
         spawn_commands_request(self.generation, self.client.clone(), self.pump.clone());
-        spawn_controls_request(self.generation, self.client.clone(), self.pump.clone());
+        spawn_controls_request(
+            self.generation,
+            self.client.clone(),
+            self.pump.clone(),
+            self.agent_dir.clone(),
+        );
     }
 
-    pub fn request_control(&self, request: ControlRequest) {
+    pub fn request_control(&self, operation: ControlOperation, request: ControlRequest) {
         let generation = self.generation;
         let client = self.client.clone();
         let pump = self.pump.clone();
+        let agent_dir = self.agent_dir.clone();
         thread::Builder::new()
             .name(format!("pi-rpc-control-{generation}"))
             .spawn(move || {
-                let result = execute_control(&client, request);
-                let _ = pump.unbounded_send(PumpMessage::ControlFinished { generation, result });
+                let result = execute_control(&client, request, agent_dir.as_deref());
+                let _ = pump.unbounded_send(PumpMessage::ControlFinished {
+                    generation,
+                    operation,
+                    result,
+                });
             })
             .expect("failed to spawn RPC control thread");
     }
@@ -391,6 +503,7 @@ impl ActiveSession {
         preset: ToolPreset,
     ) {
         let pump = self.pump.clone();
+        let agent_dir = self.agent_dir.clone();
         thread::Builder::new()
             .name(format!("pi-rpc-tool-restart-{generation}"))
             .spawn(move || {
@@ -408,6 +521,7 @@ impl ActiveSession {
                         },
                         pump.clone(),
                         false,
+                        agent_dir,
                     )
                     .map(Box::new)
                 });
@@ -446,20 +560,36 @@ impl ActiveSession {
     }
 }
 
-fn spawn_controls_request(generation: u64, client: Client, pump: UnboundedSender<PumpMessage>) {
+fn spawn_controls_request(
+    generation: u64,
+    client: Client,
+    pump: UnboundedSender<PumpMessage>,
+    agent_dir: Option<PathBuf>,
+) {
     thread::Builder::new()
         .name(format!("pi-rpc-controls-{generation}"))
         .spawn(move || {
-            let result = load_controls(&client);
+            let result = load_controls(&client, agent_dir.as_deref());
             let _ = pump.unbounded_send(PumpMessage::ControlsLoaded { generation, result });
         })
         .expect("failed to spawn RPC controls thread");
 }
 
-pub(crate) fn load_controls(client: &Client) -> Result<SessionControls, String> {
+pub(crate) fn load_controls(
+    client: &Client,
+    agent_dir: Option<&Path>,
+) -> Result<SessionControls, String> {
     let state = client
         .request_data::<RpcSessionState>(Command::GetState, REQUEST_TIMEOUT)
         .map_err(|error| error.to_string())?;
+    load_controls_from_state(client, state, agent_dir)
+}
+
+fn load_controls_from_state(
+    client: &Client,
+    state: RpcSessionState,
+    agent_dir: Option<&Path>,
+) -> Result<SessionControls, String> {
     let mut models = client
         .request_data::<AvailableModelsData>(Command::GetAvailableModels, REQUEST_TIMEOUT)
         .map_err(|error| error.to_string())?
@@ -475,18 +605,33 @@ pub(crate) fn load_controls(client: &Client) -> Result<SessionControls, String> 
         .request_data::<ThinkingLevelsData>(Command::GetAvailableThinkingLevels, REQUEST_TIMEOUT)
         .map_err(|error| error.to_string())?
         .levels;
+    let tree = client
+        .request_data::<TreeData>(Command::GetTree, REQUEST_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    let auto_retry_enabled = agent_dir
+        .map(pi_data::read_auto_retry_enabled)
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .unwrap_or(true);
     Ok(SessionControls {
         model: state.model,
         thinking_level: state.thinking_level,
         models,
         thinking_levels,
+        session_file: state.session_file.map(PathBuf::from),
+        session_id: state.session_id,
+        tree,
+        auto_compaction_enabled: state.auto_compaction_enabled,
+        auto_retry_enabled,
+        is_compacting: state.is_compacting,
     })
 }
 
 pub(crate) fn execute_control(
     client: &Client,
     request: ControlRequest,
-) -> Result<SessionControls, String> {
+    agent_dir: Option<&Path>,
+) -> Result<ControlOutcome, String> {
     match request {
         ControlRequest::SetModel { provider, model_id } => {
             client
@@ -509,8 +654,162 @@ pub(crate) fn execute_control(
                 return Err(response.error.unwrap_or_else(|| "unknown RPC error".into()));
             }
         }
+        ControlRequest::Compact => {
+            let result = client
+                .request_data::<CompactionResult>(
+                    Command::Compact {
+                        custom_instructions: None,
+                    },
+                    Duration::from_secs(300),
+                )
+                .map_err(|error| error.to_string())?;
+            return Ok(ControlOutcome::Compacted(result));
+        }
+        ControlRequest::SetAutoCompaction(enabled) => {
+            ensure_success(client, Command::SetAutoCompaction { enabled })?;
+        }
+        ControlRequest::SetAutoRetry(enabled) => {
+            ensure_success(client, Command::SetAutoRetry { enabled })?;
+        }
+        ControlRequest::AbortRetry => {
+            ensure_success(client, Command::AbortRetry)?;
+            return Ok(ControlOutcome::RetryAborted);
+        }
+        ControlRequest::Fork { entry_id } => {
+            let outcome = client
+                .request_session_rebind_data::<ForkData>(
+                    Command::Fork { entry_id },
+                    REQUEST_TIMEOUT,
+                )
+                .map_err(|error| error.to_string())?;
+            if outcome.data.cancelled {
+                return Ok(ControlOutcome::ForkCancelled(outcome.data));
+            }
+            let data = outcome.data;
+            let state = match calibrated_state("fork", outcome.calibration) {
+                Ok(state) => state,
+                Err(message) => {
+                    return Ok(ControlOutcome::RebindCalibrationFailed {
+                        operation: ControlOperation::Fork,
+                        message,
+                        fork_data: Some(data),
+                    });
+                }
+            };
+            let controls = match load_controls_from_state(client, state, agent_dir) {
+                Ok(controls) => controls,
+                Err(error) => {
+                    return Ok(ControlOutcome::RebindCalibrationFailed {
+                        operation: ControlOperation::Fork,
+                        message: format!(
+                            "fork 已成功，但会话控制元数据刷新失败；请勿重复操作：{error}"
+                        ),
+                        fork_data: Some(data),
+                    });
+                }
+            };
+            return Ok(ControlOutcome::Forked { data, controls });
+        }
+        ControlRequest::Clone => {
+            let outcome = client
+                .request_session_rebind_data::<CloneData>(Command::Clone, REQUEST_TIMEOUT)
+                .map_err(|error| error.to_string())?;
+            if outcome.data.cancelled {
+                return Ok(ControlOutcome::CloneCancelled);
+            }
+            let state = match calibrated_state("clone", outcome.calibration) {
+                Ok(state) => state,
+                Err(message) => {
+                    return Ok(ControlOutcome::RebindCalibrationFailed {
+                        operation: ControlOperation::Clone,
+                        message,
+                        fork_data: None,
+                    });
+                }
+            };
+            let controls = match load_controls_from_state(client, state, agent_dir) {
+                Ok(controls) => controls,
+                Err(error) => {
+                    return Ok(ControlOutcome::RebindCalibrationFailed {
+                        operation: ControlOperation::Clone,
+                        message: format!(
+                            "clone 已成功，但会话控制元数据刷新失败；请勿重复操作：{error}"
+                        ),
+                        fork_data: None,
+                    });
+                }
+            };
+            return Ok(ControlOutcome::Cloned {
+                data: outcome.data,
+                controls,
+            });
+        }
+        ControlRequest::SwitchSession { path } => {
+            let outcome = client
+                .request_session_rebind_data::<pi_rpc::SwitchSessionData>(
+                    Command::SwitchSession {
+                        session_path: path.to_string_lossy().into_owned(),
+                    },
+                    REQUEST_TIMEOUT,
+                )
+                .map_err(|error| error.to_string())?;
+            if outcome.data.cancelled {
+                return Ok(ControlOutcome::SwitchCancelled);
+            }
+            let state = match calibrated_state("switch_session", outcome.calibration) {
+                Ok(state) => state,
+                Err(message) => {
+                    return Ok(ControlOutcome::RebindCalibrationFailed {
+                        operation: ControlOperation::SwitchSession,
+                        message,
+                        fork_data: None,
+                    });
+                }
+            };
+            return Ok(match load_controls_from_state(client, state, agent_dir) {
+                Ok(controls) => ControlOutcome::Switched(controls),
+                Err(error) => ControlOutcome::RebindCalibrationFailed {
+                    operation: ControlOperation::SwitchSession,
+                    message: format!(
+                        "switch_session 已成功，但会话控制元数据刷新失败；请勿重复操作：{error}"
+                    ),
+                    fork_data: None,
+                },
+            });
+        }
+        ControlRequest::ExportHtml { output_path } => {
+            let data = client
+                .request_data::<ExportPathData>(
+                    Command::ExportHtml {
+                        output_path: Some(output_path.to_string_lossy().into_owned()),
+                    },
+                    Duration::from_secs(60),
+                )
+                .map_err(|error| error.to_string())?;
+            return Ok(ControlOutcome::Exported(data));
+        }
     }
-    load_controls(client)
+    load_controls(client, agent_dir).map(ControlOutcome::Controls)
+}
+
+fn calibrated_state(
+    operation: &str,
+    calibration: Option<Result<RpcSessionState, pi_rpc::ClientError>>,
+) -> Result<RpcSessionState, String> {
+    calibration
+        .ok_or_else(|| format!("{operation} 已取消"))?
+        .map_err(|error| format!("{operation} 已成功，但会话元数据校准失败；请勿重复操作：{error}"))
+}
+
+fn ensure_success(client: &Client, command: Command) -> Result<(), String> {
+    let response = client
+        .request(command, REQUEST_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    if response.success {
+        Ok(())
+    } else {
+        Err(response.error.unwrap_or_else(|| "unknown RPC error".into()))
+    }
 }
 
 fn spawn_commands_request(generation: u64, client: Client, pump: UnboundedSender<PumpMessage>) {
@@ -576,6 +875,62 @@ fn active_session_config_with_materializer(
     (config, diagnostic)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalHtmlExport {
+    pub path: PathBuf,
+    pub cleanup_warning: Option<String>,
+}
+
+fn finish_historical_export(
+    export: Result<PathBuf, String>,
+    shutdown: Result<(), String>,
+) -> Result<HistoricalHtmlExport, String> {
+    match export {
+        Ok(path) => Ok(HistoricalHtmlExport {
+            path,
+            cleanup_warning: shutdown.err(),
+        }),
+        Err(error) => {
+            // shutdown 仍已尝试；主导出失败优先展示，清理失败附带保留可观测性。
+            Err(match shutdown {
+                Ok(()) => error,
+                Err(shutdown_error) => format!("{error}；进程清理也失败：{shutdown_error}"),
+            })
+        }
+    }
+}
+
+pub fn export_historical_html(
+    session_path: PathBuf,
+    output_path: PathBuf,
+) -> Result<HistoricalHtmlExport, String> {
+    let cwd = pi_data::load_session(&session_path)
+        .map(|session| PathBuf::from(session.header.cwd))
+        .map_err(|error| error.to_string())?;
+    let mut config = ClientConfig::new(official_binary());
+    config.current_dir = Some(cwd);
+    config.initial_session = Some(session_path);
+    config.args = vec![
+        "--no-extensions".into(),
+        "--no-skills".into(),
+        "--no-prompt-templates".into(),
+        "--no-context-files".into(),
+        "--offline".into(),
+    ];
+    let client = Client::spawn(config).map_err(|error| error.to_string())?;
+    let result = client
+        .request_data::<ExportPathData>(
+            Command::ExportHtml {
+                output_path: Some(output_path.to_string_lossy().into_owned()),
+            },
+            Duration::from_secs(60),
+        )
+        .map(|data| PathBuf::from(data.path))
+        .map_err(|error| error.to_string());
+    let shutdown = client.shutdown().map_err(|error| error.to_string());
+    finish_historical_export(result.map(|_| output_path), shutdown)
+}
+
 pub fn official_binary() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -606,14 +961,15 @@ fn spawn_event_pump(
                     }
                 };
                 let mut batch = Vec::with_capacity(64);
+                let mut runtime_events = Vec::new();
                 let mut settled = false;
-                if let Some(event) = project_event(first) {
-                    if matches!(event, LiveEvent::AgentStart) {
-                        activity_generation = activity_generation.wrapping_add(1);
-                    }
-                    settled |= matches!(event, LiveEvent::AgentSettled);
-                    batch.push(event);
-                }
+                project_client_event(
+                    first,
+                    &mut batch,
+                    &mut runtime_events,
+                    &mut activity_generation,
+                    &mut settled,
+                );
                 let deadline = Instant::now() + PUMP_FRAME;
                 let mut disconnected = false;
                 while batch.len() < MAX_EVENTS_PER_BATCH {
@@ -622,15 +978,13 @@ fn spawn_event_pump(
                         break;
                     }
                     match events.recv_timeout(deadline.saturating_duration_since(now)) {
-                        Ok(event) => {
-                            if let Some(event) = project_event(event) {
-                                if matches!(event, LiveEvent::AgentStart) {
-                                    activity_generation = activity_generation.wrapping_add(1);
-                                }
-                                settled |= matches!(event, LiveEvent::AgentSettled);
-                                batch.push(event);
-                            }
-                        }
+                        Ok(event) => project_client_event(
+                            event,
+                            &mut batch,
+                            &mut runtime_events,
+                            &mut activity_generation,
+                            &mut settled,
+                        ),
                         Err(RecvTimeoutError::Timeout) => break,
                         Err(RecvTimeoutError::Disconnected) => {
                             disconnected = true;
@@ -638,11 +992,12 @@ fn spawn_event_pump(
                         }
                     }
                 }
-                if !batch.is_empty()
+                if (!batch.is_empty() || !runtime_events.is_empty())
                     && pump
                         .unbounded_send(PumpMessage::Events {
                             generation,
                             events: batch,
+                            runtime_events,
                         })
                         .is_err()
                 {
@@ -682,6 +1037,64 @@ fn spawn_calibration(
             });
         })
         .expect("failed to spawn session calibration thread");
+}
+
+fn project_client_event(
+    event: ClientEvent,
+    live_events: &mut Vec<LiveEvent>,
+    runtime_events: &mut Vec<SessionRuntimeEvent>,
+    activity_generation: &mut u64,
+    settled: &mut bool,
+) {
+    if let ClientEvent::Rpc(event) = &event {
+        match event.as_ref() {
+            RpcEvent::AgentEnd { will_retry, .. } => {
+                runtime_events.push(SessionRuntimeEvent::AgentEnded {
+                    will_retry: *will_retry,
+                })
+            }
+            RpcEvent::CompactionStart { .. } => {
+                runtime_events.push(SessionRuntimeEvent::CompactionStarted)
+            }
+            RpcEvent::CompactionEnd { error_message, .. } => {
+                runtime_events.push(SessionRuntimeEvent::CompactionEnded {
+                    error: error_message.clone(),
+                });
+                // 手动 compact 不保证另发 agent_settled；结束事件同样触发文件校准。
+                *settled = true;
+            }
+            RpcEvent::AutoRetryStart {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message,
+            } => {
+                runtime_events.push(SessionRuntimeEvent::RetryStarted {
+                    attempt: *attempt,
+                    max_attempts: *max_attempts,
+                    delay_ms: *delay_ms,
+                    error: error_message.clone(),
+                });
+            }
+            RpcEvent::AutoRetryEnd {
+                success,
+                attempt,
+                final_error,
+            } => runtime_events.push(SessionRuntimeEvent::RetryEnded {
+                success: *success,
+                attempt: *attempt,
+                error: final_error.clone(),
+            }),
+            _ => {}
+        }
+    }
+    if let Some(live) = project_event(event) {
+        if matches!(live, LiveEvent::AgentStart) {
+            *activity_generation = activity_generation.wrapping_add(1);
+        }
+        *settled |= matches!(live, LiveEvent::AgentSettled);
+        live_events.push(live);
+    }
 }
 
 fn project_event(event: ClientEvent) -> Option<LiveEvent> {
@@ -830,19 +1243,42 @@ mod tests {
         let binary = std::env::var_os("GPUI_PI_TEST_FAKE_CHILD")
             .map(PathBuf::from)
             .expect("GPUI_PI_TEST_FAKE_CHILD must point to pi-rpc fake_child");
-        let client = Client::spawn(ClientConfig::new(binary)).unwrap();
-        let controls = load_controls(&client).unwrap();
+        let agent_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            agent_dir.path().join("settings.json"),
+            r#"{"retry":{"enabled":false}}"#,
+        )
+        .unwrap();
+        let mut config = ClientConfig::new(binary);
+        config.env.push((
+            pi_data::AGENT_DIR_ENV.into(),
+            agent_dir.path().as_os_str().to_owned(),
+        ));
+        let client = Client::spawn(config).unwrap();
+        let controls = load_controls(&client, Some(agent_dir.path())).unwrap();
         assert_eq!(controls.models.len(), 2);
+        assert!(!controls.auto_retry_enabled);
         assert_eq!(controls.model.as_ref().unwrap().id, "model-one");
         assert_eq!(
             controls.thinking_levels,
             [ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High,]
         );
 
-        let controls = execute_control(&client, ControlRequest::CycleModel).unwrap();
-        assert_eq!(controls.model.as_ref().unwrap().id, "model-two");
         let controls =
-            execute_control(&client, ControlRequest::SetThinking(ThinkingLevel::High)).unwrap();
+            execute_control(&client, ControlRequest::CycleModel, Some(agent_dir.path())).unwrap();
+        let ControlOutcome::Controls(controls) = controls else {
+            panic!("expected controls")
+        };
+        assert_eq!(controls.model.as_ref().unwrap().id, "model-two");
+        let controls = execute_control(
+            &client,
+            ControlRequest::SetThinking(ThinkingLevel::High),
+            Some(agent_dir.path()),
+        )
+        .unwrap();
+        let ControlOutcome::Controls(controls) = controls else {
+            panic!("expected controls")
+        };
         assert_eq!(controls.thinking_level, ThinkingLevel::High);
         let controls = execute_control(
             &client,
@@ -850,10 +1286,35 @@ mod tests {
                 provider: "provider-one".to_owned(),
                 model_id: "model-one".to_owned(),
             },
+            Some(agent_dir.path()),
         )
         .unwrap();
+        let ControlOutcome::Controls(controls) = controls else {
+            panic!("expected controls")
+        };
         assert_eq!(controls.model.as_ref().unwrap().id, "model-one");
         client.shutdown().unwrap();
+    }
+
+    #[test]
+    fn historical_export_success_survives_shutdown_failure_with_warning() {
+        let output = PathBuf::from("exported.html");
+        let result =
+            finish_historical_export(Ok(output.clone()), Err("shutdown timed out".to_owned()))
+                .unwrap();
+        assert_eq!(result.path, output);
+        assert_eq!(
+            result.cleanup_warning.as_deref(),
+            Some("shutdown timed out")
+        );
+
+        let error = finish_historical_export(
+            Err("export failed".to_owned()),
+            Err("shutdown failed".to_owned()),
+        )
+        .unwrap_err();
+        assert!(error.contains("export failed"));
+        assert!(error.contains("shutdown failed"));
     }
 
     #[test]

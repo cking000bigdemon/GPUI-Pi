@@ -303,6 +303,9 @@ pub struct CancelledData {
     pub cancelled: bool,
 }
 
+pub type SwitchSessionData = CancelledData;
+pub type CloneData = CancelledData;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CycleModelData {

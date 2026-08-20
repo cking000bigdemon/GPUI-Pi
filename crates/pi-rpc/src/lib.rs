@@ -10,7 +10,8 @@ pub mod protocol;
 
 pub use host_extension::materialize_host_extension;
 pub use process::{
-    Client, ClientConfig, ClientError, ClientEvent, LifecycleEvent, kill_process_tree,
+    Client, ClientConfig, ClientError, ClientEvent, LifecycleEvent, SessionRebindOutcome,
+    kill_process_tree,
 };
 pub use protocol::*;
 

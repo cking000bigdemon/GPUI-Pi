@@ -502,6 +502,18 @@ pub fn render_path(path: impl AsRef<Path>) -> Result<ConversationDocument, pi_da
     pi_data::load_session(path).map(|session| render_session(&session))
 }
 
+/// 分支导航的只读预览。只消费 pi-data 安全投影，不改 JSONL 或运行时 leaf。
+pub fn render_path_at_leaf(
+    path: impl AsRef<Path>,
+    leaf_id: &str,
+) -> Result<Option<ConversationDocument>, pi_data::SessionError> {
+    pi_data::load_session(path).map(|session| {
+        session
+            .project_to_leaf(leaf_id)
+            .map(|projected| render_session(&projected))
+    })
+}
+
 fn selected_entry_indexes(
     session: &SessionFile,
     diagnostics: &mut Vec<RenderDiagnostic>,
