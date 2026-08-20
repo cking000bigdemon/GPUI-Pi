@@ -98,4 +98,5 @@
 - 最终代码审查剩余 UI 整改已补齐：worktree 跨行 hover 不再被旧行 leave 清空；non-repository 提示降为 muted 中文能力提示，其余错误保留 warning 原文；standalone diff 测试直接断言 gpui-component `scrollbar-overlay`，并用双轴超限 fixture 覆盖；Git 状态码统一为 `M/A/D/R/?/U`，tooltip 说明 `? 未跟踪 / U 冲突`。
 - 最终独立 `CARGO_TARGET_DIR=.pi/target-visual-validation-3` validation 输出 `VALIDATE OK` 且原始退出码 `0`：app `57 passed / 1 ignored`、UI `24 passed`、pi-data unit `47 passed`、pi-render unit `19 passed`、live reducer `13 passed`，其余 workspace integration/doc tests 全绿；release build 通过。
 - 最终独立代码复核结论为 `approve`，无 blocking/high/medium finding；最终 `SCREENSHOT` 视觉审查结论为 `PASS`。
-- 任务卡与 `ROUNDS.md` 收口后，使用独立 `CARGO_TARGET_DIR=.pi/target-round-12-closeout` 再次完整运行 `scripts/validate.ps1`：`VALIDATE OK`、`PIPELINE_EXIT_CODE=0`，日志为 `.pi/validation/round-12-closeout-final-validate.log`。Round 12 本地验收完成，未 commit、push、创建 PR 或合并远端。
+- 任务卡与 `ROUNDS.md` 收口后，使用独立 `CARGO_TARGET_DIR=.pi/target-round-12-closeout` 再次完整运行 `scripts/validate.ps1`：`VALIDATE OK`、`PIPELINE_EXIT_CODE=0`，日志为 `.pi/validation/round-12-closeout-post-record-validate.log`。
+- 已提交并推送分支 `WinClaude/round-12`，PR：[#22](https://github.com/cking000bigdemon/GPUI-Pi/pull/22)。尚未合并远端。
