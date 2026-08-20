@@ -20,7 +20,7 @@
 | **R12** | git diff / worktree / 本轮改动文件 | Windows | ✅ 已完成 | [#22](https://github.com/cking000bigdemon/GPUI-Pi/pull/22) | 2026-08-20 |
 | **R13** | 分支树 · compaction · retry · 导出 | Windows | ⬜ | — | — |
 | **R14** | Extension UI Protocol | Windows | ⬜ | — | — |
-| **R15** | 项目命令环境 bash 扩展（`.ts`） | Windows | ⬜ | — | — |
+| **R15** | 项目命令环境 bash 扩展（`.ts`） | Windows | 🚧 PR 待审 | [#24](https://github.com/cking000bigdemon/GPUI-Pi/pull/24) | — |
 | **R16** | 模型配置面板 + 登录 | Windows | ⬜ | — | — |
 | **R17** | 打包分发 | Windows | ⬜ | — | — |
 | **R18** | 1:1 验收 + 文档定稿 | Windows | ⬜ | — | — |

@@ -1,6 +1,6 @@
 # Round 15 — 项目命令环境扩展
 
-> 执行方：**Windows** · 状态：已完成（待创建 PR）
+> 执行方：**Windows** · 状态：已完成（PR [#24](https://github.com/cking000bigdemon/GPUI-Pi/pull/24) 待审）
 
 ## 目标
 
@@ -72,4 +72,4 @@
 - `cargo test -p pi-rpc`：unit `12 passed`、client `12 passed`、真实 tests 默认 `10 ignored`；`cargo test -p gpui-pi`：`59 passed / 1 ignored`。
 - 完整 `scripts/validate.ps1` 输出 `VALIDATE OK`：pins、fmt、workspace clippy `-D warnings`、workspace tests、release build 全绿。主要计数：app `59 passed / 1 ignored`、UI `24 passed`、pi-data unit `47 passed`、pi-render unit `19 passed`、live reducer `13 passed`、pi-rpc unit `12 passed` + client `12 passed`。
 - 独立代码终审最终结论 `approve`，无 blocking/high/medium findings；视觉审查最终结论 `SCREENSHOT / PASS`，无阻断项。
-- `Cargo.lock` 保持无 diff；`ROUNDS.md` 将在取得实际 PR 编号后回填。
+- `Cargo.lock` 保持无 diff；实现提交 `534e7a3` 已推送，PR [#24](https://github.com/cking000bigdemon/GPUI-Pi/pull/24) 已创建；`ROUNDS.md` 已回填为 PR 待审。
