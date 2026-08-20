@@ -14,6 +14,7 @@ pub mod extensions;
 pub mod files;
 mod fs_util;
 pub mod git;
+pub mod model_config;
 pub mod project;
 pub mod session;
 pub mod session_actions;
@@ -47,6 +48,13 @@ pub use git::{
     GitDiffUnsupported, GitError, GitFileDiff, GitFileStatus, GitFileStatusKind, GitStatusSnapshot,
     WorktreeInfo, WorktreeSnapshot, add_worktree, git_file_diff, git_status, list_worktrees,
     remove_worktree,
+};
+pub use model_config::{
+    AuthCapability, AuthKind, AuthSummary, CliAuthStatus, ModelApi, ModelConfigDocument,
+    ModelConfigError, ModelEntry, ProviderConfig, ProviderDescriptor, ProviderDraft, SecretString,
+    auth_path, built_in_providers, connectivity_request_body, merge_provider_directory,
+    parse_cli_auth_status, parse_discovered_models, read_api_key, read_auth_summaries,
+    remove_api_key, validate_base_url, write_api_key,
 };
 pub use project::{
     GroupedSession, PathPlatform, ProjectGroup, ProjectInfo, group_sessions, native_platform,
