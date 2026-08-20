@@ -39,7 +39,7 @@
 - 视觉审查模式：<N/A | SCREENSHOT | CODE_ONLY>
 - 视觉审查结论：<N/A | PASS | FAIL | INSUFFICIENT_EVIDENCE | CODE_ONLY_PASS | CODE_ONLY_FAIL>
 - 截图验证：<N/A | 已提供（SCREENSHOT_PROVIDED） | 未提供（SCREENSHOT_NOT_PROVIDED）>
-- 兜底原因：<N/A | TIMEOUT_10M | USER_DECLINED>
+- 兜底原因：<N/A | TIMEOUT_30M | USER_DECLINED>
 - `requested_at`：<ISO-8601，含时区 | N/A>
 - `deadline`：<ISO-8601，含时区 | N/A>
 - 审查报告 / 证据：<路径或摘要>
