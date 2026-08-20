@@ -1,6 +1,6 @@
 # Round 13 — 会话分支树、Compaction、Auto-retry 与 HTML 导出
 
-> 执行方：**Windows** · 状态：已完成（工作区未提交，未创建 PR）
+> 执行方：**Windows** · 状态：实现与门禁已完成（PR [#23](https://github.com/cking000bigdemon/GPUI-Pi/pull/23) 待审）
 
 ## 目标
 
@@ -131,4 +131,7 @@
 - 活动 leaf 优先使用 RPC `get_tree.leafId`，本地 append-last 仅作 fallback；历史 HTML 已落盘但 shutdown 失败时返回成功及 cleanup warning；abort-retry disabled 与全局 busy 门禁一致。
 - 与初始任务卡的偏离：RPC `get_tree` 返回的 entry id 可能经 pi 加载迁移重写，真实测试只断言结构和命令语义，不依赖 fixture 原始短 id，符合上游行为。
 - `git diff --check` 通过；`Cargo.lock`、pins、`vendor/` 无 tracked diff；无 staged files。
-- 本轮按用户要求停在未提交工作区：未 commit、未 push、未创建 PR、未合并。
+- 实现提交：`0496e98`（`feat: complete round 13 session branching controls`）。
+- 分支已推送：`origin/WinClaude/round-13`。
+- PR：[GitHub #23](https://github.com/cking000bigdemon/GPUI-Pi/pull/23)。
+- 未合并；等待 PR 审查与 GitHub CI。
