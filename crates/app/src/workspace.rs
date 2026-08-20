@@ -14,9 +14,9 @@ use gpui_pi_ui::{AppShell, WorkspaceTabBar, theme};
 
 use crate::file_explorer::FileExplorerPanel;
 use crate::main_panel::MainPanel;
-use crate::panels::ChatPanel;
 #[cfg(test)]
 use crate::panels::LayoutProbe;
+use crate::panels::{ChatPanel, SessionsChanged};
 use crate::session_sidebar::{SessionSelected, SessionSidebar, WorktreeSelected};
 use crate::trust_prompt::prompt_project_trust;
 
@@ -35,6 +35,7 @@ pub struct Workspace {
     _appearance_subscription: Subscription,
     _session_subscription: Subscription,
     _worktree_subscription: Subscription,
+    _sessions_changed_subscription: Subscription,
 }
 
 impl Workspace {
@@ -152,6 +153,14 @@ impl Workspace {
                 workspace.apply_browsing_root(event.cwd.clone(), window, cx);
             },
         );
+        let sessions_sidebar = sidebar.clone();
+        let sessions_changed_subscription = cx.subscribe_in(
+            &chat,
+            window,
+            move |_, _, _: &SessionsChanged, window, cx| {
+                sessions_sidebar.update(cx, |sidebar, cx| sidebar.refresh(window, cx));
+            },
+        );
 
         Self {
             dock_area,
@@ -163,6 +172,7 @@ impl Workspace {
             _appearance_subscription: appearance_subscription,
             _session_subscription: session_subscription,
             _worktree_subscription: worktree_subscription,
+            _sessions_changed_subscription: sessions_changed_subscription,
         }
     }
 

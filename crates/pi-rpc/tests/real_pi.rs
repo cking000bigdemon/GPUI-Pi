@@ -8,9 +8,9 @@ use std::{
 use tempfile::TempDir;
 
 use pi_rpc::{
-    AvailableModelsData, BashResult, Client, ClientConfig, ClientEvent, Command, CommandsData,
-    LifecycleEvent, MessagesData, PINNED_PI_VERSION, QueueMode, RpcSessionState, StreamingBehavior,
-    ThinkingLevel, ThinkingLevelsData,
+    AvailableModelsData, BashResult, Client, ClientConfig, ClientEvent, CloneData, Command,
+    CommandsData, ExportPathData, ForkData, LifecycleEvent, MessagesData, PINNED_PI_VERSION,
+    QueueMode, RpcSessionState, StreamingBehavior, ThinkingLevel, ThinkingLevelsData, TreeData,
 };
 use serde_json::Value;
 
@@ -224,6 +224,101 @@ fn zero_token_command_matrix() {
     assert_eq!(new_session["cancelled"], false);
     let after: RpcSessionState = client.request_data(Command::GetState, TIMEOUT).unwrap();
     assert_ne!(before, after.session_id);
+    client.shutdown().unwrap();
+}
+
+#[test]
+#[ignore = "requires PI_RPC_TEST_BINARY=official pi 0.84.2"]
+fn r13_tree_fork_clone_switch_and_html_are_zero_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = env::current_dir().unwrap();
+    let fixture_path = temp.path().join("r13-source.jsonl");
+    fs::write(
+        &fixture_path,
+        format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({"type":"session","version":3,"id":"r13-source","timestamp":"2026-01-01T00:00:00.000Z","cwd":cwd}),
+            serde_json::json!({"type":"message","id":"user-root","parentId":null,"timestamp":"2026-01-01T00:00:00.001Z","message":{"role":"user","content":"fork fixture"}}),
+            serde_json::json!({"type":"message","id":"assistant-leaf","parentId":"user-root","timestamp":"2026-01-01T00:00:00.002Z","message":{"role":"assistant","content":[{"type":"text","text":"answer"}],"api":"fixture","provider":"fixture","model":"fixture","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0},"stopReason":"stop","timestamp":0}}})
+        ),
+    )
+    .unwrap();
+    let mut config = client_config(&temp);
+    config.initial_session = Some(fixture_path.clone());
+    let client = Client::spawn(config).unwrap();
+
+    let tree: TreeData = client.request_data(Command::GetTree, TIMEOUT).unwrap();
+    let root_id = tree.tree[0].entry.id.clone();
+    let leaf_id = tree.leaf_id.clone().expect("fixture leaf");
+    assert_ne!(root_id, leaf_id);
+    assert!(!tree.tree.is_empty());
+
+    let html = temp.path().join("r13-source.html");
+    let exported: ExportPathData = client
+        .request_data(
+            Command::ExportHtml {
+                output_path: Some(html.to_string_lossy().into_owned()),
+            },
+            TIMEOUT,
+        )
+        .unwrap();
+    assert_eq!(Path::new(&exported.path), html);
+    assert!(
+        fs::read_to_string(&html)
+            .unwrap()
+            .contains("<!DOCTYPE html>")
+    );
+
+    for command in [
+        Command::SetAutoCompaction { enabled: false },
+        Command::SetAutoCompaction { enabled: true },
+        Command::SetAutoRetry { enabled: false },
+        Command::SetAutoRetry { enabled: true },
+        Command::AbortRetry,
+    ] {
+        assert!(client.request(command, TIMEOUT).unwrap().success);
+    }
+
+    let cloned: CloneData = client.request_data(Command::Clone, TIMEOUT).unwrap();
+    assert!(!cloned.cancelled);
+    let clone_state: RpcSessionState = client.request_data(Command::GetState, TIMEOUT).unwrap();
+    assert_ne!(clone_state.session_id, "r13-source");
+    assert_eq!(
+        client.resume_session().as_deref(),
+        clone_state.session_file.as_deref().map(Path::new)
+    );
+
+    let switched: serde_json::Value = client
+        .request_data(
+            Command::SwitchSession {
+                session_path: fixture_path.to_string_lossy().into_owned(),
+            },
+            TIMEOUT,
+        )
+        .unwrap();
+    assert_eq!(switched["cancelled"], false);
+    let restored: RpcSessionState = client.request_data(Command::GetState, TIMEOUT).unwrap();
+    assert_eq!(restored.session_id, "r13-source");
+    assert_eq!(client.resume_session(), Some(fixture_path.clone()));
+
+    let restored_tree: TreeData = client.request_data(Command::GetTree, TIMEOUT).unwrap();
+    let restored_root = restored_tree.tree[0].entry.id.clone();
+    let forked: ForkData = client
+        .request_data(
+            Command::Fork {
+                entry_id: restored_root,
+            },
+            TIMEOUT,
+        )
+        .unwrap();
+    assert!(!forked.cancelled);
+    assert_eq!(forked.text, "fork fixture");
+    let fork_state: RpcSessionState = client.request_data(Command::GetState, TIMEOUT).unwrap();
+    assert_ne!(fork_state.session_id, "r13-source");
+    assert_eq!(
+        client.resume_session().as_deref(),
+        fork_state.session_file.as_deref().map(Path::new)
+    );
     client.shutdown().unwrap();
 }
 

@@ -4,10 +4,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use futures::{StreamExt as _, channel::mpsc::UnboundedReceiver};
 use gpui::{
-    App, AppContext as _, ClipboardEntry, Context, EventEmitter, ExternalPaths, FocusHandle,
-    Focusable, FollowMode, Image, ImageFormat, InteractiveElement as _, IntoElement, KeyDownEvent,
-    ListAlignment, ListState, ParentElement as _, PathPromptOptions, Render, SharedString,
-    Styled as _, Subscription, Window, div, img, prelude::FluentBuilder as _, px,
+    Anchor, App, AppContext as _, ClipboardEntry, Context, EventEmitter, ExternalPaths,
+    FocusHandle, Focusable, FollowMode, Image, ImageFormat, InteractiveElement as _, IntoElement,
+    KeyDownEvent, ListAlignment, ListState, ParentElement as _, PathPromptOptions, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, img,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _,
@@ -17,6 +18,7 @@ use gpui_component::{
     h_flex,
     input::{InputEvent, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
+    popover::Popover,
     scroll::ScrollableElement as _,
     v_flex,
 };
@@ -24,11 +26,15 @@ use pi_render::{ConversationDocument, ConversationItem, LivePhase};
 
 use crate::{
     live_session::{
-        ActiveSession, ComposerMode, ComposerSubmission, ControlOperation, ControlRequest,
-        PumpMessage, RequestFailureKind, RpcIntent, SessionControls, ToolPreset, official_binary,
+        ActiveSession, ComposerMode, ComposerSubmission, ControlOperation, ControlOutcome,
+        ControlRequest, PumpMessage, RequestFailureKind, RpcIntent, SessionControls,
+        SessionRuntimeEvent, ToolPreset, official_binary,
     },
     session_sidebar::SessionSelected,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionsChanged;
 
 pub struct ChatPanel {
     focus_handle: FocusHandle,
@@ -46,6 +52,11 @@ pub struct ChatPanel {
     model_names: Arc<std::collections::HashMap<String, String>>,
     tool_preset: ToolPreset,
     control_operation: Option<ControlOperation>,
+    branch_tree: Option<pi_data::SessionBranchTree>,
+    branch_preview_leaf: Option<String>,
+    branch_preview_document: Option<Arc<ConversationDocument>>,
+    retry_status: Option<RetryStatus>,
+    compacting: bool,
     popup: Option<ComposerPopup>,
     popup_index: usize,
     file_index: Option<pi_data::FileIndex>,
@@ -58,11 +69,32 @@ pub struct ChatPanel {
     minimap_visible: bool,
     expanded_tools: HashSet<String>,
     expanded_processes: HashSet<String>,
+    rpc_success: Option<String>,
     rpc_error: Option<String>,
     activity_generation: u64,
     calibration_generation: u64,
     _composer_subscription: Subscription,
     probe: Option<LayoutProbe>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetryStatus {
+    attempt: u32,
+    max_attempts: u32,
+    delay_ms: u64,
+    error: String,
+}
+
+const fn sessions_changed_for_outcome(outcome: &ControlOutcome) -> bool {
+    matches!(
+        outcome,
+        ControlOutcome::Forked { .. }
+            | ControlOutcome::Cloned { .. }
+            | ControlOutcome::RebindCalibrationFailed {
+                operation: ControlOperation::Fork | ControlOperation::Clone,
+                ..
+            }
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +249,11 @@ impl ChatPanel {
             model_names: Arc::new(std::collections::HashMap::new()),
             tool_preset: ToolPreset::Inherit,
             control_operation: None,
+            branch_tree: None,
+            branch_preview_leaf: None,
+            branch_preview_document: None,
+            retry_status: None,
+            compacting: false,
             popup: None,
             popup_index: 0,
             file_index: None,
@@ -229,6 +266,7 @@ impl ChatPanel {
             minimap_visible: true,
             expanded_tools: HashSet::new(),
             expanded_processes: HashSet::new(),
+            rpc_success: None,
             rpc_error: None,
             activity_generation: 0,
             calibration_generation: 0,
@@ -302,6 +340,7 @@ impl ChatPanel {
         self.status = ChatStatus::Loading {
             title: selection.title.clone(),
         };
+        self.rpc_success = None;
         self.rpc_error = None;
         self.draft_key = Some(selection.id.clone());
         self.composer_cwd = Some(selection.cwd.clone());
@@ -311,6 +350,11 @@ impl ChatPanel {
         self.model_names = Arc::new(std::collections::HashMap::new());
         self.tool_preset = ToolPreset::Inherit;
         self.control_operation = None;
+        self.branch_tree = None;
+        self.branch_preview_leaf = None;
+        self.branch_preview_document = None;
+        self.retry_status = None;
+        self.compacting = false;
         self.popup = None;
         self.popup_index = 0;
         self.prepare_draft_restore();
@@ -407,10 +451,14 @@ impl ChatPanel {
         match result {
             Ok((active, receiver)) => {
                 self.active = Some(active);
+                self.rpc_success = None;
                 self.rpc_error = None;
                 self.spawn_pump(receiver, cx);
             }
-            Err(error) => self.rpc_error = Some(error),
+            Err(error) => {
+                self.rpc_success = None;
+                self.rpc_error = Some(error);
+            }
         }
         cx.notify();
     }
@@ -420,7 +468,7 @@ impl ChatPanel {
             while let Some(message) = receiver.next().await {
                 let should_stop = panel
                     .update(cx, |panel, cx| {
-                        let should_stop = panel.handle_pump(message);
+                        let should_stop = panel.handle_pump(message, cx);
                         cx.notify();
                         should_stop
                     })
@@ -433,7 +481,7 @@ impl ChatPanel {
         .detach();
     }
 
-    fn handle_pump(&mut self, message: PumpMessage) -> bool {
+    fn handle_pump(&mut self, message: PumpMessage, cx: &mut Context<Self>) -> bool {
         let generation = match &message {
             PumpMessage::Events { generation, .. }
             | PumpMessage::RequestFinished { generation, .. }
@@ -459,6 +507,7 @@ impl ChatPanel {
                 Ok(active) => {
                     self.active = Some(*active);
                     self.tool_preset = preset;
+                    self.rpc_success = None;
                     self.rpc_error = None;
                     if let Some(active) = self.active.as_ref() {
                         active.refresh_metadata();
@@ -466,6 +515,7 @@ impl ChatPanel {
                 }
                 Err(error) => {
                     self.active = None;
+                    self.rpc_success = None;
                     self.rpc_error = Some(format!("工具预设重启失败；请重新启动活会话：{error}"));
                 }
             }
@@ -475,6 +525,7 @@ impl ChatPanel {
             && self.active.is_none()
         {
             if let Some(error) = error {
+                self.rpc_success = None;
                 self.rpc_error = Some(error.clone());
             }
             if self.control_operation == Some(ControlOperation::Tools) {
@@ -482,6 +533,13 @@ impl ChatPanel {
             }
             self.control_operation = None;
             return true;
+        }
+        let runtime_events = match &message {
+            PumpMessage::Events { runtime_events, .. } => Some(runtime_events.clone()),
+            _ => None,
+        };
+        if let Some(runtime_events) = runtime_events {
+            self.apply_runtime_events(runtime_events);
         }
         let Some(active) = self.active.as_mut() else {
             return false;
@@ -491,6 +549,9 @@ impl ChatPanel {
         }
         match message {
             PumpMessage::Events { events, .. } => {
+                if !events.is_empty() {
+                    self.rpc_success = None;
+                }
                 if events
                     .iter()
                     .any(|event| matches!(event, pi_render::LiveEvent::AgentStart))
@@ -514,9 +575,11 @@ impl ChatPanel {
                 ..
             } => match result {
                 Ok(()) => {
+                    self.rpc_success = None;
                     self.rpc_error = None;
                 }
                 Err((kind, error)) => {
+                    self.rpc_success = None;
                     if intent == RpcIntent::Abort {
                         active.reducer_mut().restore_running_if_stopping();
                     } else if should_restore_idle_phase(
@@ -559,21 +622,28 @@ impl ChatPanel {
                     self.slash_commands = commands;
                     self.refresh_popup_without_input();
                 }
-                Err(error) => self.rpc_error = Some(format!("加载 slash 命令失败：{error}")),
+                Err(error) => {
+                    self.rpc_success = None;
+                    self.rpc_error = Some(format!("加载 slash 命令失败：{error}"));
+                }
             },
             PumpMessage::ControlsLoaded { result, .. } => match result {
                 Ok(controls) => self.apply_controls(controls),
-                Err(error) => self.rpc_error = Some(format!("加载会话控制失败：{error}")),
+                Err(error) => {
+                    self.rpc_success = None;
+                    self.rpc_error = Some(format!("加载会话控制失败：{error}"));
+                }
             },
-            PumpMessage::ControlFinished { result, .. } => {
+            PumpMessage::ControlFinished {
+                operation, result, ..
+            } => {
                 self.control_operation = None;
                 match result {
-                    Ok(controls) => {
-                        self.apply_controls(controls);
-                        self.rpc_error = None;
-                    }
+                    Ok(outcome) => self.apply_control_outcome(operation, outcome, cx),
                     Err(error) => {
-                        self.rpc_error = Some(format!("切换会话控制失败：{error}"));
+                        self.compacting = false;
+                        self.rpc_success = None;
+                        self.rpc_error = Some(format!("会话操作失败：{error}"));
                         active.refresh_metadata();
                     }
                 }
@@ -600,11 +670,15 @@ impl ChatPanel {
                         self.sync_list_document(&document, true);
                         self.status = ChatStatus::Ready(document);
                     }
-                    Err(error) => self.rpc_error = Some(format!("会话落盘校准失败：{error}")),
+                    Err(error) => {
+                        self.rpc_success = None;
+                        self.rpc_error = Some(format!("会话落盘校准失败：{error}"));
+                    }
                 }
             }
             PumpMessage::Stopped { error, .. } => {
                 if let Some(error) = error {
+                    self.rpc_success = None;
                     self.rpc_error = Some(error);
                 }
                 self.active = None;
@@ -615,7 +689,140 @@ impl ChatPanel {
         false
     }
 
+    fn apply_runtime_events(&mut self, events: Vec<SessionRuntimeEvent>) {
+        for event in events {
+            match event {
+                SessionRuntimeEvent::CompactionStarted => self.compacting = true,
+                SessionRuntimeEvent::CompactionEnded { error } => {
+                    self.compacting = false;
+                    if let Some(error) = error {
+                        self.rpc_success = None;
+                        self.rpc_error = Some(format!("Compaction 失败：{error}"));
+                    }
+                }
+                SessionRuntimeEvent::RetryStarted {
+                    attempt,
+                    max_attempts,
+                    delay_ms,
+                    error,
+                } => {
+                    self.retry_status = Some(RetryStatus {
+                        attempt,
+                        max_attempts,
+                        delay_ms,
+                        error,
+                    });
+                }
+                SessionRuntimeEvent::RetryEnded { error, .. } => {
+                    self.retry_status = None;
+                    if let Some(error) = error {
+                        self.rpc_success = None;
+                        self.rpc_error = Some(format!("Auto-retry 结束：{error}"));
+                    }
+                }
+                SessionRuntimeEvent::AgentEnded { will_retry } => {
+                    if !will_retry && self.retry_status.is_some() {
+                        self.retry_status = None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_control_outcome(
+        &mut self,
+        operation: ControlOperation,
+        outcome: ControlOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        let sessions_changed = sessions_changed_for_outcome(&outcome);
+        self.rpc_success = None;
+        self.rpc_error = None;
+        match outcome {
+            ControlOutcome::Controls(controls) | ControlOutcome::Switched(controls) => {
+                self.apply_session_rebind(controls);
+            }
+            ControlOutcome::Compacted(_) => {
+                self.compacting = false;
+                if let Some(active) = self.active.as_ref() {
+                    active.refresh_metadata();
+                }
+            }
+            ControlOutcome::Forked { data, controls } => {
+                self.apply_session_rebind(controls);
+                self.drafts.set(
+                    self.draft_key.clone().unwrap_or_default(),
+                    pi_data::ComposerDraft {
+                        text: data.text,
+                        images: Vec::new(),
+                    },
+                );
+                self.pending_draft_restore = true;
+                self.attachments.clear();
+            }
+            ControlOutcome::ForkCancelled(_) | ControlOutcome::CloneCancelled => {}
+            ControlOutcome::RebindCalibrationFailed {
+                operation: _,
+                message,
+                fork_data,
+            } => {
+                if let Some(data) = fork_data {
+                    self.drafts.set(
+                        self.draft_key.clone().unwrap_or_default(),
+                        pi_data::ComposerDraft {
+                            text: data.text,
+                            images: Vec::new(),
+                        },
+                    );
+                    self.pending_draft_restore = true;
+                    self.attachments.clear();
+                }
+                self.rpc_error = Some(message);
+                if let Some(active) = self.active.as_ref() {
+                    active.refresh_metadata();
+                }
+            }
+            ControlOutcome::Cloned { controls, .. } => {
+                self.apply_session_rebind(controls);
+            }
+            ControlOutcome::SwitchCancelled => {}
+            ControlOutcome::Exported(data) => {
+                self.rpc_success = Some(format!("HTML 已导出：{}", data.path));
+            }
+            ControlOutcome::RetryAborted => {
+                if operation == ControlOperation::AbortRetry {
+                    self.retry_status = None;
+                }
+            }
+        }
+        if sessions_changed {
+            cx.emit(SessionsChanged);
+        }
+    }
+
+    fn apply_session_rebind(&mut self, controls: SessionControls) {
+        if let Some(path) = controls.session_file.clone() {
+            self.draft_key = Some(controls.session_id.clone());
+            if let Ok(document) = pi_render::render_path(&path)
+                && let Some(active) = self.active.as_mut()
+            {
+                active.calibrate(document);
+                let document = Arc::new(active.document());
+                self.sync_list_document(&document, true);
+                self.status = ChatStatus::Ready(document);
+            }
+        }
+        self.branch_preview_leaf = None;
+        self.branch_preview_document = None;
+        self.apply_controls(controls);
+    }
+
     fn apply_controls(&mut self, controls: SessionControls) {
+        self.compacting = controls.is_compacting;
+        self.branch_tree = self.current_session_branch_tree(
+            controls.session_file.as_deref(),
+            controls.tree.leaf_id.as_deref(),
+        );
         self.model_names = Arc::new(
             controls
                 .models
@@ -631,6 +838,15 @@ impl ChatPanel {
         self.controls = Some(controls);
     }
 
+    fn current_session_branch_tree(
+        &self,
+        path: Option<&std::path::Path>,
+        authoritative_leaf_id: Option<&str>,
+    ) -> Option<pi_data::SessionBranchTree> {
+        path.and_then(|path| pi_data::load_session(path).ok())
+            .map(|session| session.branch_tree_at_leaf(authoritative_leaf_id))
+    }
+
     fn set_model(&mut self, provider: String, model_id: String, cx: &mut Context<Self>) {
         if self.control_operation.is_some() {
             return;
@@ -642,8 +858,12 @@ impl ChatPanel {
             return;
         }
         self.control_operation = Some(ControlOperation::Model);
+        self.rpc_success = None;
         self.rpc_error = None;
-        active.request_control(ControlRequest::SetModel { provider, model_id });
+        active.request_control(
+            ControlOperation::Model,
+            ControlRequest::SetModel { provider, model_id },
+        );
         cx.notify();
     }
 
@@ -664,8 +884,9 @@ impl ChatPanel {
             .as_ref()
             .expect("can_cycle_model requires an active session");
         self.control_operation = Some(ControlOperation::Model);
+        self.rpc_success = None;
         self.rpc_error = None;
-        active.request_control(ControlRequest::CycleModel);
+        active.request_control(ControlOperation::Model, ControlRequest::CycleModel);
         cx.notify();
     }
 
@@ -680,8 +901,12 @@ impl ChatPanel {
             return;
         }
         self.control_operation = Some(ControlOperation::Thinking);
+        self.rpc_success = None;
         self.rpc_error = None;
-        active.request_control(ControlRequest::SetThinking(level));
+        active.request_control(
+            ControlOperation::Thinking,
+            ControlRequest::SetThinking(level),
+        );
         cx.notify();
     }
 
@@ -691,6 +916,7 @@ impl ChatPanel {
         }
         let Some(active) = self.active.take() else {
             self.tool_preset = preset;
+            self.rpc_success = None;
             self.rpc_error = None;
             cx.notify();
             return;
@@ -707,6 +933,7 @@ impl ChatPanel {
         let session_path = history.source_path.clone();
         let cwd = session_cwd(&session_path).unwrap_or_else(|| PathBuf::from("."));
         self.control_operation = Some(ControlOperation::Tools);
+        self.rpc_success = None;
         self.rpc_error = None;
         self.active_generation = self.active_generation.wrapping_add(1);
         self.activity_generation = 0;
@@ -720,6 +947,183 @@ impl ChatPanel {
             preset,
         );
         cx.notify();
+    }
+
+    fn begin_control(
+        &mut self,
+        operation: ControlOperation,
+        request: ControlRequest,
+        cx: &mut Context<Self>,
+    ) {
+        if self.control_operation.is_some() {
+            return;
+        }
+        let Some(active) = self.active.as_ref() else {
+            self.rpc_success = None;
+            self.rpc_error = Some("请先启动活会话".to_owned());
+            cx.notify();
+            return;
+        };
+        if active.phase() != LivePhase::Idle && operation != ControlOperation::AbortRetry {
+            return;
+        }
+        self.control_operation = Some(operation);
+        self.rpc_success = None;
+        self.rpc_error = None;
+        active.request_control(operation, request);
+        cx.notify();
+    }
+
+    fn set_auto_compaction(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.begin_control(
+            ControlOperation::AutoCompaction,
+            ControlRequest::SetAutoCompaction(enabled),
+            cx,
+        );
+    }
+
+    fn set_auto_retry(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.begin_control(
+            ControlOperation::AutoRetry,
+            ControlRequest::SetAutoRetry(enabled),
+            cx,
+        );
+    }
+
+    fn abort_retry(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.begin_control(ControlOperation::AbortRetry, ControlRequest::AbortRetry, cx);
+    }
+
+    fn fork_message(&mut self, entry_id: String, cx: &mut Context<Self>) {
+        // 只允许权威当前分支中的 user entry；预览其它 leaf 时必须先 clone/fork，不能写错 branch。
+        let forkable = self.branch_tree.as_ref().is_some_and(|tree| {
+            tree.active_path.contains(&entry_id)
+                && tree
+                    .nodes
+                    .iter()
+                    .any(|node| node.id == entry_id && node.forkable_user_message.is_some())
+        });
+        if !forkable {
+            self.rpc_success = None;
+            self.rpc_error = Some("只能从当前分支的用户消息创建 fork".to_owned());
+            cx.notify();
+            return;
+        }
+        self.begin_control(
+            ControlOperation::Fork,
+            ControlRequest::Fork { entry_id },
+            cx,
+        );
+    }
+
+    fn preview_branch(&mut self, leaf_id: String, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .controls
+            .as_ref()
+            .and_then(|controls| controls.session_file.clone())
+        else {
+            return;
+        };
+        match pi_render::render_path_at_leaf(&path, &leaf_id) {
+            Ok(Some(document)) => {
+                self.branch_preview_leaf = Some(leaf_id);
+                self.branch_preview_document = Some(Arc::new(document));
+                self.rpc_success = None;
+                self.rpc_error = None;
+            }
+            Ok(None) => {
+                self.rpc_success = None;
+                self.rpc_error = Some("该分支不可安全投影".to_owned());
+            }
+            Err(error) => {
+                self.rpc_success = None;
+                self.rpc_error = Some(format!("加载分支预览失败：{error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn clear_branch_preview(&mut self, cx: &mut Context<Self>) {
+        self.branch_preview_leaf = None;
+        self.branch_preview_document = None;
+        cx.notify();
+    }
+
+    fn choose_session_switch(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.control_operation.is_some() || self.active.is_none() {
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择要切换到的 pi 会话 JSONL".into()),
+        });
+        cx.spawn_in(window, async move |panel, cx| {
+            let path = receiver
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten()
+                .and_then(|paths| paths.into_iter().next());
+            let Some(path) = path else { return };
+            let _ = panel.update(cx, |panel, cx| {
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl")
+                {
+                    panel.begin_control(
+                        ControlOperation::SwitchSession,
+                        ControlRequest::SwitchSession { path },
+                        cx,
+                    );
+                } else {
+                    panel.rpc_success = None;
+                    panel.rpc_error = Some("只能切换到 .jsonl 会话文件".to_owned());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn export_html(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.control_operation.is_some() || self.active.is_none() {
+            return;
+        }
+        let start = self
+            .composer_cwd
+            .clone()
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let session_id = self
+            .controls
+            .as_ref()
+            .map(|controls| controls.session_id.clone())
+            .unwrap_or_else(|| "session".to_owned());
+        let receiver =
+            cx.prompt_for_new_path(&start, Some(&format!("pi-session-{session_id}.html")));
+        cx.spawn_in(window, async move |panel, cx| {
+            let destination = receiver.await.ok().into_iter().flatten().flatten().next();
+            let Some(destination) = destination else {
+                return;
+            };
+            let _ = panel.update(cx, |panel, cx| {
+                panel.begin_control(
+                    ControlOperation::ExportHtml,
+                    ControlRequest::ExportHtml {
+                        output_path: destination,
+                    },
+                    cx,
+                );
+            });
+        })
+        .detach();
     }
 
     fn composer_changed(&mut self, input: &gpui::Entity<TextareaState>, cx: &mut Context<Self>) {
@@ -880,8 +1284,14 @@ impl ChatPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.control_operation.is_some() {
-            self.rpc_error = Some("会话控制切换中，暂不能发送消息".to_owned());
+        self.rpc_success = None;
+        if self.branch_preview_leaf.is_some() {
+            self.rpc_error = Some("当前是只读分支预览；返回当前分支后才能发送".to_owned());
+            cx.notify();
+            return;
+        }
+        if self.control_operation.is_some() || self.compacting {
+            self.rpc_error = Some("会话操作进行中，暂不能发送消息".to_owned());
             cx.notify();
             return;
         }
@@ -967,7 +1377,10 @@ impl ChatPanel {
                 }
                 match result {
                     Ok(images) => panel.add_draft_images(images, cx),
-                    Err(error) => panel.rpc_error = Some(error),
+                    Err(error) => {
+                        panel.rpc_success = None;
+                        panel.rpc_error = Some(error);
+                    }
                 }
                 cx.notify();
             });
@@ -977,6 +1390,7 @@ impl ChatPanel {
 
     fn add_draft_images(&mut self, images: Vec<pi_data::DraftImage>, cx: &mut Context<Self>) {
         if let Err(error) = pi_data::validate_image_batch(self.attachments.len(), &images) {
+            self.rpc_success = None;
             self.rpc_error = Some(error.to_string());
             return;
         }
@@ -985,6 +1399,7 @@ impl ChatPanel {
         if let Some(key) = self.draft_key.clone() {
             self.drafts.set(key, self.current_draft(cx));
         }
+        self.rpc_success = None;
         self.rpc_error = None;
     }
 
@@ -1242,6 +1657,7 @@ impl Drop for ChatPanel {
 
 impl EventEmitter<PanelEvent> for ChatPanel {}
 impl EventEmitter<crate::main_panel::OpenFileRequest> for ChatPanel {}
+impl EventEmitter<SessionsChanged> for ChatPanel {}
 
 impl Focusable for ChatPanel {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -1293,7 +1709,12 @@ impl Render for ChatPanel {
         let model_panel = panel.clone();
         let thinking_panel = panel.clone();
         let tools_panel = panel.clone();
-        let content = match &self.status {
+        let visible_status = self
+            .branch_preview_document
+            .as_ref()
+            .map(|document| ChatStatus::Ready(document.clone()))
+            .unwrap_or_else(|| self.status.clone());
+        let content = match &visible_status {
             ChatStatus::Empty => centered_state(
                 IconName::Bot,
                 "选择一个历史会话",
@@ -1348,6 +1769,12 @@ impl Render for ChatPanel {
                             panel.update(cx, |panel, cx| panel.toggle_process(key, cx));
                         }
                     })
+                    .on_fork_message({
+                        let panel = cx.entity();
+                        move |entry_id, cx| {
+                            panel.update(cx, |panel, cx| panel.fork_message(entry_id, cx));
+                        }
+                    })
                     .on_toggle_minimap({
                         let panel = cx.entity();
                         move |cx| {
@@ -1398,6 +1825,10 @@ impl Render for ChatPanel {
             (steering + follow_up > 0)
                 .then(|| format!("队列：steer {steering} · follow-up {follow_up}"))
         });
+        if self.rpc_error.is_some() {
+            // 错误反馈优先于较早的成功反馈，禁止绿红两条同时出现。
+            self.rpc_success = None;
+        }
         let controls_enabled = session_controls_enabled(phase, self.control_operation.is_some());
         let tools_enabled = !running
             && !stopping
@@ -1432,6 +1863,104 @@ impl Render for ChatPanel {
             .as_ref()
             .map(|controls| controls.thinking_level);
         let selected_tool_preset = self.tool_preset;
+        let auto_compaction = self
+            .controls
+            .as_ref()
+            .is_some_and(|controls| controls.auto_compaction_enabled);
+        let auto_retry = self
+            .controls
+            .as_ref()
+            .is_some_and(|controls| controls.auto_retry_enabled);
+        let branch_nodes = self
+            .branch_tree
+            .as_ref()
+            .map(|tree| tree.nodes.clone())
+            .unwrap_or_default();
+        let active_path = self
+            .branch_tree
+            .as_ref()
+            .map(|tree| tree.active_path.clone())
+            .unwrap_or_default();
+        let selected_preview_leaf = self.branch_preview_leaf.clone();
+        let branch_panel = panel.clone();
+        let branch_trigger = Button::new("branch-navigator-trigger")
+            .debug_selector(|| "branch-navigator-trigger".into())
+            .ghost()
+            .small()
+            .icon(IconName::Copy)
+            .label("分支")
+            .tooltip("查看会话分支树")
+            .disabled(!live_started || branch_nodes.is_empty());
+        let branch_popover = Popover::new("branch-navigator")
+            .anchor(Anchor::TopLeft)
+            .trigger(branch_trigger)
+            .content(move |_, _, cx| {
+                let rows = if branch_nodes.is_empty() {
+                    vec![
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("当前会话没有可显示的分支")
+                            .into_any_element(),
+                    ]
+                } else {
+                    branch_nodes
+                        .iter()
+                        .map(|node| {
+                            let id = node.id.clone();
+                            let panel = branch_panel.clone();
+                            let active = active_path.contains(&node.id);
+                            let selected = selected_preview_leaf.as_deref() == Some(&node.id);
+                            let label = node.label.clone().unwrap_or_else(|| node.preview.clone());
+                            h_flex()
+                                .id(SharedString::from(format!("branch-node-{}", node.id)))
+                                .debug_selector(|| "branch-node".into())
+                                .w_full()
+                                .min_w_0()
+                                .gap_2()
+                                .pl(px(node.depth.saturating_mul(12) as f32))
+                                .pr_2()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .when(selected, |row| row.bg(cx.theme().accent.opacity(0.16)))
+                                .hover(|row| row.bg(cx.theme().muted))
+                                .child(div().size_2().flex_none().rounded_full().bg(if active {
+                                    cx.theme().accent
+                                } else {
+                                    cx.theme().border
+                                }))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(if active {
+                                            cx.theme().foreground
+                                        } else {
+                                            cx.theme().muted_foreground
+                                        })
+                                        .child(label),
+                                )
+                                .on_click(move |_, _, cx| {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.preview_branch(id.clone(), cx)
+                                    });
+                                })
+                                .into_any_element()
+                        })
+                        .collect()
+                };
+                v_flex()
+                    .debug_selector(|| "branch-navigator-content".into())
+                    // 使用 GPUI 既有尺寸刻度，不自造 popover 像素尺寸（规范红线 4）。
+                    .w_80()
+                    .max_h_64()
+                    .overflow_y_scrollbar()
+                    .gap_1()
+                    .children(rows)
+            });
 
         div()
             .id("chat-workspace")
@@ -1474,6 +2003,83 @@ impl Render for ChatPanel {
                                 .child(summary),
                         )
                     })
+                    .when_some(self.branch_preview_leaf.clone(), |view, leaf| {
+                        view.child(
+                            h_flex()
+                                .debug_selector(|| "branch-preview-banner".into())
+                                .gap_2()
+                                .px_3()
+                                .py_1()
+                                .bg(cx.theme().accent.opacity(0.16))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_xs()
+                                        .child(format!("只读分支预览：{leaf}；发送已禁用")),
+                                )
+                                .child(
+                                    Button::new("close-branch-preview")
+                                        .ghost()
+                                        .small()
+                                        .label("返回当前分支")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.clear_branch_preview(cx)
+                                        })),
+                                ),
+                        )
+                    })
+                    .when_some(self.retry_status.clone(), |view, retry| {
+                        view.child(
+                            h_flex()
+                                .debug_selector(|| "auto-retry-status".into())
+                                .gap_2()
+                                .px_3()
+                                .py_1()
+                                .child(div().size_2().rounded_full().bg(cx.theme().warning))
+                                .child(
+                                    div().flex_1().text_xs().child(format!(
+                                        "Auto-retry {}/{} · {}ms · {}",
+                                        retry.attempt, retry.max_attempts, retry.delay_ms, retry.error
+                                    )),
+                                )
+                                .child(
+                                    Button::new("abort-retry")
+                                        .ghost()
+                                        .small()
+                                        .label("取消重试")
+                                        .disabled(abort_retry_disabled(
+                                            self.control_operation.is_some(),
+                                        ))
+                                        .on_click(cx.listener(Self::abort_retry)),
+                                ),
+                        )
+                    })
+                    .when(self.compacting, |view| {
+                        view.child(
+                            h_flex()
+                                .debug_selector(|| "compaction-status".into())
+                                .gap_2()
+                                .px_3()
+                                .py_1()
+                                .child(div().size_2().rounded_full().bg(cx.theme().warning))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .child("正在压缩上下文；官方 RPC 无取消命令"),
+                                ),
+                        )
+                    })
+                    .when_some(self.rpc_success.clone(), |view, success| {
+                        view.child(
+                            div()
+                                .debug_selector(|| "live-success".into())
+                                .px_3()
+                                .py_1()
+                                .text_xs()
+                                .text_color(cx.theme().success)
+                                .child(success),
+                        )
+                    })
                     .when_some(self.rpc_error.clone(), |view, error| {
                         view.child(
                             div()
@@ -1500,6 +2106,96 @@ impl Render for ChatPanel {
                             .when_some(attachments, |composer, attachments| {
                                 composer.child(attachments)
                             })
+                            .child(
+                                h_flex()
+                                    .debug_selector(|| "r13-session-controls".into())
+                                    .gap_2()
+                                    .child(branch_popover)
+                                    .child(
+                                        Button::new("session-actions")
+                                            .debug_selector(|| "session-actions".into())
+                                            .ghost()
+                                            .small()
+                                            .label("会话")
+                                            .tooltip("会话分支、压缩与切换")
+                                            .disabled(!live_started)
+                                            .dropdown_menu({
+                                                let panel = panel.clone();
+                                                move |menu, _, _| {
+                                                    let clone_panel = panel.clone();
+                                                    let compact_panel = panel.clone();
+                                                    let auto_compaction_panel = panel.clone();
+                                                    let auto_retry_panel = panel.clone();
+                                                    let switch_panel = panel.clone();
+                                                    menu.item(
+                                                        PopupMenuItem::new("Clone 当前分支")
+                                                            .on_click(move |_, _, cx| {
+                                                                clone_panel.update(cx, |panel, cx| {
+                                                                    panel.begin_control(
+                                                                        ControlOperation::Clone,
+                                                                        ControlRequest::Clone,
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            }),
+                                                    )
+                                                    .item(
+                                                        PopupMenuItem::new("手动 Compact")
+                                                            .on_click(move |_, _, cx| {
+                                                                compact_panel.update(cx, |panel, cx| {
+                                                                    panel.begin_control(
+                                                                        ControlOperation::Compact,
+                                                                        ControlRequest::Compact,
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            }),
+                                                    )
+                                                    .item(
+                                                        PopupMenuItem::new("Auto-compaction")
+                                                            .checked(auto_compaction)
+                                                            .on_click(move |_, _, cx| {
+                                                                auto_compaction_panel.update(cx, |panel, cx| {
+                                                                    panel.set_auto_compaction(!auto_compaction, cx);
+                                                                });
+                                                            }),
+                                                    )
+                                                    .item(
+                                                        PopupMenuItem::new("Auto-retry")
+                                                            .checked(auto_retry)
+                                                            .on_click(move |_, _, cx| {
+                                                                auto_retry_panel.update(cx, |panel, cx| {
+                                                                    panel.set_auto_retry(!auto_retry, cx);
+                                                                });
+                                                            }),
+                                                    )
+                                                    .item(
+                                                        PopupMenuItem::new("切换会话文件")
+                                                            .on_click(move |_, window, cx| {
+                                                                switch_panel.update(cx, |panel, cx| {
+                                                                    panel.choose_session_switch(
+                                                                        &gpui::ClickEvent::default(),
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            }),
+                                                    )
+                                                }
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("export-html")
+                                            .debug_selector(|| "export-html".into())
+                                            .ghost()
+                                            .small()
+                                            .icon(IconName::Copy)
+                                            .label("导出")
+                                            .tooltip("导出当前会话 HTML")
+                                            .disabled(!controls_enabled)
+                                            .on_click(cx.listener(Self::export_html)),
+                                    ),
+                            )
                             .child(Textarea::new(&self.composer).h(px(76.)))
                             .child(
                                 h_flex()
@@ -1616,6 +2312,7 @@ impl Render for ChatPanel {
                                                 menu
                                             }),
                                     )
+                                    .child(div().flex_1())
                                     .child(
                                         Button::new("tools-selector")
                                             .debug_selector(|| "tools-selector".into())
@@ -1652,7 +2349,6 @@ impl Render for ChatPanel {
                                                 menu
                                             }),
                                     )
-                                    .child(div().flex_1())
                                     // 右：模式切换 → 停止（仅运行态）→ 发送（唯一常驻主操作）。
                                     .child(
                                         div()
@@ -1726,7 +2422,9 @@ impl Render for ChatPanel {
                                             .disabled(
                                                 !live_started
                                                     || stopping
-                                                    || self.control_operation.is_some(),
+                                                    || self.control_operation.is_some()
+                                                    || self.branch_preview_leaf.is_some()
+                                                    || self.compacting,
                                             )
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 let input = this.composer.clone();
@@ -1765,6 +2463,11 @@ const fn next_composer_mode(checks: &[bool], current: ComposerMode) -> Option<Co
 
 const fn session_controls_enabled(phase: Option<LivePhase>, busy: bool) -> bool {
     matches!(phase, Some(LivePhase::Idle)) && !busy
+}
+
+const fn abort_retry_disabled(busy: bool) -> bool {
+    // begin_control 对所有控制操作共用同一个 busy 门禁，按钮状态必须与之完全一致。
+    busy
 }
 
 const fn should_restore_submission(kind: RequestFailureKind) -> bool {
@@ -2581,21 +3284,22 @@ mod tests {
             .debug_bounds("composer-mode-toggle")
             .expect("composer 模式切换组必须渲染");
         assert!(group.size.width > px(0.));
-        let steer = visual
-            .debug_bounds("composer-mode-steer")
-            .expect("Steer 段必须渲染")
-            .center();
+        // 新增左侧会话控件后布局更密，先重新绘制，避免测试持有布局前的命中坐标。
+        draw_frames(&mut visual, 1);
         let follow_up = visual
             .debug_bounds("composer-mode-follow-up")
-            .expect("Follow-up 段必须渲染")
+            .expect("Follow-up 段必须保持可点击")
             .center();
-
         visual.simulate_click(follow_up, Modifiers::default());
         visual.run_until_parked();
         panel.update(cx, |panel, _| {
             assert_eq!(panel.composer_mode, ComposerMode::FollowUp);
         });
 
+        let steer = visual
+            .debug_bounds("composer-mode-steer")
+            .expect("Steer 段必须保持可点击")
+            .center();
         visual.simulate_click(steer, Modifiers::default());
         visual.run_until_parked();
         panel.update(cx, |panel, _| {
@@ -2637,12 +3341,29 @@ mod tests {
                 thinking_level: pi_rpc::ThinkingLevel::High,
                 models: vec![model],
                 thinking_levels: vec![pi_rpc::ThinkingLevel::Off, pi_rpc::ThinkingLevel::High],
+                session_file: None,
+                session_id: "fixture".to_owned(),
+                tree: pi_rpc::TreeData {
+                    tree: Vec::new(),
+                    leaf_id: None,
+                },
+                auto_compaction_enabled: true,
+                auto_retry_enabled: true,
+                is_compacting: false,
             });
             panel.tool_preset = ToolPreset::ReadOnly;
             cx.notify();
         });
         draw_frames(&mut visual, 2);
-        for selector in ["model-selector", "thinking-selector", "tools-selector"] {
+        for selector in [
+            "model-selector",
+            "thinking-selector",
+            "tools-selector",
+            "r13-session-controls",
+            "branch-navigator-trigger",
+            "session-actions",
+            "export-html",
+        ] {
             assert!(
                 visual.debug_bounds(selector).is_some(),
                 "missing {selector}"
@@ -2651,27 +3372,84 @@ mod tests {
     }
 
     #[gpui::test]
+    fn exported_html_uses_success_feedback_not_error_feedback(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, cx| {
+            panel.rpc_error = Some("stale error".to_owned());
+            panel.apply_control_outcome(
+                ControlOperation::ExportHtml,
+                ControlOutcome::Exported(pi_rpc::ExportPathData {
+                    path: "C:/tmp/session.html".to_owned(),
+                }),
+                cx,
+            );
+            assert!(panel.rpc_error.is_none());
+            assert_eq!(
+                panel.rpc_success.as_deref(),
+                Some("HTML 已导出：C:/tmp/session.html")
+            );
+        });
+        draw_frames(&mut visual, 2);
+        assert!(visual.debug_bounds("live-success").is_some());
+        assert!(visual.debug_bounds("live-error").is_none());
+    }
+
+    #[gpui::test]
+    fn error_feedback_suppresses_stale_success_feedback(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, cx| {
+            panel.rpc_success = Some("HTML 已导出：C:/tmp/session.html".to_owned());
+            panel.rpc_error = Some("later failure".to_owned());
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        panel.update(cx, |panel, _| assert!(panel.rpc_success.is_none()));
+        assert!(visual.debug_bounds("live-success").is_none());
+        assert!(visual.debug_bounds("live-error").is_some());
+    }
+
+    #[test]
+    fn branch_navigator_uses_component_size_scales() {
+        let source = include_str!("panels.rs");
+        let production = source.split("mod tests {").next().unwrap();
+        let old_width = [".w(px(", "360.", "))"].concat();
+        let old_height = [".max_h(px(", "260.", "))"].concat();
+        assert!(production.contains(".w_80()"));
+        assert!(production.contains(".max_h_64()"));
+        assert!(!production.contains(&old_width));
+        assert!(!production.contains(&old_height));
+    }
+
+    #[gpui::test]
     fn tool_restart_failure_is_recoverable_and_stale_failures_are_ignored(cx: &mut TestAppContext) {
         let (_visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
-        panel.update(cx, |panel, _| {
+        panel.update(cx, |panel, cx| {
             panel.active_generation = 7;
             panel.activity_generation = 9;
             panel.calibration_generation = 9;
             panel.control_operation = Some(ControlOperation::Tools);
             panel.rpc_error = None;
-            assert!(!panel.handle_pump(PumpMessage::ToolRestartFinished {
-                generation: 6,
-                preset: ToolPreset::ReadOnly,
-                result: Err("stale".to_owned()),
-            }));
+            assert!(!panel.handle_pump(
+                PumpMessage::ToolRestartFinished {
+                    generation: 6,
+                    preset: ToolPreset::ReadOnly,
+                    result: Err("stale".to_owned()),
+                },
+                cx,
+            ));
             assert_eq!(panel.control_operation, Some(ControlOperation::Tools));
             assert!(panel.rpc_error.is_none());
 
-            assert!(!panel.handle_pump(PumpMessage::ToolRestartFinished {
-                generation: 7,
-                preset: ToolPreset::ReadOnly,
-                result: Err("spawn failed".to_owned()),
-            }));
+            assert!(!panel.handle_pump(
+                PumpMessage::ToolRestartFinished {
+                    generation: 7,
+                    preset: ToolPreset::ReadOnly,
+                    result: Err("spawn failed".to_owned()),
+                },
+                cx,
+            ));
             assert!(panel.active.is_none());
             assert!(panel.control_operation.is_none());
             assert!(panel.rpc_error.as_deref().is_some_and(|error| {
@@ -2680,6 +3458,41 @@ mod tests {
             assert_eq!(panel.activity_generation, 9);
             assert_eq!(panel.calibration_generation, 9);
         });
+    }
+
+    #[gpui::test]
+    fn r13_runtime_statuses_render_as_points_and_retry_can_clear(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, cx| {
+            panel.apply_runtime_events(vec![
+                SessionRuntimeEvent::CompactionStarted,
+                SessionRuntimeEvent::RetryStarted {
+                    attempt: 2,
+                    max_attempts: 3,
+                    delay_ms: 2_000,
+                    error: "rate limited".to_owned(),
+                },
+            ]);
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        assert!(visual.debug_bounds("compaction-status").is_some());
+        assert!(visual.debug_bounds("auto-retry-status").is_some());
+        panel.update(cx, |panel, cx| {
+            panel.apply_runtime_events(vec![
+                SessionRuntimeEvent::CompactionEnded { error: None },
+                SessionRuntimeEvent::RetryEnded {
+                    success: true,
+                    attempt: 2,
+                    error: None,
+                },
+            ]);
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        assert!(visual.debug_bounds("compaction-status").is_none());
+        assert!(visual.debug_bounds("auto-retry-status").is_none());
     }
 
     #[gpui::test]
@@ -2787,6 +3600,53 @@ mod tests {
     }
 
     #[test]
+    fn session_list_refreshes_only_for_successful_fork_or_clone() {
+        let controls = SessionControls {
+            model: None,
+            thinking_level: pi_rpc::ThinkingLevel::Off,
+            models: Vec::new(),
+            thinking_levels: Vec::new(),
+            session_file: None,
+            session_id: "fixture".to_owned(),
+            tree: pi_rpc::TreeData {
+                tree: Vec::new(),
+                leaf_id: None,
+            },
+            auto_compaction_enabled: true,
+            auto_retry_enabled: true,
+            is_compacting: false,
+        };
+        assert!(sessions_changed_for_outcome(&ControlOutcome::Forked {
+            data: pi_rpc::ForkData {
+                text: "fork".to_owned(),
+                cancelled: false,
+            },
+            controls: controls.clone(),
+        }));
+        assert!(sessions_changed_for_outcome(&ControlOutcome::Cloned {
+            data: pi_rpc::CloneData { cancelled: false },
+            controls,
+        }));
+        assert!(sessions_changed_for_outcome(
+            &ControlOutcome::RebindCalibrationFailed {
+                operation: ControlOperation::Fork,
+                message: "success with warning".to_owned(),
+                fork_data: None,
+            }
+        ));
+        assert!(!sessions_changed_for_outcome(
+            &ControlOutcome::ForkCancelled(pi_rpc::ForkData {
+                text: String::new(),
+                cancelled: true,
+            })
+        ));
+        assert!(!sessions_changed_for_outcome(
+            &ControlOutcome::CloneCancelled
+        ));
+        assert!(!sessions_changed_for_outcome(&ControlOutcome::RetryAborted));
+    }
+
+    #[test]
     fn session_controls_only_enable_for_idle_non_busy_sessions() {
         assert!(session_controls_enabled(Some(LivePhase::Idle), false));
         for phase in [
@@ -2798,6 +3658,8 @@ mod tests {
             assert!(!session_controls_enabled(phase, false));
         }
         assert!(!session_controls_enabled(Some(LivePhase::Idle), true));
+        assert!(!abort_retry_disabled(false));
+        assert!(abort_retry_disabled(true));
     }
 
     #[test]
