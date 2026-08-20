@@ -1,6 +1,6 @@
 # Round 16 — 模型配置面板与登录
 
-> 执行方：**Windows** · 状态：验收完成，待 PR / CI
+> 执行方：**Windows** · 状态：已完成（PR [#25](https://github.com/cking000bigdemon/GPUI-Pi/pull/25) 已合并）
 
 ## 目标
 
@@ -86,4 +86,4 @@
 - 全量 validation：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/validate.ps1` exit 0；pins、fmt、clippy、workspace tests（app 95 passed / 1 ignored；ui 26；pi-data 70 + integration；pi-render 19 + integration；pi-rpc 12 + client 15）与 release build 全绿，末行 `VALIDATE OK`。
 - 视觉 SCREENSHOT review：已完成并 PASS，5 张截图证据与审查报告见上方记录。
 - T3 用户路径：用户于 `2026-08-20` 确认 `cliproxy-dmit` 与 `deepseek` 两家真实 provider 的 API Key/OAuth 认证状态均正常；刷新/发现后可看到并选择真实模型，且已完成至少一次明确授权的真实连通性测试，结果 OK。未记录、展示或提交任何密钥/token 正文。
-- 收口状态：T1–T3、独立代码审查与 SCREENSHOT 视觉审查均通过；待创建 PR 并提交 GitHub CI。
+- 收口状态：T1–T3、独立代码审查与 SCREENSHOT 视觉审查均通过；PR [#25](https://github.com/cking000bigdemon/GPUI-Pi/pull/25) 已创建并经 GitHub CI 通过后于 `2026-08-20` 合并，`ROUNDS.md` 已回填为已完成。

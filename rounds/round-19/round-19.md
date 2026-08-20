@@ -1,6 +1,6 @@
 # Round 19 — Windows 应用图标
 
-> 执行方：**Windows** · 状态：进行中（PR [#21](https://github.com/cking000bigdemon/GPUI-Pi/pull/21) 待审）
+> 执行方：**Windows** · 状态：已完成（PR [#21](https://github.com/cking000bigdemon/GPUI-Pi/pull/21) 已合并）
 
 ## 目标
 
