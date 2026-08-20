@@ -17,7 +17,7 @@
 | **R9** | 前端视觉打磨（依据 [`docs/UI设计规范.md`](docs/UI设计规范.md)，源自 Zed Agent Panel 设计语言调研；规范演进至 v2.2） | Windows | ✅ 已完成 | [#16](https://github.com/cking000bigdemon/GPUI-Pi/pull/16) | 2026-08-18 |
 | **R10** | 模型 · 思考级别 · 工具预设 | Windows | ✅ | [#17](https://github.com/cking000bigdemon/GPUI-Pi/pull/17) | 2026-08-18 |
 | **R11** | 文件浏览器 + 查看器 | Windows | ✅ 已完成 | [#18](https://github.com/cking000bigdemon/GPUI-Pi/pull/18) | 2026-08-19 |
-| **R12** | git diff / worktree / 本轮改动文件 | Windows | ⬜ | — | — |
+| **R12** | git diff / worktree / 本轮改动文件 | Windows | ✅ 已完成 | — | 2026-08-20 |
 | **R13** | 分支树 · compaction · retry · 导出 | Windows | ⬜ | — | — |
 | **R14** | Extension UI Protocol | Windows | ⬜ | — | — |
 | **R15** | 项目命令环境 bash 扩展（`.ts`） | Windows | ⬜ | — | — |

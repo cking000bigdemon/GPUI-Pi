@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::{
     Block, ConversationDocument, ConversationItem, Message, MessageRole, MinimapNode, ModelRef,
     NoticeBlock, RenderDiagnostic, ToolCard, ToolOutput, ToolStatus, parse_ansi,
-    parse_unified_diff, project_conversation,
+    parse_unified_diff,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +253,7 @@ impl LiveSessionReducer {
         Self::new(ConversationDocument {
             session_id,
             source_path,
+            cwd: PathBuf::new(),
             messages: Arc::from([]),
             items: Arc::from([]),
             minimap: Arc::from([]),
@@ -556,10 +557,19 @@ impl LiveSessionReducer {
                 live_messages.push(Arc::new(message));
             }
 
-            // 已校准历史的 turn 投影直接复用；流式帧只重算当前活动片段，
-            // 避免每 20ms 扫描并克隆整段长会话。
             let active_tail = self.phase != LivePhase::Idle;
-            let (live_items, mut live_minimap) = project_conversation(&live_messages, active_tail);
+            // 历史文档已完成 written-files 与 turn 投影。流式帧只投影 live 段，
+            // 再复用历史 item/message Arc；draft delta 不扫描或克隆整段历史。
+            crate::attach_written_files(&mut live_messages, &self.history.cwd, active_tail);
+            let (live_items, live_minimap) =
+                crate::project_conversation(&live_messages, active_tail);
+            let mut messages =
+                Vec::with_capacity(self.history.messages.len() + live_messages.len());
+            messages.extend(self.history.messages.iter().cloned());
+            messages.extend(live_messages);
+            let mut items = Vec::with_capacity(self.history.items.len() + live_items.len());
+            items.extend(self.history.items.iter().cloned());
+            items.extend(live_items);
             let turn_offset = self
                 .history
                 .minimap
@@ -567,19 +577,12 @@ impl LiveSessionReducer {
                 .map(|node| node.turn)
                 .max()
                 .unwrap_or(0);
-            for node in &mut live_minimap {
-                node.turn += turn_offset;
-            }
-            let mut items = Vec::with_capacity(self.history.items.len() + live_items.len());
-            items.extend(self.history.items.iter().cloned());
-            items.extend(live_items);
             let mut minimap = Vec::with_capacity(self.history.minimap.len() + live_minimap.len());
             minimap.extend(self.history.minimap.iter().cloned());
-            minimap.extend(live_minimap);
-            let mut messages =
-                Vec::with_capacity(self.history.messages.len() + live_messages.len());
-            messages.extend(self.history.messages.iter().cloned());
-            messages.extend(live_messages);
+            minimap.extend(live_minimap.into_iter().map(|mut node| {
+                node.turn += turn_offset;
+                node
+            }));
 
             self.cached_items = items.into();
             self.cached_minimap = minimap.into();
@@ -598,6 +601,7 @@ impl LiveSessionReducer {
         ConversationDocument {
             session_id: self.session_id.clone(),
             source_path: self.source_path.clone(),
+            cwd: self.history.cwd.clone(),
             messages: self.cached_messages.clone(),
             items: self.cached_items.clone(),
             minimap: self.cached_minimap.clone(),
@@ -689,6 +693,7 @@ fn render_live_message(
             .map(str::to_owned),
         label: None,
         model: live_model_ref(value),
+        written_files: Vec::new(),
         blocks,
     })
 }

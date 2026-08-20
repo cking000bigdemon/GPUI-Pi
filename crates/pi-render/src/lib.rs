@@ -25,6 +25,7 @@ const PREVIEW_CHARS: usize = 240;
 pub struct ConversationDocument {
     pub session_id: String,
     pub source_path: PathBuf,
+    pub cwd: PathBuf,
     /// 文档快照共享已定稿历史，流式帧只复制 Arc 与当前草稿，不深拷贝全部消息。
     pub messages: Arc<[Arc<Message>]>,
     /// UI 直接消费按 turn 投影后的列表项，避免每帧重新扫描长会话。
@@ -88,6 +89,16 @@ pub struct Message {
     pub label: Option<String>,
     pub model: Option<ModelRef>,
     pub blocks: Vec<Block>,
+    /// 仅挂在一个已完成 turn 的最终 assistant answer 上。
+    pub written_files: Vec<WrittenFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrittenFile {
+    /// 原始工具参数解析出的展示路径。
+    pub path: PathBuf,
+    /// 后台完成 cwd 边界与链接逃逸检查；UI 只能打开此相对路径。
+    pub safe_relative_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -406,6 +417,7 @@ pub fn render_session(session: &SessionFile) -> ConversationDocument {
                             .unwrap_or_else(|| "自定义消息".to_owned()),
                     ),
                     model: None,
+                    written_files: Vec::new(),
                     blocks,
                 });
             }
@@ -420,6 +432,7 @@ pub fn render_session(session: &SessionFile) -> ConversationDocument {
                 timestamp: base.timestamp.clone(),
                 label: Some("上下文压缩".to_owned()),
                 model: None,
+                written_files: Vec::new(),
                 blocks: vec![Block::Notice(NoticeBlock {
                     title: tokens_before.map_or_else(
                         || "上下文压缩".to_owned(),
@@ -439,6 +452,7 @@ pub fn render_session(session: &SessionFile) -> ConversationDocument {
                 timestamp: base.timestamp.clone(),
                 label: Some("分支摘要".to_owned()),
                 model: None,
+                written_files: Vec::new(),
                 blocks: vec![Block::Notice(NoticeBlock {
                     title: from_id.as_ref().map_or_else(
                         || "分支摘要".to_owned(),
@@ -457,6 +471,7 @@ pub fn render_session(session: &SessionFile) -> ConversationDocument {
                 timestamp: base.timestamp.clone(),
                 label: Some("未知会话条目".to_owned()),
                 model: None,
+                written_files: Vec::new(),
                 blocks: vec![Block::Unknown(UnknownBlock {
                     kind: entry_type.clone(),
                     text: visible_json(raw),
@@ -467,15 +482,15 @@ pub fn render_session(session: &SessionFile) -> ConversationDocument {
         }
     }
 
-    let messages: Arc<[Arc<Message>]> = messages
-        .into_iter()
-        .map(Arc::new)
-        .collect::<Vec<_>>()
-        .into();
+    let mut messages = messages.into_iter().map(Arc::new).collect::<Vec<_>>();
+    let cwd = PathBuf::from(&session.header.cwd);
+    attach_written_files(&mut messages, &cwd, false);
     let (items, minimap) = project_conversation(&messages, false);
+    let messages: Arc<[Arc<Message>]> = messages.into();
     ConversationDocument {
         session_id: session.header.id.clone(),
         source_path: session.path.clone(),
+        cwd,
         messages,
         items: items.into(),
         minimap: minimap.into(),
@@ -587,6 +602,7 @@ fn render_message(
             timestamp: base.timestamp.clone(),
             label: Some("Bash execution".to_owned()),
             model: None,
+            written_files: Vec::new(),
             blocks: vec![Block::Tool(render_bash_execution(message))],
         });
     }
@@ -643,6 +659,7 @@ fn render_message(
         model: (role == MessageRole::Assistant)
             .then(|| message_model_ref(message).or_else(|| current_model.cloned()))
             .flatten(),
+        written_files: Vec::new(),
         blocks,
     })
 }
@@ -1015,6 +1032,7 @@ fn orphan_result_message(
         timestamp: base.timestamp.clone(),
         label: Some("未配对工具结果".to_owned()),
         model: None,
+        written_files: Vec::new(),
         blocks: vec![Block::Tool(ToolCard {
             id: result
                 .tool_call_id
@@ -1475,6 +1493,7 @@ pub(crate) fn project_conversation(
                     timestamp: final_message.timestamp.clone(),
                     label: final_message.label.clone(),
                     model: final_message.model.clone(),
+                    written_files: Vec::new(),
                     blocks: process_blocks,
                 }));
             }
@@ -1491,6 +1510,7 @@ pub(crate) fn project_conversation(
                     timestamp: final_message.timestamp.clone(),
                     label: final_message.label.clone(),
                     model: final_message.model.clone(),
+                    written_files: final_message.written_files.clone(),
                     blocks: answer_blocks,
                 });
                 push_minimap_node(&mut minimap, &answer, turn);
@@ -1513,6 +1533,163 @@ pub(crate) fn project_conversation(
         index = end;
     }
     (items, minimap)
+}
+
+fn attach_written_files(messages: &mut [Arc<Message>], cwd: &Path, active_tail: bool) {
+    let mut index = 0;
+    while index < messages.len() {
+        if messages[index].role != MessageRole::User {
+            index += 1;
+            continue;
+        }
+        let end = messages[index + 1..]
+            .iter()
+            .position(|message| message.role == MessageRole::User)
+            .map_or(messages.len(), |offset| index + 1 + offset);
+        if active_tail && end == messages.len() {
+            break;
+        }
+        let final_assistant = (index + 1..end).rev().find(|candidate| {
+            messages[*candidate].role == MessageRole::Assistant
+                && has_answer_content(&messages[*candidate])
+        });
+        if let Some(final_index) = final_assistant {
+            let files = extract_turn_written_files(&messages[index + 1..end], cwd);
+            if !files.is_empty() {
+                let mut final_message = (*messages[final_index]).clone();
+                final_message.written_files = files;
+                messages[final_index] = Arc::new(final_message);
+            }
+        }
+        index = end;
+    }
+}
+
+fn extract_turn_written_files(messages: &[Arc<Message>], cwd: &Path) -> Vec<WrittenFile> {
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+    for message in messages {
+        if message.role != MessageRole::Assistant {
+            continue;
+        }
+        for tool in message.blocks.iter().filter_map(|block| match block {
+            Block::Tool(tool) => Some(tool),
+            _ => None,
+        }) {
+            if !matches!(tool.status, ToolStatus::Success | ToolStatus::Empty)
+                || !is_file_writing_tool(&tool.name)
+            {
+                continue;
+            }
+            let Some(raw) = tool
+                .arguments
+                .get("file_path")
+                .or_else(|| tool.arguments.get("path"))
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+            else {
+                continue;
+            };
+            let path = resolve_written_path(raw, cwd);
+            let key = pi_data::project_identity_key(&path);
+            if seen.insert(key) {
+                files.push(WrittenFile {
+                    safe_relative_path: safe_relative_written_path(cwd, Path::new(raw)),
+                    path,
+                });
+            }
+        }
+    }
+    files
+}
+
+fn is_file_writing_tool(name: &str) -> bool {
+    let leaf = name.rsplit(['.', ':', '/']).next().unwrap_or(name);
+    let normalized = leaf
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != '-')
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "write"
+            | "edit"
+            | "writefile"
+            | "editfile"
+            | "multiedit"
+            | "notebookedit"
+            | "strreplace"
+            | "replaceeditor"
+    )
+}
+
+fn safe_relative_written_path(cwd: &Path, path: &Path) -> Option<PathBuf> {
+    let relative = if path.is_absolute() || is_windows_absolute_path(path) {
+        lexical_relative_to(cwd, path)?
+    } else {
+        path.to_path_buf()
+    };
+    normalize_safe_relative(&relative)
+}
+
+fn lexical_relative_to(root: &Path, path: &Path) -> Option<PathBuf> {
+    let root = normalize_lexical(root);
+    let path = normalize_lexical(path);
+    path.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+fn normalize_safe_relative(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
+}
+
+fn resolve_written_path(raw: &str, cwd: &Path) -> PathBuf {
+    let raw = if cfg!(windows) {
+        raw.replace('/', "\\")
+    } else {
+        raw.to_owned()
+    };
+    let path = PathBuf::from(raw);
+    let resolved = if path.is_absolute() || is_windows_absolute_path(&path) {
+        path
+    } else {
+        cwd.join(path)
+    };
+    normalize_lexical(&resolved)
+}
+
+fn is_windows_absolute_path(path: &Path) -> bool {
+    let text = path.as_os_str().to_string_lossy().replace('/', "\\");
+    (text.len() >= 3
+        && text.as_bytes().get(1) == Some(&b':')
+        && text.as_bytes().get(2) == Some(&b'\\'))
+        || text.starts_with("\\\\")
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn push_process_item(
@@ -1905,6 +2082,7 @@ mod tests {
             timestamp: None,
             label: None,
             model: None,
+            written_files: Vec::new(),
             blocks: vec![
                 Block::Markdown(MarkdownBlock {
                     source: "early text".to_owned(),
@@ -2074,6 +2252,143 @@ mod tests {
         assert_eq!(source.state, ImageState::Invalid);
         assert_eq!(remote.state, ImageState::Remote);
         assert_eq!(redacted.state, ImageState::Redacted);
+    }
+
+    #[test]
+    fn written_file_paths_are_pure_lexical_and_root_bounded() {
+        let cwd = if cfg!(windows) {
+            PathBuf::from(r"C:\fixture\project")
+        } else {
+            PathBuf::from("/fixture/project")
+        };
+        let inside = cwd.join("src/main.rs");
+        let outside = if cfg!(windows) {
+            PathBuf::from(r"C:\fixture\outside.txt")
+        } else {
+            PathBuf::from("/fixture/outside.txt")
+        };
+        assert_eq!(
+            safe_relative_written_path(&cwd, &inside),
+            Some(PathBuf::from("src/main.rs"))
+        );
+        assert_eq!(safe_relative_written_path(&cwd, &outside), None);
+        assert_eq!(
+            safe_relative_written_path(&cwd, Path::new("../escape.txt")),
+            None
+        );
+    }
+
+    #[test]
+    fn active_tail_defers_written_files_until_completed() {
+        let cwd = PathBuf::from("fixture");
+        let user = Arc::new(Message {
+            id: "u".to_owned(),
+            role: MessageRole::User,
+            timestamp: None,
+            label: None,
+            model: None,
+            written_files: Vec::new(),
+            blocks: vec![Block::Markdown(MarkdownBlock {
+                source: "do".to_owned(),
+            })],
+        });
+        let tool = Arc::new(Message {
+            id: "tool".to_owned(),
+            role: MessageRole::Assistant,
+            timestamp: None,
+            label: None,
+            model: None,
+            written_files: Vec::new(),
+            blocks: vec![Block::Tool(ToolCard {
+                id: "w".to_owned(),
+                name: "WriteFile".to_owned(),
+                arguments: serde_json::json!({"path":"out.txt"}),
+                input_json: "{}".to_owned(),
+                preview: "write".to_owned(),
+                status: ToolStatus::Empty,
+                output: Vec::new(),
+                details: None,
+                orphan: false,
+            })],
+        });
+        let answer = Arc::new(Message {
+            id: "a".to_owned(),
+            role: MessageRole::Assistant,
+            timestamp: None,
+            label: None,
+            model: None,
+            written_files: Vec::new(),
+            blocks: vec![Block::Markdown(MarkdownBlock {
+                source: "done".to_owned(),
+            })],
+        });
+        let mut messages = vec![user, tool, answer];
+        attach_written_files(&mut messages, &cwd, true);
+        assert!(messages[2].written_files.is_empty());
+        attach_written_files(&mut messages, &cwd, false);
+        assert_eq!(
+            messages[2].written_files[0].safe_relative_path,
+            Some(PathBuf::from("out.txt"))
+        );
+    }
+
+    #[test]
+    fn turn_written_files_only_attach_successful_writes_to_final_answer() {
+        let document = render_fixture(&[
+            serde_json::json!({"type":"message","id":"u","message":{"role":"user","content":"do it"}}),
+            serde_json::json!({"type":"message","id":"a1","message":{"role":"assistant","content":[
+                {"type":"toolCall","id":"w1","name":"write_file","arguments":{"file_path":"out/report.html"}},
+                {"type":"toolCall","id":"w2","name":"fs.edit","arguments":{"path":"src\\main.rs"}},
+                {"type":"toolCall","id":"w3","name":"write","arguments":{"path":"failed.txt"}},
+                {"type":"toolCall","id":"w4","name":"WriteFile","arguments":{"path":"empty.txt"}},
+                {"type":"toolCall","id":"w5","name":"MultiEdit","arguments":{"path":"src\\main.rs"}},
+                {"type":"toolCall","id":"w6","name":"read_file","arguments":{"path":"not-written.txt"}},
+                {"type":"toolCall","id":"w7","name":"NotebookEdit","arguments":{"path":"notes.ipynb"}}
+            ]}}),
+            serde_json::json!({"type":"message","id":"r1","message":{"role":"toolResult","toolCallId":"w1","toolName":"write_file","content":"ok"}}),
+            serde_json::json!({"type":"message","id":"r2","message":{"role":"toolResult","toolCallId":"w2","toolName":"fs.edit","content":"ok"}}),
+            serde_json::json!({"type":"message","id":"r3","message":{"role":"toolResult","toolCallId":"w3","toolName":"write","content":"no","isError":true}}),
+            serde_json::json!({"type":"message","id":"r4","message":{"role":"toolResult","toolCallId":"w4","toolName":"WriteFile","content":""}}),
+            serde_json::json!({"type":"message","id":"r5","message":{"role":"toolResult","toolCallId":"w5","toolName":"MultiEdit","content":""}}),
+            serde_json::json!({"type":"message","id":"r6","message":{"role":"toolResult","toolCallId":"w6","toolName":"read_file","content":"ok"}}),
+            serde_json::json!({"type":"message","id":"r7","message":{"role":"toolResult","toolCallId":"w7","toolName":"NotebookEdit","content":""}}),
+            serde_json::json!({"type":"message","id":"a2","message":{"role":"assistant","content":"Done; see imagined.txt too."}}),
+        ]);
+        let final_answer = document
+            .messages
+            .iter()
+            .find(|message| message.id == "a2")
+            .unwrap();
+        assert_eq!(
+            final_answer.written_files,
+            vec![
+                WrittenFile {
+                    path: PathBuf::from(r"C:\fixture\out\report.html"),
+                    safe_relative_path: Some(PathBuf::from(r"out\report.html")),
+                },
+                WrittenFile {
+                    path: PathBuf::from(r"C:\fixture\src\main.rs"),
+                    safe_relative_path: Some(PathBuf::from(r"src\main.rs")),
+                },
+                WrittenFile {
+                    path: PathBuf::from(r"C:\fixture\empty.txt"),
+                    safe_relative_path: Some(PathBuf::from("empty.txt")),
+                },
+                WrittenFile {
+                    path: PathBuf::from(r"C:\fixture\notes.ipynb"),
+                    safe_relative_path: Some(PathBuf::from("notes.ipynb")),
+                },
+            ]
+        );
+        assert!(
+            document
+                .messages
+                .iter()
+                .find(|message| message.id == "a1")
+                .unwrap()
+                .written_files
+                .is_empty()
+        );
     }
 
     #[test]

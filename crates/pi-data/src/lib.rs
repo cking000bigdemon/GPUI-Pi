@@ -13,6 +13,7 @@ pub mod config;
 pub mod extensions;
 pub mod files;
 mod fs_util;
+pub mod git;
 pub mod project;
 pub mod session;
 pub mod session_actions;
@@ -40,6 +41,11 @@ pub use files::{
     MAX_UPLOAD_TOTAL_BYTES, ProjectFiles, TEXT_PREVIEW_MAX_BYTES, TextFileContent, UploadCandidate,
     UploadConflictStrategy, UploadInspection, UploadItemError, UploadReport, language_for_path,
     validate_upload_name,
+};
+pub use git::{
+    GitDiffUnsupported, GitError, GitFileDiff, GitFileStatus, GitFileStatusKind, GitStatusSnapshot,
+    WorktreeInfo, WorktreeSnapshot, add_worktree, git_file_diff, git_status, list_worktrees,
+    remove_worktree,
 };
 pub use project::{
     GroupedSession, PathPlatform, ProjectGroup, ProjectInfo, group_sessions, native_platform,

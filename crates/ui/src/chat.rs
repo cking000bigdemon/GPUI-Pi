@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -25,11 +26,12 @@ type TailDetachHandler = Arc<dyn Fn(&mut Window, &mut App)>;
 type DetailToggleHandler = Arc<dyn Fn(String, String, &mut App)>;
 type ProcessToggleHandler = Arc<dyn Fn(String, &mut App)>;
 type MinimapToggleHandler = Arc<dyn Fn(&mut App)>;
+type OpenWrittenFileHandler = Arc<dyn Fn(PathBuf, &mut App)>;
 
 use pi_render::{
     AnsiColor, AnsiStyle, AnsiText, Block, CodeBlock, ConversationDocument, ConversationItem,
-    DiffBlock, DiffLineKind, FrontmatterCard, ImageBlock, ImageState, Message, MessageRole,
-    ProcessGroup, ToolCard, ToolOutput, ToolStatus,
+    FrontmatterCard, ImageBlock, ImageState, Message, MessageRole, ProcessGroup, ToolCard,
+    ToolOutput, ToolStatus,
 };
 
 fn detail_key(message_id: &str, block_index: usize, kind: &str) -> String {
@@ -194,6 +196,7 @@ pub struct ChatWindow {
     on_toggle_minimap: Option<MinimapToggleHandler>,
     on_tail_attachment_change: Option<TailAttachmentHandler>,
     on_tail_detach: Option<TailDetachHandler>,
+    on_open_written_file: Option<OpenWrittenFileHandler>,
 }
 
 impl ChatWindow {
@@ -211,6 +214,7 @@ impl ChatWindow {
             on_toggle_minimap: None,
             on_tail_attachment_change: None,
             on_tail_detach: None,
+            on_open_written_file: None,
         }
     }
 
@@ -266,6 +270,11 @@ impl ChatWindow {
         self.selected_message = Some(id.into());
         self
     }
+
+    pub fn on_open_written_file(mut self, handler: impl Fn(PathBuf, &mut App) + 'static) -> Self {
+        self.on_open_written_file = Some(Arc::new(handler));
+        self
+    }
 }
 
 impl gpui::RenderOnce for ChatWindow {
@@ -282,6 +291,7 @@ impl gpui::RenderOnce for ChatWindow {
         let minimap_toggle = self.on_toggle_minimap.clone();
         let list_state = self.list_state.clone();
         let items = document.items.clone();
+        let on_open_written_file = self.on_open_written_file.clone();
 
         h_flex()
             .debug_selector(|| "chat-window".into())
@@ -313,6 +323,7 @@ impl gpui::RenderOnce for ChatWindow {
                                                 )
                                                 .expanded_tools(expanded_tools.clone())
                                                 .on_toggle_tool(on_toggle_tool.clone())
+                                                .on_open_written_file(on_open_written_file.clone())
                                                 .into_any_element()
                                         }
                                         ConversationItem::Process(group) => {
@@ -396,6 +407,7 @@ pub struct MessageView {
     selected: bool,
     expanded_tools: Arc<HashSet<String>>,
     on_toggle_tool: Option<DetailToggleHandler>,
+    on_open_written_file: Option<OpenWrittenFileHandler>,
 }
 
 impl MessageView {
@@ -407,6 +419,7 @@ impl MessageView {
             selected: false,
             expanded_tools: Arc::new(HashSet::new()),
             on_toggle_tool: None,
+            on_open_written_file: None,
         }
     }
 
@@ -427,6 +440,11 @@ impl MessageView {
 
     pub fn on_toggle_tool(mut self, handler: Option<DetailToggleHandler>) -> Self {
         self.on_toggle_tool = handler;
+        self
+    }
+
+    pub fn on_open_written_file(mut self, handler: Option<OpenWrittenFileHandler>) -> Self {
+        self.on_open_written_file = handler;
         self
     }
 }
@@ -552,6 +570,14 @@ impl gpui::RenderOnce for MessageView {
                     },
                 ))
                 .children(blocks)
+                .when(!self.message.written_files.is_empty(), |view| {
+                    let mut written =
+                        crate::TurnWrittenFiles::new(self.message.written_files.clone());
+                    if let Some(handler) = self.on_open_written_file.clone() {
+                        written = written.on_open(move |path, cx| handler(path, cx));
+                    }
+                    view.child(written)
+                })
         }
     }
 }
@@ -901,7 +927,9 @@ fn render_block(
                 cx,
             )
         }
-        Block::Diff(diff) => render_diff(diff.clone(), cx),
+        Block::Diff(diff) => subordinate_column(cx)
+            .child(crate::render_diff_block(Arc::new(diff.clone()), cx))
+            .into_any_element(),
         Block::Ansi(ansi) => render_ansi(ansi.clone(), cx),
         Block::Image(image) => render_image(image.clone(), cx),
         Block::Frontmatter(frontmatter) => render_frontmatter(frontmatter.clone(), cx),
@@ -1168,68 +1196,11 @@ fn render_tool(
                         ToolOutput::Text(text) => div().text_xs().child(text).into_any_element(),
                         ToolOutput::Ansi(ansi) => render_ansi(ansi, cx),
                         ToolOutput::Image(image) => render_image(image, cx),
-                        ToolOutput::Diff(diff) => render_diff(diff, cx),
+                        // Tool card 展开区自身已经是 subordinate_column，不重复套壳。
+                        ToolOutput::Diff(diff) => crate::render_diff_block(Arc::new(diff), cx),
                     })),
             )
         })
-        .into_any_element()
-}
-
-fn render_diff(diff: DiffBlock, cx: &App) -> gpui::AnyElement {
-    let lines = if diff.parsed {
-        diff.files
-            .iter()
-            .flat_map(|file| {
-                let path = match (&file.old_path, &file.new_path) {
-                    (Some(old), Some(new)) if old != new => format!("{old} → {new}"),
-                    (_, Some(new)) => new.clone(),
-                    (Some(old), None) => old.clone(),
-                    (None, None) => "未命名文件".to_owned(),
-                };
-                std::iter::once((DiffLineKind::Header, path)).chain(file.hunks.iter().flat_map(
-                    |hunk| {
-                        std::iter::once((DiffLineKind::Header, hunk.header.clone()))
-                            .chain(hunk.lines.iter().map(|line| (line.kind, line.text.clone())))
-                    },
-                ))
-            })
-            .collect::<Vec<_>>()
-    } else {
-        diff.raw
-            .lines()
-            .map(|line| (DiffLineKind::Context, line.to_owned()))
-            .collect()
-    };
-    // diff 是从属内容：左竖线 + 缩进，不再自成一张描边卡（规范 5.3 / 红线 2）。
-    subordinate_column(cx)
-        .debug_selector(|| "diff-block".into())
-        .child(
-            div()
-                .py_1()
-                .text_xs()
-                .font_semibold()
-                .text_color(cx.theme().muted_foreground)
-                .child(if diff.parsed {
-                    "Unified diff"
-                } else {
-                    "Raw diff fallback"
-                }),
-        )
-        .children(lines.into_iter().map(|(kind, text)| {
-            let (foreground, background) = match kind {
-                DiffLineKind::Added => (cx.theme().success, cx.theme().success.opacity(0.08)),
-                DiffLineKind::Removed => (cx.theme().danger, cx.theme().danger.opacity(0.08)),
-                DiffLineKind::Header => (cx.theme().accent, cx.theme().accent.opacity(0.08)),
-                DiffLineKind::Context => (cx.theme().foreground, cx.theme().transparent),
-            };
-            div()
-                .px_1()
-                .font_family(cx.theme().mono_font_family.clone())
-                .text_xs()
-                .text_color(foreground)
-                .bg(background)
-                .child(text)
-        }))
         .into_any_element()
 }
 
@@ -1432,6 +1403,7 @@ mod tests {
             timestamp: None,
             label: None,
             model: None,
+            written_files: Vec::new(),
             blocks,
         })
     }
@@ -1448,6 +1420,7 @@ mod tests {
             timestamp: None,
             label: None,
             model,
+            written_files: Vec::new(),
             blocks,
         })
     }
@@ -1478,6 +1451,7 @@ mod tests {
         Arc::new(ConversationDocument {
             session_id: "fixture".to_owned(),
             source_path: std::path::PathBuf::from("fixture.jsonl"),
+            cwd: PathBuf::new(),
             messages: Arc::from(vec![user.clone(), assistant.clone()]),
             items: Arc::from(vec![
                 ConversationItem::Message(user),
@@ -1582,6 +1556,7 @@ mod tests {
         Arc::new(ConversationDocument {
             session_id: base.session_id.clone(),
             source_path: base.source_path.clone(),
+            cwd: PathBuf::new(),
             messages: base.messages.clone(),
             items: base.items.clone(),
             minimap: Arc::from(Vec::new()),
@@ -1740,6 +1715,7 @@ mod tests {
         let document = Arc::new(ConversationDocument {
             session_id: "model".to_owned(),
             source_path: PathBuf::from("model.jsonl"),
+            cwd: PathBuf::new(),
             messages: Arc::from([with_model.clone()]),
             items: Arc::from([ConversationItem::Message(with_model)]),
             minimap: Arc::from([]),
@@ -1759,6 +1735,7 @@ mod tests {
         let document = Arc::new(ConversationDocument {
             session_id: "none".to_owned(),
             source_path: PathBuf::from("none.jsonl"),
+            cwd: PathBuf::new(),
             messages: Arc::from([without_model.clone()]),
             items: Arc::from([ConversationItem::Message(without_model)]),
             minimap: Arc::from([]),
