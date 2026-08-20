@@ -5,7 +5,7 @@ use gpui::{
     PathPromptOptions, Render, SharedString, Styled as _, Subscription, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, IconName, Root, Sizable as _, StyledExt as _, TitleBar,
+    ActiveTheme as _, IconName, Root, Sizable as _, StyledExt as _, TitleBar, WindowExt as _,
     button::{Button, ButtonVariants as _},
     dock::{DockArea, DockItem, DockPlacement},
     h_flex,
@@ -14,6 +14,7 @@ use gpui_pi_ui::{AppShell, WorkspaceTabBar, theme};
 
 use crate::file_explorer::FileExplorerPanel;
 use crate::main_panel::MainPanel;
+use crate::model_config::ModelConfigPanel;
 #[cfg(test)]
 use crate::panels::LayoutProbe;
 use crate::panels::{ChatPanel, SessionsChanged};
@@ -30,6 +31,7 @@ pub struct Workspace {
     sidebar: gpui::Entity<SessionSidebar>,
     file_explorer: gpui::Entity<FileExplorerPanel>,
     main_panel: gpui::Entity<MainPanel>,
+    model_config: gpui::Entity<ModelConfigPanel>,
     selected_directory: Option<PathBuf>,
     selected_session: Option<SessionSelected>,
     _appearance_subscription: Subscription,
@@ -90,6 +92,7 @@ impl Workspace {
             panel
         });
         let workspace = cx.new(|cx| MainPanel::new(chat.clone(), &file_explorer, window, cx));
+        let model_config = cx.new(|cx| ModelConfigPanel::new(window, cx));
 
         dock_area.update(cx, |dock_area, cx| {
             dock_area.set_center(DockItem::panel(Arc::new(workspace.clone())), window, cx);
@@ -167,6 +170,7 @@ impl Workspace {
             sidebar,
             file_explorer,
             main_panel: workspace,
+            model_config,
             selected_directory: None,
             selected_session: None,
             _appearance_subscription: appearance_subscription,
@@ -204,6 +208,19 @@ impl Workspace {
             dock_area.toggle_dock(DockPlacement::Right, window, cx);
         });
         cx.notify();
+    }
+
+    fn open_model_config(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_sheet(cx) {
+            return;
+        }
+        self.model_config
+            .update(cx, |panel, cx| panel.open(window, cx));
     }
 
     fn choose_directory(
@@ -359,6 +376,15 @@ impl Render for Workspace {
                     .icon(files_toggle_icon)
                     .tooltip(files_toggle_tooltip)
                     .on_click(cx.listener(Self::toggle_files)),
+            )
+            .child(
+                Button::new("open-model-config")
+                    .debug_selector(|| "open-model-config".into())
+                    .ghost()
+                    .small()
+                    .icon(IconName::Settings)
+                    .tooltip("打开模型与认证设置")
+                    .on_click(cx.listener(Self::open_model_config)),
             )
             .child(
                 Button::new("choose-project-directory")
