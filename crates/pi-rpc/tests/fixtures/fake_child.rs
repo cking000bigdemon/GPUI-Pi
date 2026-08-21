@@ -53,6 +53,7 @@ fn main() {
     ]);
     let mut current_model = available_models[0].clone();
     let mut thinking_level = "off".to_owned();
+    let mut pending_extension_ui = Vec::<String>::new();
     let tool_allowlist = env::args_os()
         .collect::<Vec<_>>()
         .windows(2)
@@ -70,6 +71,29 @@ fn main() {
         let value: Value = serde_json::from_str(&line).unwrap();
         let id = value.get("id").cloned().unwrap_or(Value::Null);
         let command = value["type"].as_str().unwrap();
+        if command == "extension_ui_response" {
+            let response_id = value["id"].as_str().unwrap_or_default();
+            let valid = if value["cancelled"] == true {
+                true
+            } else {
+                match response_id {
+                    "ui-select" | "ui-input" | "ui-editor" => value.get("value").is_some(),
+                    "ui-confirm" => value.get("confirmed").is_some(),
+                    _ => false,
+                }
+            };
+            if valid {
+                pending_extension_ui.retain(|id| id != response_id);
+                writeln!(
+                    stdout,
+                    "{}",
+                    json!({"type":"extension_error","extensionPath":"fake-ui","event":"response","error":format!("received:{response_id}")})
+                )
+                .unwrap();
+            }
+            stdout.flush().unwrap();
+            continue;
+        }
         if command == "prompt" {
             let message = value["message"].as_str().unwrap_or_default();
             if message == "stream" {
@@ -96,6 +120,37 @@ fn main() {
                 .unwrap();
                 writeln!(stdout, "{}", json!({"type":"agent_settled"})).unwrap();
                 let response = json!({"id":id,"type":"response","command":command,"success":true});
+                writeln!(stdout, "{response}").unwrap();
+                stdout.flush().unwrap();
+                continue;
+            }
+            if message == "extension-ui" {
+                let requests = [
+                    json!({"type":"extension_ui_request","id":"ui-select","method":"select","title":"Select","options":["Alpha","Beta"],"timeout":1000}),
+                    json!({"type":"extension_ui_request","id":"ui-confirm","method":"confirm","title":"Confirm","message":"Continue?","timeout":1000}),
+                    json!({"type":"extension_ui_request","id":"ui-input","method":"input","title":"Input","placeholder":"value","timeout":1000}),
+                    json!({"type":"extension_ui_request","id":"ui-editor","method":"editor","title":"Editor","prefill":"line 1\nline 2"}),
+                    json!({"type":"extension_ui_request","id":"ui-notify","method":"notify","message":"Notice","notifyType":"warning"}),
+                    json!({"type":"extension_ui_request","id":"ui-status","method":"setStatus","statusKey":"fixture","statusText":"Running"}),
+                    json!({"type":"extension_ui_request","id":"ui-widget","method":"setWidget","widgetKey":"fixture","widgetLines":["one","two"]}),
+                    json!({"type":"extension_ui_request","id":"ui-title","method":"setTitle","title":"Fixture Title"}),
+                    json!({"type":"extension_ui_request","id":"ui-editor-text","method":"set_editor_text","text":"composer text"}),
+                ];
+                pending_extension_ui.extend(
+                    ["ui-select", "ui-confirm", "ui-input", "ui-editor"]
+                        .into_iter()
+                        .map(str::to_owned),
+                );
+                for request in requests {
+                    writeln!(stdout, "{request}").unwrap();
+                }
+                let response = json!({"id":id,"type":"response","command":command,"success":true});
+                writeln!(stdout, "{response}").unwrap();
+                stdout.flush().unwrap();
+                continue;
+            }
+            if message == "extension-ui-pending" {
+                let response = json!({"id":id,"type":"response","command":command,"success":pending_extension_ui.is_empty(),"error":(!pending_extension_ui.is_empty()).then(|| format!("pending:{}", pending_extension_ui.join(",")))});
                 writeln!(stdout, "{response}").unwrap();
                 stdout.flush().unwrap();
                 continue;

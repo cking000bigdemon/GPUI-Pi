@@ -4,6 +4,7 @@ mod file_explorer;
 mod live_session;
 mod main_panel;
 mod panels;
+mod resource_config;
 mod session_sidebar;
 mod trust_prompt;
 mod workspace;

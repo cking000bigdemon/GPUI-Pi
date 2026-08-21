@@ -9,8 +9,8 @@ use tempfile::TempDir;
 
 use pi_rpc::{
     AvailableModelsData, BashResult, Client, ClientConfig, ClientEvent, Command, CommandsData,
-    LifecycleEvent, MessagesData, PINNED_PI_VERSION, QueueMode, RpcSessionState, StreamingBehavior,
-    ThinkingLevel, ThinkingLevelsData,
+    ExtensionUiRequest, ExtensionUiResponse, LifecycleEvent, MessagesData, PINNED_PI_VERSION,
+    QueueMode, RpcEvent, RpcSessionState, StreamingBehavior, ThinkingLevel, ThinkingLevelsData,
 };
 use serde_json::Value;
 
@@ -224,6 +224,151 @@ fn zero_token_command_matrix() {
     assert_eq!(new_session["cancelled"], false);
     let after: RpcSessionState = client.request_data(Command::GetState, TIMEOUT).unwrap();
     assert_ne!(before, after.session_id);
+    client.shutdown().unwrap();
+}
+
+#[test]
+#[ignore = "requires PI_RPC_TEST_BINARY=official pi 0.84.2"]
+fn extension_ui_zero_token_fixture_reaches_nine_methods_and_custom_is_unreachable() {
+    let temp = tempfile::tempdir().unwrap();
+    let extension_path = temp.path().join("extension-ui-fixture.ts");
+    fs::write(
+        &extension_path,
+        r#"import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+export default function (pi: ExtensionAPI) {
+  pi.registerCommand("r14-ui", {
+    description: "R14 zero-token extension UI fixture",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify("notify", "warning");
+      ctx.ui.setStatus("r14", "status");
+      ctx.ui.setWidget("above", ["above"], { placement: "aboveEditor" });
+      ctx.ui.setWidget("below", ["below"], { placement: "belowEditor" });
+      ctx.ui.setTitle("R14 Fixture");
+      ctx.ui.setEditorText("fixture editor text");
+      await ctx.ui.select("Select", ["A", "B"]);
+      await ctx.ui.confirm("Confirm", "Continue?");
+      await ctx.ui.input("Input", "value");
+      await ctx.ui.editor("Editor", "prefill");
+      const custom = await ctx.ui.custom(() => { throw new Error("must not run"); });
+      if (custom !== undefined) throw new Error("custom unexpectedly returned a value");
+      ctx.ui.notify("custom:UNSUPPORTED_BY_PINNED_RPC", "info");
+    },
+  });
+}
+"#,
+    )
+    .unwrap();
+    let mut config = client_config(&temp);
+    config.args.retain(|arg| arg != "--no-extensions");
+    config.args.push("--extension".into());
+    config.args.push(extension_path.into_os_string());
+    let client = Client::spawn(config).unwrap();
+    let events = client.subscribe();
+    let prompt_client = client.clone();
+    let prompt = std::thread::spawn(move || {
+        prompt_client.request(
+            Command::Prompt {
+                message: "/r14-ui".into(),
+                images: None,
+                streaming_behavior: None,
+            },
+            TIMEOUT,
+        )
+    });
+
+    let deadline = Instant::now() + TIMEOUT;
+    let mut methods = Vec::new();
+    let mut custom_marker = false;
+    let mut unknown_events = Vec::new();
+    let mut custom_wire_requests = Vec::new();
+    while Instant::now() < deadline && (!custom_marker || methods.len() < 10) {
+        match events.recv_timeout(Duration::from_millis(100)) {
+            Ok(ClientEvent::Rpc(event)) => {
+                if let RpcEvent::ExtensionUiRequest { id, request } = *event {
+                    let serialized = serde_json::to_value(&request).unwrap();
+                    if serialized.get("method").and_then(Value::as_str) == Some("custom") {
+                        custom_wire_requests.push(serialized);
+                    }
+                    match &request {
+                        ExtensionUiRequest::Select { .. }
+                        | ExtensionUiRequest::Input { .. }
+                        | ExtensionUiRequest::Editor { .. } => client
+                            .send_extension_ui_response(&ExtensionUiResponse::value(&id, "fixture"))
+                            .unwrap(),
+                        ExtensionUiRequest::Confirm { .. } => client
+                            .send_extension_ui_response(&ExtensionUiResponse::confirmed(&id, true))
+                            .unwrap(),
+                        ExtensionUiRequest::Notify { message, .. } => {
+                            custom_marker |= message.contains("UNSUPPORTED_BY_PINNED_RPC");
+                        }
+                        _ => {}
+                    }
+                    methods.push(request);
+                }
+            }
+            Ok(ClientEvent::Unknown(value)) => unknown_events.push(value),
+            Ok(ClientEvent::Lifecycle(_)) | Err(_) => {}
+        }
+    }
+    assert!(
+        methods
+            .iter()
+            .any(|request| matches!(request, ExtensionUiRequest::Select { .. }))
+    );
+    assert!(
+        methods
+            .iter()
+            .any(|request| matches!(request, ExtensionUiRequest::Confirm { .. }))
+    );
+    assert!(
+        methods
+            .iter()
+            .any(|request| matches!(request, ExtensionUiRequest::Input { .. }))
+    );
+    assert!(
+        methods
+            .iter()
+            .any(|request| matches!(request, ExtensionUiRequest::Editor { .. }))
+    );
+    assert!(
+        methods
+            .iter()
+            .any(|request| matches!(request, ExtensionUiRequest::Notify { .. }))
+    );
+    assert!(
+        methods
+            .iter()
+            .any(|request| matches!(request, ExtensionUiRequest::SetStatus { .. }))
+    );
+    assert!(
+        methods
+            .iter()
+            .any(|request| matches!(request, ExtensionUiRequest::SetWidget { .. }))
+    );
+    assert!(
+        methods
+            .iter()
+            .any(|request| matches!(request, ExtensionUiRequest::SetTitle { .. }))
+    );
+    assert!(
+        methods
+            .iter()
+            .any(|request| matches!(request, ExtensionUiRequest::SetEditorText { .. }))
+    );
+    assert!(
+        custom_marker,
+        "custom() did not prove UNSUPPORTED_BY_PINNED_RPC"
+    );
+    assert!(
+        unknown_events.is_empty(),
+        "fixture emitted unknown wire events: {unknown_events:?}"
+    );
+    assert!(
+        custom_wire_requests.is_empty(),
+        "custom() unexpectedly emitted extension_ui_request: {custom_wire_requests:?}"
+    );
+    let response = prompt.join().unwrap().unwrap();
+    assert!(response.success, "{:?}", response.error);
     client.shutdown().unwrap();
 }
 

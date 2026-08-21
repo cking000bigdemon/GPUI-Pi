@@ -15,6 +15,7 @@ pub mod files;
 mod fs_util;
 pub mod git;
 pub mod project;
+pub mod resources;
 pub mod session;
 pub mod session_actions;
 pub mod session_view;
@@ -51,6 +52,11 @@ pub use project::{
     GroupedSession, PathPlatform, ProjectGroup, ProjectInfo, group_sessions, native_platform,
     project_identity_key, project_identity_key_for, resolve_project,
 };
+pub use resources::{
+    FileRevision, PackageFilters, PluginPackageInfo, PluginScan, ResourceDiagnostic, ResourceScope,
+    SkillInfo, SkillScan, SkillWriteError, scan_plugin_packages, scan_skills,
+    set_skill_disable_model_invocation, skill_allowed_roots,
+};
 pub use session::{
     EntryBase, SessionDiagnostic, SessionEntry, SessionError, SessionFile, SessionHeader,
     SessionList, SessionListDiagnostic, SessionMetrics, SessionRevision, SessionSummary,
@@ -63,7 +69,7 @@ pub use session_view::{
     ProjectSessionView, RunningSessionOverlay, SessionView, build_session_view,
 };
 pub use trust::{
-    ProjectTrustStatus, TrustError, has_trust_resources, project_trust_status, trust_project,
+    ProjectTrustStatus, TrustError, has_trust_resources, read_project_trust_status, trust_project,
 };
 
 /// pi 用来覆盖数据目录的环境变量，语义与上游一致。
@@ -75,6 +81,11 @@ pub const AGENT_DIR_ENV: &str = "PI_CODING_AGENT_DIR";
 /// Windows 上 `dirs::home_dir()` 取的是 `USERPROFILE`，不要自己读 `HOME`。
 pub fn agent_dir() -> Option<PathBuf> {
     agent_dir_from(std::env::var_os(AGENT_DIR_ENV), dirs::home_dir())
+}
+
+/// 当前用户 home，统一由 `dirs` 解析 Windows `USERPROFILE`。
+pub fn home_dir() -> Option<PathBuf> {
+    dirs::home_dir()
 }
 
 /// [`agent_dir`] 的纯函数版本，便于在不改进程环境的前提下单测。

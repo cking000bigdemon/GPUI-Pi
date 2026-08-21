@@ -873,6 +873,37 @@ pub enum ExtensionUiResponseValue {
     Cancelled { cancelled: bool },
 }
 
+impl ExtensionUiResponse {
+    pub fn value(id: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::ExtensionUiResponse {
+            id: id.into(),
+            response: ExtensionUiResponseValue::Value {
+                value: value.into(),
+            },
+        }
+    }
+
+    pub fn confirmed(id: impl Into<String>, confirmed: bool) -> Self {
+        Self::ExtensionUiResponse {
+            id: id.into(),
+            response: ExtensionUiResponseValue::Confirmed { confirmed },
+        }
+    }
+
+    pub fn cancelled(id: impl Into<String>) -> Self {
+        Self::ExtensionUiResponse {
+            id: id.into(),
+            response: ExtensionUiResponseValue::Cancelled { cancelled: true },
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Self::ExtensionUiResponse { id, .. } => id,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

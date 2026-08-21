@@ -24,6 +24,8 @@ const PI_RESOURCES: &[&str] = &[
 const LOCK_ATTEMPTS: usize = 10;
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(20);
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(10);
+const READONLY_ATTEMPTS: usize = 3;
+const READONLY_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectTrustStatus {
@@ -77,7 +79,10 @@ pub fn has_trust_resources(cwd: impl AsRef<Path>, home: Option<&Path>) -> bool {
     false
 }
 
-pub fn project_trust_status(
+/// 只读解析共享 trust store；不会创建锁、目录或写文件。
+///
+/// 上游写入 `trust.json` 不是原子替换，短暂的半写 JSON 会做有限重试。
+pub fn read_project_trust_status(
     agent_dir: impl AsRef<Path>,
     cwd: impl AsRef<Path>,
     home: Option<&Path>,
@@ -91,31 +96,31 @@ pub fn project_trust_status(
         });
     }
     let path = trust_path(agent_dir);
-    with_trust_lock(&path, || {
-        let object = read_store(&path)?;
-        let mut current = canonical_project_path(cwd)?;
-        loop {
-            let key = trust_key(&current);
-            if let Some(decision) = object.get(&key).and_then(Value::as_bool) {
-                return Ok(ProjectTrustStatus {
-                    requires_trust: true,
-                    trusted: decision,
-                    decision_path: Some(current),
-                });
-            }
-            let Some(parent) = current.parent() else {
-                break;
-            };
-            if parent == current {
-                break;
-            }
-            current = parent.to_path_buf();
+    let object = read_store_readonly_with_retry(&path, READONLY_ATTEMPTS, |_| {
+        thread::sleep(READONLY_RETRY_DELAY)
+    })?;
+    let mut current = canonical_project_path(cwd)?;
+    loop {
+        let key = trust_key(&current);
+        if let Some(decision) = object.get(&key).and_then(Value::as_bool) {
+            return Ok(ProjectTrustStatus {
+                requires_trust: true,
+                trusted: decision,
+                decision_path: Some(current),
+            });
         }
-        Ok(ProjectTrustStatus {
-            requires_trust: true,
-            trusted: false,
-            decision_path: None,
-        })
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent.to_path_buf();
+    }
+    Ok(ProjectTrustStatus {
+        requires_trust: true,
+        trusted: false,
+        decision_path: None,
     })
 }
 
@@ -139,6 +144,38 @@ fn read_store(path: &Path) -> Result<Map<String, Value>, TrustError> {
         }
     }
     Ok(object.clone())
+}
+
+fn read_store_readonly_with_retry(
+    path: &Path,
+    attempts: usize,
+    mut wait: impl FnMut(usize),
+) -> Result<Map<String, Value>, TrustError> {
+    let attempts = attempts.max(1);
+    for attempt in 0..attempts {
+        match read_store(path) {
+            Ok(store) => return Ok(store),
+            Err(error) if attempt + 1 < attempts && readonly_error_is_retryable(&error) => {
+                wait(attempt);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("只读 trust 重试循环总会返回")
+}
+
+fn readonly_error_is_retryable(error: &TrustError) -> bool {
+    match error {
+        TrustError::Config(crate::ConfigError::Parse { .. }) => true,
+        TrustError::Config(crate::ConfigError::Read { source, .. }) => matches!(
+            source.kind(),
+            io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
 }
 
 fn canonical_project_path(path: &Path) -> Result<PathBuf, TrustError> {
@@ -235,6 +272,78 @@ mod tests {
         assert!(!has_trust_resources(dir.path(), None));
         fs::create_dir_all(dir.path().join(".agents/skills")).unwrap();
         assert!(has_trust_resources(dir.path(), None));
+    }
+
+    #[test]
+    fn readonly_retry_is_bounded_and_reports_permanent_parse_error() {
+        let agent = tempdir().unwrap();
+        let path = agent.path().join("trust.json");
+        fs::write(&path, "{").unwrap();
+        let mut waits = Vec::new();
+        let error =
+            read_store_readonly_with_retry(&path, 3, |attempt| waits.push(attempt)).unwrap_err();
+        assert!(matches!(
+            error,
+            TrustError::Config(crate::ConfigError::Parse { .. })
+        ));
+        assert_eq!(waits, [0, 1]);
+    }
+
+    #[test]
+    fn readonly_retry_recovers_from_transient_parse_error_without_locking() {
+        let agent = tempdir().unwrap();
+        let path = agent.path().join("trust.json");
+        fs::write(&path, "{").unwrap();
+        let replacement = path.clone();
+        let store = read_store_readonly_with_retry(&path, 2, move |_| {
+            fs::write(&replacement, "{}").unwrap();
+        })
+        .unwrap();
+        assert!(store.is_empty());
+        assert!(!agent.path().join("trust.json.lock").exists());
+    }
+
+    #[test]
+    fn readonly_retry_reports_permanent_io_error_without_waiting() {
+        let agent = tempdir().unwrap();
+        let path = agent.path().join("trust.json");
+        fs::create_dir(&path).unwrap();
+        let mut waits = 0;
+        assert!(matches!(
+            read_store_readonly_with_retry(&path, 2, |_| waits += 1),
+            Err(TrustError::Config(crate::ConfigError::Read { .. }))
+        ));
+        assert_eq!(waits, 0);
+    }
+
+    #[test]
+    fn readonly_retry_rejects_invalid_store_and_decision_without_waiting() {
+        let agent = tempdir().unwrap();
+        let path = agent.path().join("trust.json");
+        for content in ["[]", r#"{"project":"yes"}"#] {
+            fs::write(&path, content).unwrap();
+            let mut waits = 0;
+            let error = read_store_readonly_with_retry(&path, 3, |_| waits += 1).unwrap_err();
+            assert!(matches!(
+                error,
+                TrustError::InvalidStore | TrustError::InvalidDecision { .. }
+            ));
+            assert_eq!(waits, 0);
+        }
+    }
+
+    #[test]
+    fn readonly_retry_classifies_only_transient_io_kinds() {
+        let retryable = |kind| {
+            readonly_error_is_retryable(&TrustError::Config(crate::ConfigError::Read {
+                path: PathBuf::from("trust.json"),
+                source: io::Error::from(kind),
+            }))
+        };
+        assert!(retryable(io::ErrorKind::WouldBlock));
+        assert!(retryable(io::ErrorKind::Interrupted));
+        assert!(!retryable(io::ErrorKind::PermissionDenied));
+        assert!(!retryable(io::ErrorKind::InvalidData));
     }
 
     #[test]

@@ -7,8 +7,9 @@ use std::{
 };
 
 use pi_rpc::{
-    Client, ClientConfig, ClientError, ClientEvent, Command, CommandsData, ImageContent, ImageKind,
-    LifecycleEvent, RpcSessionState, SlashCommandSource,
+    Client, ClientConfig, ClientError, ClientEvent, Command, CommandsData, ExtensionUiRequest,
+    ExtensionUiResponse, ImageContent, ImageKind, LifecycleEvent, RpcEvent, RpcSessionState,
+    SlashCommandSource,
 };
 use serde_json::Value;
 
@@ -320,6 +321,93 @@ fn get_commands_decodes_typed_sources_and_image_prompt_preserves_wire() {
         )
         .unwrap();
     assert!(response.success);
+    client.shutdown().unwrap();
+}
+
+#[test]
+fn extension_ui_wire_decodes_all_nine_requests_and_writes_four_responses() {
+    let client = Client::spawn(config()).unwrap();
+    let events = client.subscribe();
+    assert!(
+        client
+            .request(
+                Command::Prompt {
+                    message: "extension-ui".into(),
+                    images: None,
+                    streaming_behavior: None,
+                },
+                Duration::from_secs(2),
+            )
+            .unwrap()
+            .success
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut requests = Vec::new();
+    while Instant::now() < deadline && requests.len() < 9 {
+        if let Ok(ClientEvent::Rpc(event)) = events.recv_timeout(Duration::from_millis(50))
+            && let RpcEvent::ExtensionUiRequest { id, request } = *event
+        {
+            requests.push((id, request));
+        }
+    }
+    assert_eq!(requests.len(), 9);
+    assert!(matches!(requests[0].1, ExtensionUiRequest::Select { .. }));
+    assert!(matches!(requests[1].1, ExtensionUiRequest::Confirm { .. }));
+    assert!(matches!(requests[2].1, ExtensionUiRequest::Input { .. }));
+    assert!(matches!(requests[3].1, ExtensionUiRequest::Editor { .. }));
+    assert!(matches!(requests[4].1, ExtensionUiRequest::Notify { .. }));
+    assert!(matches!(
+        requests[5].1,
+        ExtensionUiRequest::SetStatus { .. }
+    ));
+    assert!(matches!(
+        requests[6].1,
+        ExtensionUiRequest::SetWidget { .. }
+    ));
+    assert!(matches!(requests[7].1, ExtensionUiRequest::SetTitle { .. }));
+    assert!(matches!(
+        requests[8].1,
+        ExtensionUiRequest::SetEditorText { .. }
+    ));
+
+    client
+        .send_extension_ui_response(&ExtensionUiResponse::value("ui-select", "Alpha"))
+        .unwrap();
+    client
+        .send_extension_ui_response(&ExtensionUiResponse::confirmed("ui-confirm", true))
+        .unwrap();
+    client
+        .send_extension_ui_response(&ExtensionUiResponse::cancelled("ui-input"))
+        .unwrap();
+    client
+        .send_extension_ui_response(&ExtensionUiResponse::value("ui-editor", "edited"))
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut acknowledgements = 0;
+    while Instant::now() < deadline && acknowledgements < 4 {
+        if let Ok(ClientEvent::Rpc(event)) = events.recv_timeout(Duration::from_millis(50))
+            && let RpcEvent::ExtensionError { error, .. } = *event
+            && error.starts_with("received:ui-")
+        {
+            acknowledgements += 1;
+        }
+    }
+    assert_eq!(acknowledgements, 4);
+    assert!(
+        client
+            .request(
+                Command::Prompt {
+                    message: "extension-ui-pending".into(),
+                    images: None,
+                    streaming_behavior: None,
+                },
+                Duration::from_secs(2),
+            )
+            .unwrap()
+            .success
+    );
     client.shutdown().unwrap();
 }
 

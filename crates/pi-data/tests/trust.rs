@@ -1,6 +1,8 @@
 use std::fs;
 
-use pi_data::{TrustError, has_trust_resources, project_trust_status, read_trust, trust_project};
+use pi_data::{
+    TrustError, has_trust_resources, read_project_trust_status, read_trust, trust_project,
+};
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -49,13 +51,13 @@ fn project_resource_matrix_and_atomic_preserving_trust_write() {
         json!({other_key.clone(): false, "reserved": null}),
     );
     assert!(
-        !project_trust_status(agent.path(), project.path(), None)
+        !read_project_trust_status(agent.path(), project.path(), None)
             .unwrap()
             .trusted
     );
     trust_project(agent.path(), project.path()).unwrap();
     assert!(
-        project_trust_status(agent.path(), project.path(), None)
+        read_project_trust_status(agent.path(), project.path(), None)
             .unwrap()
             .trusted
     );
@@ -77,13 +79,13 @@ fn nearest_parent_decision_applies_and_invalid_values_fail() {
     let parent_key = parent.as_os_str().to_string_lossy().into_owned();
     write_store(agent.path(), json!({parent_key.clone(): true}));
 
-    let status = project_trust_status(agent.path(), &child, None).unwrap();
+    let status = read_project_trust_status(agent.path(), &child, None).unwrap();
     assert!(status.trusted);
     assert_eq!(status.decision_path.as_deref(), Some(parent.as_path()));
 
     write_store(agent.path(), json!({parent_key: "yes"}));
     assert!(matches!(
-        project_trust_status(agent.path(), &child, None),
+        read_project_trust_status(agent.path(), &child, None),
         Err(TrustError::InvalidDecision { .. })
     ));
 }
