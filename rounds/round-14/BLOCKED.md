@@ -1,6 +1,6 @@
 # Round 14 — BLOCKED
 
-> 状态：整改完成，等待 PR #26 GitHub CI 复验
+> 状态：✅ 已解除（授权整改经 GitHub Windows 阻断 CI 验证通过）
 
 ## 阻塞摘要
 
@@ -61,6 +61,6 @@ R14 worktree hash:      ed4ba02113619e7ff672a3255fed34401c805a28
 - focused test 连续运行 20 次：`20/20 passed`，单次约 0.41–0.50 秒；
 - `scripts/validate.ps1`：`VALIDATE OK`（app `120 passed / 0 failed / 1 ignored`，其余 workspace suites 全绿，release build 通过）；
 - 官方 pi R14 zero-token fixture：`1 passed / 0 failed / 11 filtered out`；
-- GitHub CI：等待父会话提交、push 后复验。
+- GitHub CI：修复 commit `4061d54` 推送后，run [32449842258](https://github.com/cking000bigdemon/GPUI-Pi/actions/runs/32449842258) 的 `windows (阻断)` 与 `T1 全量验收` 均为 `SUCCESS`；job `96676142655`，head `4061d543d389ca102f7b7a0c60dfa234e3d45ce5`。
 
-历史两次 CI 失败证据保留在上文；当前不再等待授权，状态为“整改完成，等待 CI”。
+历史两次 CI 失败证据保留在上文；授权整改已经真实 `windows-latest` 验证，阻塞解除。
