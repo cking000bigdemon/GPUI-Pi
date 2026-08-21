@@ -19,7 +19,7 @@
 | **R11** | 文件浏览器 + 查看器 | Windows | ✅ 已完成 | [#18](https://github.com/cking000bigdemon/GPUI-Pi/pull/18) | 2026-08-19 |
 | **R12** | git diff / worktree / 本轮改动文件 | Windows | ✅ 已完成 | [#22](https://github.com/cking000bigdemon/GPUI-Pi/pull/22) | 2026-08-20 |
 | **R13** | 分支树 · compaction · retry · 导出 | Windows | ⬜ | — | — |
-| **R14** | Extension UI Protocol | Windows | ✅ 本地完成 | 待创建 | 2026-08-21 |
+| **R14** | Extension UI Protocol | Windows | 🚧 PR 待审 | [#26](https://github.com/cking000bigdemon/GPUI-Pi/pull/26) | — |
 | **R15** | 项目命令环境 bash 扩展（`.ts`） | Windows | ⬜ | — | — |
 | **R16** | 模型配置面板 + 登录 | Windows | ⬜ | — | — |
 | **R17** | 打包分发 | Windows | ⬜ | — | — |

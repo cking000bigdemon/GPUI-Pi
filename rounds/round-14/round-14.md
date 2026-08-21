@@ -1,6 +1,6 @@
 # Round 14 — Extension UI Protocol 与资源配置
 
-> 执行方：**Windows** · 状态：✅ 已完成（本地待提交）
+> 执行方：**Windows** · 状态：🚧 PR 待审（[#26](https://github.com/cking000bigdemon/GPUI-Pi/pull/26)）
 
 ## 目标
 
@@ -111,4 +111,4 @@
 - fixture：`.pi/visual-review/round-14/launch-visual-review.ps1 -ProbeOnly` 通过官方 RPC 自检；同时隔离 `PI_CODING_AGENT_DIR`、`USERPROFILE` 与 `HOME`，未读写真实 `~/.pi`。
 - 视觉回归：首次截图真实暴露 30 秒交互 timeout、composer paint overflow、Resource dialog 高度塌陷；修复后补充截图确认最终完成态无 timeout/红色错误，Skills/Plugins footer 可见，深浅主题下 widget/composer/status 顺序稳定。因证据集不完整，最终严格记录为 `CODE_ONLY_PASS` 而非截图通过。
 - 上游边界：官方 pi 0.84.2 独立二进制 RPC 无法实现 pi-web 的进程内 headless custom-UI terminal；本轮固定标记 `UNSUPPORTED_BY_PINNED_RPC`，未新增私有协议或伪造支持。
-- 工作区：`git diff --check` 通过；staged area 为空；`Cargo.lock`、`PINNED_PI_VERSION`、`pins/`、`vendor/` 无 diff。当前未 commit、未 push、未创建 PR。
+- 提交与 PR：实现 commit `46eacb4` 已推送至 `WinClaude/round-14`；PR [#26](https://github.com/cking000bigdemon/GPUI-Pi/pull/26) 已创建并触发 GitHub CI。`Cargo.lock`、`PINNED_PI_VERSION`、`pins/`、`vendor/` 无 diff。
