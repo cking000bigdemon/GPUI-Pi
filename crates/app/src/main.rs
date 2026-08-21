@@ -3,6 +3,8 @@
 mod file_explorer;
 mod live_session;
 mod main_panel;
+mod model_config;
+mod model_service;
 mod panels;
 mod resource_config;
 mod session_sidebar;

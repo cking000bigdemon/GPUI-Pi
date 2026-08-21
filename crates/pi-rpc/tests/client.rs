@@ -7,9 +7,10 @@ use std::{
 };
 
 use pi_rpc::{
-    Client, ClientConfig, ClientError, ClientEvent, Command, CommandsData, ExtensionUiRequest,
-    ExtensionUiResponse, ImageContent, ImageKind, LifecycleEvent, RpcEvent, RpcSessionState,
-    SlashCommandSource,
+    Client, ClientConfig, ClientError, ClientEvent, CloneData, Command, CommandsData,
+    ExportPathData, ExtensionUiRequest, ExtensionUiResponse, ForkData, ForkMessagesData,
+    ImageContent, ImageKind, LifecycleEvent, RpcEvent, RpcSessionState, SlashCommandSource,
+    SwitchSessionData, TreeData,
 };
 use serde_json::Value;
 
@@ -325,6 +326,7 @@ fn get_commands_decodes_typed_sources_and_image_prompt_preserves_wire() {
 }
 
 #[test]
+
 fn extension_ui_wire_decodes_all_nine_requests_and_writes_four_responses() {
     let client = Client::spawn(config()).unwrap();
     let events = client.subscribe();
@@ -407,6 +409,182 @@ fn extension_ui_wire_decodes_all_nine_requests_and_writes_four_responses() {
             )
             .unwrap()
             .success
+    );
+    client.shutdown().unwrap();
+}
+
+#[test]
+fn session_rebind_calibration_failure_preserves_main_success_and_never_retries_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let initial = temp.path().join("initial.jsonl");
+    let switched = temp.path().join("switched.jsonl");
+    let command_log = temp.path().join("commands.log");
+    let mut child_config = config();
+    child_config.initial_session = Some(initial.clone());
+    child_config.env.extend([
+        ("PI_RPC_FAKE_GET_STATE_FAILURES".into(), "3".into()),
+        (
+            "PI_RPC_FAKE_COMMAND_LOG".into(),
+            command_log.as_os_str().to_owned(),
+        ),
+    ]);
+    let client = Client::spawn(child_config).unwrap();
+
+    let switched_outcome = client
+        .request_session_rebind_data::<SwitchSessionData>(
+            Command::SwitchSession {
+                session_path: switched.to_string_lossy().into_owned(),
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    assert!(!switched_outcome.data.cancelled);
+    assert!(switched_outcome.calibration.unwrap().is_err());
+    assert_eq!(
+        client.resume_session().as_deref(),
+        Some(switched.as_path()),
+        "switch 的已知目标在校准失败时仍可安全恢复"
+    );
+
+    let cloned_outcome = client
+        .request_session_rebind_data::<CloneData>(Command::Clone, Duration::from_secs(2))
+        .unwrap();
+    assert!(!cloned_outcome.data.cancelled);
+    assert!(cloned_outcome.calibration.unwrap().is_ok());
+    assert_eq!(
+        client.resume_session().unwrap().file_name().unwrap(),
+        "cloned-session.jsonl"
+    );
+
+    let commands = std::fs::read_to_string(command_log).unwrap();
+    assert_eq!(
+        commands
+            .lines()
+            .filter(|line| *line == "switch_session")
+            .count(),
+        1
+    );
+    assert_eq!(commands.lines().filter(|line| *line == "clone").count(), 1);
+    assert_eq!(
+        commands.lines().filter(|line| *line == "get_state").count(),
+        4
+    );
+    client.shutdown().unwrap();
+}
+
+#[test]
+fn fork_calibration_failure_is_structured_and_clears_stale_resume_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let initial = temp.path().join("initial.jsonl");
+    let command_log = temp.path().join("commands.log");
+    let mut child_config = config();
+    child_config.initial_session = Some(initial);
+    child_config.env.extend([
+        ("PI_RPC_FAKE_GET_STATE_FAILURES".into(), "3".into()),
+        (
+            "PI_RPC_FAKE_COMMAND_LOG".into(),
+            command_log.as_os_str().to_owned(),
+        ),
+    ]);
+    let client = Client::spawn(child_config).unwrap();
+    let outcome = client
+        .request_session_rebind_data::<ForkData>(
+            Command::Fork {
+                entry_id: "user-root".into(),
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    assert_eq!(outcome.data.text, "fork me");
+    assert!(outcome.calibration.unwrap().is_err());
+    assert_eq!(client.resume_session(), None, "不能静默回到旧会话");
+    let commands = std::fs::read_to_string(command_log).unwrap();
+    assert_eq!(commands.lines().filter(|line| *line == "fork").count(), 1);
+    assert_eq!(
+        commands.lines().filter(|line| *line == "get_state").count(),
+        3
+    );
+    client.shutdown().unwrap();
+}
+
+#[test]
+fn r13_commands_update_resume_target_and_export_html() {
+    let temp = tempfile::tempdir().unwrap();
+    let initial = temp.path().join("initial.jsonl");
+    let switched = temp.path().join("switched.jsonl");
+    let exported = temp.path().join("session.html");
+    let mut child_config = config();
+    child_config.initial_session = Some(initial);
+    let client = Client::spawn(child_config).unwrap();
+
+    let tree: TreeData = client
+        .request_data(Command::GetTree, Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(tree.leaf_id.as_deref(), Some("assistant-leaf"));
+    assert_eq!(tree.tree[0].entry.id, "user-root");
+    let messages: ForkMessagesData = client
+        .request_data(Command::GetForkMessages, Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(messages.messages[0].text, "fork me");
+
+    let switched_data: SwitchSessionData = client
+        .request_data(
+            Command::SwitchSession {
+                session_path: switched.to_string_lossy().into_owned(),
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    assert!(!switched_data.cancelled);
+    assert_eq!(client.resume_session(), Some(switched));
+
+    let forked: ForkData = client
+        .request_data(
+            Command::Fork {
+                entry_id: "user-root".into(),
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    assert_eq!(forked.text, "fork me");
+    assert_eq!(
+        client.resume_session().unwrap().file_name().unwrap(),
+        "forked-session.jsonl"
+    );
+    let cloned: CloneData = client
+        .request_data(Command::Clone, Duration::from_secs(2))
+        .unwrap();
+    assert!(!cloned.cancelled);
+    assert_eq!(
+        client.resume_session().unwrap().file_name().unwrap(),
+        "cloned-session.jsonl"
+    );
+
+    for command in [
+        Command::SetAutoCompaction { enabled: false },
+        Command::SetAutoRetry { enabled: false },
+        Command::AbortRetry,
+    ] {
+        assert!(
+            client
+                .request(command, Duration::from_secs(2))
+                .unwrap()
+                .success
+        );
+    }
+    let path: ExportPathData = client
+        .request_data(
+            Command::ExportHtml {
+                output_path: Some(exported.to_string_lossy().into_owned()),
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    assert_eq!(PathBuf::from(path.path), exported);
+    assert!(
+        std::fs::read_to_string(exported)
+            .unwrap()
+            .contains("doctype html")
     );
     client.shutdown().unwrap();
 }

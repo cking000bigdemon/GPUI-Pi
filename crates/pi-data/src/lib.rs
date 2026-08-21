@@ -14,6 +14,7 @@ pub mod extensions;
 pub mod files;
 mod fs_util;
 pub mod git;
+pub mod model_config;
 pub mod project;
 pub mod resources;
 pub mod session;
@@ -29,8 +30,9 @@ pub use composer::{
     merge_restored_submission, validate_image_batch,
 };
 pub use config::{
-    ConfigError, models_path, read_json, read_models, read_settings, read_trust, settings_path,
-    trust_path, write_json_atomic, write_models, write_settings, write_trust,
+    ConfigError, models_path, read_auto_retry_enabled, read_json, read_models, read_settings,
+    read_trust, settings_path, trust_path, write_json_atomic, write_models, write_settings,
+    write_trust,
 };
 pub use extensions::{
     ExtensionDiagnostic, ExtensionInfo, ExtensionKind, ExtensionScan, scan_extensions,
@@ -48,6 +50,13 @@ pub use git::{
     WorktreeInfo, WorktreeSnapshot, add_worktree, git_file_diff, git_status, list_worktrees,
     remove_worktree,
 };
+pub use model_config::{
+    AuthCapability, AuthKind, AuthSummary, CliAuthStatus, ModelApi, ModelConfigDocument,
+    ModelConfigError, ModelEntry, ProviderConfig, ProviderDescriptor, ProviderDraft, SecretString,
+    auth_path, built_in_providers, connectivity_request_body, merge_provider_directory,
+    parse_cli_auth_status, parse_discovered_models, read_api_key, read_auth_summaries,
+    remove_api_key, validate_base_url, write_api_key,
+};
 pub use project::{
     GroupedSession, PathPlatform, ProjectGroup, ProjectInfo, group_sessions, native_platform,
     project_identity_key, project_identity_key_for, resolve_project,
@@ -58,9 +67,10 @@ pub use resources::{
     set_skill_disable_model_invocation, skill_allowed_roots,
 };
 pub use session::{
-    EntryBase, SessionDiagnostic, SessionEntry, SessionError, SessionFile, SessionHeader,
-    SessionList, SessionListDiagnostic, SessionMetrics, SessionRevision, SessionSummary,
-    list_sessions, load_session, read_session_summary, session_metrics,
+    EntryBase, SessionBranchNode, SessionBranchTree, SessionDiagnostic, SessionEntry, SessionError,
+    SessionFile, SessionHeader, SessionList, SessionListDiagnostic, SessionMetrics,
+    SessionRevision, SessionSummary, list_sessions, load_session, read_session_summary,
+    session_metrics,
 };
 pub use session_actions::{
     SessionActionError, delete_leaf_session, export_session_jsonl, rename_session,

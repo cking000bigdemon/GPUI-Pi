@@ -3,12 +3,15 @@
 //! 驱动官方发布的 pi 独立二进制（`pi --mode rpc`），用 JSONL over stdin/stdout
 //! 通信。本 crate **不依赖 GPUI**，可在无窗口、无 GPU 的环境完整单测。
 //!
+pub mod host_extension;
 pub mod jsonl;
 pub mod process;
 pub mod protocol;
 
+pub use host_extension::materialize_host_extension;
 pub use process::{
-    Client, ClientConfig, ClientError, ClientEvent, LifecycleEvent, kill_process_tree,
+    Client, ClientConfig, ClientError, ClientEvent, LifecycleEvent, SessionRebindOutcome,
+    kill_process_tree,
 };
 pub use protocol::*;
 

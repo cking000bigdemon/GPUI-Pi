@@ -27,6 +27,7 @@ type DetailToggleHandler = Arc<dyn Fn(String, String, &mut App)>;
 type ProcessToggleHandler = Arc<dyn Fn(String, &mut App)>;
 type MinimapToggleHandler = Arc<dyn Fn(&mut App)>;
 type OpenWrittenFileHandler = Arc<dyn Fn(PathBuf, &mut App)>;
+type ForkMessageHandler = Arc<dyn Fn(String, &mut App)>;
 
 use pi_render::{
     AnsiColor, AnsiStyle, AnsiText, Block, CodeBlock, ConversationDocument, ConversationItem,
@@ -197,6 +198,7 @@ pub struct ChatWindow {
     on_tail_attachment_change: Option<TailAttachmentHandler>,
     on_tail_detach: Option<TailDetachHandler>,
     on_open_written_file: Option<OpenWrittenFileHandler>,
+    on_fork_message: Option<ForkMessageHandler>,
 }
 
 impl ChatWindow {
@@ -215,6 +217,7 @@ impl ChatWindow {
             on_tail_attachment_change: None,
             on_tail_detach: None,
             on_open_written_file: None,
+            on_fork_message: None,
         }
     }
 
@@ -275,6 +278,11 @@ impl ChatWindow {
         self.on_open_written_file = Some(Arc::new(handler));
         self
     }
+
+    pub fn on_fork_message(mut self, handler: impl Fn(String, &mut App) + 'static) -> Self {
+        self.on_fork_message = Some(Arc::new(handler));
+        self
+    }
 }
 
 impl gpui::RenderOnce for ChatWindow {
@@ -292,6 +300,7 @@ impl gpui::RenderOnce for ChatWindow {
         let list_state = self.list_state.clone();
         let items = document.items.clone();
         let on_open_written_file = self.on_open_written_file.clone();
+        let on_fork_message = self.on_fork_message.clone();
 
         h_flex()
             .debug_selector(|| "chat-window".into())
@@ -324,6 +333,7 @@ impl gpui::RenderOnce for ChatWindow {
                                                 .expanded_tools(expanded_tools.clone())
                                                 .on_toggle_tool(on_toggle_tool.clone())
                                                 .on_open_written_file(on_open_written_file.clone())
+                                                .on_fork_message(on_fork_message.clone())
                                                 .into_any_element()
                                         }
                                         ConversationItem::Process(group) => {
@@ -408,6 +418,7 @@ pub struct MessageView {
     expanded_tools: Arc<HashSet<String>>,
     on_toggle_tool: Option<DetailToggleHandler>,
     on_open_written_file: Option<OpenWrittenFileHandler>,
+    on_fork_message: Option<ForkMessageHandler>,
 }
 
 impl MessageView {
@@ -420,6 +431,7 @@ impl MessageView {
             expanded_tools: Arc::new(HashSet::new()),
             on_toggle_tool: None,
             on_open_written_file: None,
+            on_fork_message: None,
         }
     }
 
@@ -445,6 +457,11 @@ impl MessageView {
 
     pub fn on_open_written_file(mut self, handler: Option<OpenWrittenFileHandler>) -> Self {
         self.on_open_written_file = handler;
+        self
+    }
+
+    pub fn on_fork_message(mut self, handler: Option<ForkMessageHandler>) -> Self {
+        self.on_fork_message = handler;
         self
     }
 }
@@ -480,35 +497,60 @@ impl gpui::RenderOnce for MessageView {
             // 规范 S-14：用户消息是右对齐弱色气泡，不通栏；右对齐 + 底色已完成身份区分，
             // 不再显示 `User` 角色标签（再加就是重复编码，违反 S-8）。
             let style = user_bubble_style(cx);
-            root.items_end().mb_4().child(
-                v_flex()
-                    .debug_selector(|| "user-bubble".into())
-                    .min_w_0()
-                    .max_w(relative(style.max_w_ratio))
-                    .px_3()
-                    .py_2()
-                    .rounded(style.radius)
-                    .border_1()
-                    // 选中态（minimap 定位）用同源实色边框表达，不与常规弱边框混淆。
-                    .border_color(if selected {
-                        style.selected_border
-                    } else {
-                        style.border
-                    })
-                    .bg(style.bg)
-                    .text_sm()
-                    .line_height(relative(BODY_LINE_HEIGHT))
-                    .gap_2()
-                    .when_some(self.message.label.clone(), |bubble, label| {
-                        bubble.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(label),
-                        )
-                    })
-                    .children(blocks),
-            )
+            let action_group = SharedString::from(format!("message-actions-{message_id}"));
+            root.group(action_group.clone())
+                .items_end()
+                .mb_4()
+                .child(
+                    v_flex()
+                        .debug_selector(|| "user-bubble".into())
+                        .min_w_0()
+                        .max_w(relative(style.max_w_ratio))
+                        .px_3()
+                        .py_2()
+                        .rounded(style.radius)
+                        .border_1()
+                        // 选中态（minimap 定位）用同源实色边框表达，不与常规弱边框混淆。
+                        .border_color(if selected {
+                            style.selected_border
+                        } else {
+                            style.border
+                        })
+                        .bg(style.bg)
+                        .text_sm()
+                        .line_height(relative(BODY_LINE_HEIGHT))
+                        .gap_2()
+                        .when_some(self.message.label.clone(), |bubble, label| {
+                            bubble.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(label),
+                            )
+                        })
+                        .children(blocks),
+                )
+                .when_some(self.on_fork_message.clone(), |message, handler| {
+                    let entry_id = message_id.clone();
+                    message.child(
+                        h_flex()
+                            .mt_1()
+                            .justify_end()
+                            // Fork 是低频次操作：默认隐藏，仅在整条用户气泡 hover 时显形。
+                            .invisible()
+                            .group_hover(action_group.clone(), |actions| actions.visible())
+                            .child(
+                                Button::new(SharedString::from(format!("fork-{entry_id}")))
+                                    .debug_selector(|| "fork-user-message".into())
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Copy)
+                                    .label("分叉")
+                                    .tooltip("从此用户消息分叉")
+                                    .on_click(move |_, _, cx| handler(entry_id.clone(), cx)),
+                            ),
+                    )
+                })
         } else {
             let model_label = (self.message.role == MessageRole::Assistant)
                 .then(|| {
@@ -1364,11 +1406,11 @@ fn role_label(role: MessageRole) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
     use gpui::{
-        AppContext as _, Context, ListAlignment, Render, TestAppContext, VisualTestContext, size,
-        transparent_black,
+        AppContext as _, Context, ListAlignment, Modifiers, Render, TestAppContext,
+        VisualTestContext, size, transparent_black,
     };
     use gpui_component::{Root, ThemeMode};
     use pi_render::{MarkdownBlock, MinimapNode, ModelRef};
@@ -1382,6 +1424,7 @@ mod tests {
         list_state: ListState,
         expanded_tools: Arc<HashSet<String>>,
         selected: Option<String>,
+        forked: Option<Rc<RefCell<Vec<String>>>>,
     }
 
     impl Render for ChatHarness {
@@ -1389,6 +1432,11 @@ mod tests {
             let chat = ChatWindow::new(self.document.clone(), self.list_state.clone())
                 .model_names(self.model_names.clone())
                 .expanded_tools(self.expanded_tools.clone());
+            let chat = if let Some(forked) = self.forked.clone() {
+                chat.on_fork_message(move |entry_id, _| forked.borrow_mut().push(entry_id))
+            } else {
+                chat
+            };
             match &self.selected {
                 Some(id) => chat.selected_message(id.clone()),
                 None => chat,
@@ -1509,6 +1557,7 @@ mod tests {
                 list_state: ListState::new(item_count, ListAlignment::Top, px(1200.)).measure_all(),
                 expanded_tools: Arc::new(HashSet::new()),
                 selected: None,
+                forked: None,
             });
             Root::new(harness, window, cx)
         });
@@ -1539,6 +1588,7 @@ mod tests {
                 list_state: ListState::new(item_count, ListAlignment::Top, px(1200.)).measure_all(),
                 expanded_tools: Arc::new(expanded_tools.into_iter().collect()),
                 selected,
+                forked: None,
             });
             Root::new(harness, window, cx)
         });
@@ -1548,6 +1598,36 @@ mod tests {
             visual.run_until_parked();
         }
         visual
+    }
+
+    fn render_chat_with_fork_handler(
+        cx: &mut TestAppContext,
+        document: Arc<ConversationDocument>,
+    ) -> (VisualTestContext, Rc<RefCell<Vec<String>>>) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init_fonts(cx).expect("font init failed");
+        });
+        let item_count = document.items.len();
+        let forked = Rc::new(RefCell::new(Vec::new()));
+        let captured = forked.clone();
+        let handle = cx.open_window(size(px(640.), px(480.)), move |window, cx| {
+            let harness = cx.new(|_| ChatHarness {
+                document,
+                model_names: Arc::new(HashMap::new()),
+                list_state: ListState::new(item_count, ListAlignment::Top, px(1200.)).measure_all(),
+                expanded_tools: Arc::new(HashSet::new()),
+                selected: None,
+                forked: Some(captured),
+            });
+            Root::new(harness, window, cx)
+        });
+        let mut visual = VisualTestContext::from_window(handle.into(), cx);
+        for _ in 0..4 {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.run_until_parked();
+        }
+        (visual, forked)
     }
 
     /// 消息列宽度断言需要排除 176px 目录面板的占位，用空 minimap 的文档。
@@ -1678,6 +1758,46 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// § 5.8 S-9：用户消息 Fork 默认无命中区，hover 气泡后显示且可点击。
+    #[gpui::test]
+    fn fork_action_is_hidden_until_message_hover_and_clicks(cx: &mut TestAppContext) {
+        let (mut visual, forked) = render_chat_with_fork_handler(
+            cx,
+            fixture_document_without_minimap(ToolStatus::Success),
+        );
+        assert!(visual.debug_bounds("fork-user-message").is_none());
+        let bubble = visual
+            .debug_bounds("user-bubble")
+            .expect("用户气泡必须存在");
+        visual.simulate_mouse_move(bubble.center(), None, Modifiers::default());
+        for _ in 0..2 {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.run_until_parked();
+        }
+        let fork = visual
+            .debug_bounds("fork-user-message")
+            .expect("hover 用户消息后 Fork 操作必须显形");
+        visual.simulate_click(fork.center(), Modifiers::default());
+        visual.run_until_parked();
+        assert_eq!(forked.borrow().as_slice(), ["u"]);
+    }
+
+    /// 源码结构断言作为行为测试的补充，防止回退到每行 hover state。
+    #[test]
+    fn fork_action_uses_message_group_hover_visibility() {
+        let source = include_str!("chat.rs");
+        let production = source.split("mod tests {").next().unwrap();
+        assert!(production.contains(".group(action_group.clone())"));
+        assert!(production.contains(".invisible()"));
+        assert!(
+            production.contains(".group_hover(action_group.clone(), |actions| actions.visible())")
+        );
+        assert!(production.contains(".debug_selector(|| \"fork-user-message\".into())"));
+        assert!(production.contains(".label(\"分叉\")"));
+        assert!(production.contains("root.group(action_group.clone())"));
+        assert!(!production.contains(".debug_selector(|| \"user-bubble\".into())\n                        .group(action_group.clone())"));
     }
 
     /// § 5.8 S-18：行高常量唯一；消息正文与用户气泡都必须引用它，不许出现字面量行高。

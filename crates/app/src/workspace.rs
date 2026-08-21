@@ -6,6 +6,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, IconName, Root, Sizable as _, StyledExt as _, TitleBar,
+    WindowExt as _,
     button::{Button, ButtonVariants as _},
     dock::{DockArea, DockItem, DockPlacement},
     h_flex,
@@ -14,9 +15,10 @@ use gpui_pi_ui::{AppShell, WorkspaceTabBar, theme};
 
 use crate::file_explorer::FileExplorerPanel;
 use crate::main_panel::MainPanel;
-use crate::panels::ChatPanel;
+use crate::model_config::ModelConfigPanel;
 #[cfg(test)]
 use crate::panels::LayoutProbe;
+use crate::panels::{ChatPanel, SessionsChanged};
 use crate::session_sidebar::{SessionSelected, SessionSidebar, WorktreeSelected};
 use crate::trust_prompt::prompt_project_trust;
 
@@ -30,11 +32,13 @@ pub struct Workspace {
     sidebar: gpui::Entity<SessionSidebar>,
     file_explorer: gpui::Entity<FileExplorerPanel>,
     main_panel: gpui::Entity<MainPanel>,
+    model_config: gpui::Entity<ModelConfigPanel>,
     selected_directory: Option<PathBuf>,
     selected_session: Option<SessionSelected>,
     _appearance_subscription: Subscription,
     _session_subscription: Subscription,
     _worktree_subscription: Subscription,
+    _sessions_changed_subscription: Subscription,
 }
 
 impl Workspace {
@@ -89,6 +93,7 @@ impl Workspace {
             panel
         });
         let workspace = cx.new(|cx| MainPanel::new(chat.clone(), &file_explorer, window, cx));
+        let model_config = cx.new(|cx| ModelConfigPanel::new(window, cx));
 
         dock_area.update(cx, |dock_area, cx| {
             dock_area.set_center(DockItem::panel(Arc::new(workspace.clone())), window, cx);
@@ -152,17 +157,27 @@ impl Workspace {
                 workspace.apply_browsing_root(event.cwd.clone(), window, cx);
             },
         );
+        let sessions_sidebar = sidebar.clone();
+        let sessions_changed_subscription = cx.subscribe_in(
+            &chat,
+            window,
+            move |_, _, _: &SessionsChanged, window, cx| {
+                sessions_sidebar.update(cx, |sidebar, cx| sidebar.refresh(window, cx));
+            },
+        );
 
         Self {
             dock_area,
             sidebar,
             file_explorer,
             main_panel: workspace,
+            model_config,
             selected_directory: None,
             selected_session: None,
             _appearance_subscription: appearance_subscription,
             _session_subscription: session_subscription,
             _worktree_subscription: worktree_subscription,
+            _sessions_changed_subscription: sessions_changed_subscription,
         }
     }
 
@@ -206,6 +221,19 @@ impl Workspace {
             return;
         };
         crate::resource_config::open_resource_config(cwd, window, cx);
+    }
+
+    fn open_model_config(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_sheet(cx) {
+            return;
+        }
+        self.model_config
+            .update(cx, |panel, cx| panel.open(window, cx));
     }
 
     fn choose_directory(
@@ -371,6 +399,15 @@ impl Render for Workspace {
                     .tooltip("查看 Skills / Plugins")
                     .disabled(self.selected_directory.is_none())
                     .on_click(cx.listener(Self::open_resources)),
+            )
+            .child(
+                Button::new("open-model-config")
+                    .debug_selector(|| "open-model-config".into())
+                    .ghost()
+                    .small()
+                    .icon(IconName::Settings)
+                    .tooltip("打开模型与认证设置")
+                    .on_click(cx.listener(Self::open_model_config)),
             )
             .child(
                 Button::new("choose-project-directory")
