@@ -5,7 +5,8 @@ use gpui::{
     PathPromptOptions, Render, SharedString, Styled as _, Subscription, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, IconName, Root, Sizable as _, StyledExt as _, TitleBar, WindowExt as _,
+    ActiveTheme as _, Disableable as _, IconName, Root, Sizable as _, StyledExt as _, TitleBar,
+    WindowExt as _,
     button::{Button, ButtonVariants as _},
     dock::{DockArea, DockItem, DockPlacement},
     h_flex,
@@ -137,7 +138,7 @@ impl Workspace {
                 workspace.selected_directory = Some(event.cwd.clone());
                 workspace.selected_session = Some(event.clone());
                 chat_panel.update(cx, |panel, cx| {
-                    panel.load_selection(event.clone(), cx);
+                    panel.load_selection(event.clone(), window, cx);
                 });
                 file_panel.update(cx, |panel, cx| {
                     panel.set_root(Some(event.cwd.clone()), window, cx);
@@ -208,6 +209,18 @@ impl Workspace {
             dock_area.toggle_dock(DockPlacement::Right, window, cx);
         });
         cx.notify();
+    }
+
+    fn open_resources(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cwd) = self.selected_directory.clone() else {
+            return;
+        };
+        crate::resource_config::open_resource_config(cwd, window, cx);
     }
 
     fn open_model_config(
@@ -376,6 +389,16 @@ impl Render for Workspace {
                     .icon(files_toggle_icon)
                     .tooltip(files_toggle_tooltip)
                     .on_click(cx.listener(Self::toggle_files)),
+            )
+            .child(
+                Button::new("open-resource-config")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Settings)
+                    .label("资源")
+                    .tooltip("查看 Skills / Plugins")
+                    .disabled(self.selected_directory.is_none())
+                    .on_click(cx.listener(Self::open_resources)),
             )
             .child(
                 Button::new("open-model-config")

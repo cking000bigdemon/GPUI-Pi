@@ -691,7 +691,9 @@ impl Panel for MainPanel {
 }
 
 impl Render for MainPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.chat
+            .update(cx, |chat, cx| chat.process_extension_ui(window, cx));
         let panel = cx.entity();
         let select_panel = panel.clone();
         let close_panel = panel.clone();
@@ -815,6 +817,195 @@ fn centered_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    struct MainPanelDialogHarness {
+        panel: gpui::Entity<MainPanel>,
+    }
+
+    impl Render for MainPanelDialogHarness {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(self.panel.clone())
+                .children(gpui_component::Root::render_dialog_layer(window, cx))
+                .children(gpui_component::Root::render_notification_layer(window, cx))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingResponseSender {
+        responses: Mutex<Vec<pi_rpc::ExtensionUiResponse>>,
+    }
+
+    impl crate::live_session::ExtensionResponseSender for RecordingResponseSender {
+        fn send(&self, response: pi_rpc::ExtensionUiResponse) -> Result<(), String> {
+            self.responses.lock().unwrap().push(response);
+            Ok(())
+        }
+    }
+
+    #[gpui::test]
+    fn extension_ui_is_driven_while_file_tab_is_active(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            gpui_pi_ui::theme::init_fonts(cx).expect("font init failed");
+        });
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let output = captured.clone();
+        let sender = Arc::new(RecordingResponseSender::default());
+        let test_sender = sender.clone();
+        let handle = cx.open_window(gpui::size(px(800.), px(560.)), move |window, cx| {
+            let explorer = cx.new(|cx| crate::file_explorer::FileExplorerPanel::new(window, cx));
+            let chat = cx.new(|cx| ChatPanel::new(window, cx));
+            chat.update(cx, |chat, _| {
+                chat.set_extension_response_sender_for_test(test_sender.clone());
+            });
+            let panel = cx.new(|cx| MainPanel::new(chat.clone(), &explorer, window, cx));
+            panel.update(cx, |panel, cx| {
+                panel.tabs.push(FileTab {
+                    id: "file:fixture".to_owned(),
+                    source_root: PathBuf::from("C:/fixture"),
+                    relative_path: PathBuf::from("fixture.txt"),
+                    label: "fixture.txt".to_owned(),
+                    kind: FileTabKind::Source,
+                    generation: 1,
+                    status: FileTabStatus::Text(Arc::new(pi_data::TextFileContent {
+                        text: "fixture".to_owned(),
+                        language: "text",
+                        lines: 1,
+                        size: 7,
+                    })),
+                });
+                panel.active = ActiveContent::File("file:fixture".to_owned());
+                cx.notify();
+            });
+            *output.borrow_mut() = Some((panel.clone(), chat));
+            let harness = cx.new(|_| MainPanelDialogHarness { panel });
+            gpui_component::Root::new(harness, window, cx)
+        });
+        let mut visual = gpui::VisualTestContext::from_window(handle.into(), cx);
+        for _ in 0..3 {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let (panel, chat) = captured.borrow().clone().unwrap();
+        chat.update(cx, |chat, cx| {
+            for (id, request) in [
+                (
+                    "confirm",
+                    pi_rpc::ExtensionUiRequest::Confirm {
+                        title: "Confirm".into(),
+                        message: "Continue?".into(),
+                        timeout: None,
+                    },
+                ),
+                (
+                    "select",
+                    pi_rpc::ExtensionUiRequest::Select {
+                        title: "Select".into(),
+                        options: vec!["Alpha".into()],
+                        timeout: None,
+                    },
+                ),
+                (
+                    "input",
+                    pi_rpc::ExtensionUiRequest::Input {
+                        title: "Input".into(),
+                        placeholder: Some("value".into()),
+                        timeout: None,
+                    },
+                ),
+                (
+                    "editor-dialog",
+                    pi_rpc::ExtensionUiRequest::Editor {
+                        title: "Editor".into(),
+                        prefill: Some("prefill".into()),
+                    },
+                ),
+                (
+                    "notify",
+                    pi_rpc::ExtensionUiRequest::Notify {
+                        message: "file tab notification".into(),
+                        notify_type: None,
+                    },
+                ),
+                (
+                    "title",
+                    pi_rpc::ExtensionUiRequest::SetTitle {
+                        title: "File Tab Extension".into(),
+                    },
+                ),
+                (
+                    "editor",
+                    pi_rpc::ExtensionUiRequest::SetEditorText {
+                        text: "hidden chat editor".into(),
+                    },
+                ),
+                (
+                    "status",
+                    pi_rpc::ExtensionUiRequest::SetStatus {
+                        status_key: "fixture".into(),
+                        status_text: Some("ready".into()),
+                    },
+                ),
+                (
+                    "widget",
+                    pi_rpc::ExtensionUiRequest::SetWidget {
+                        widget_key: "fixture".into(),
+                        widget_lines: Some(vec!["one\ntwo".into()]),
+                        widget_placement: None,
+                    },
+                ),
+            ] {
+                chat.apply_extension_request_for_test(id, request);
+            }
+            cx.notify();
+        });
+        for _ in 0..4 {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.run_until_parked();
+        }
+        assert!(visual.debug_bounds("extension-confirm-submit").is_some());
+        assert_eq!(visual.window_title().as_deref(), Some("File Tab Extension"));
+        visual.dispatch_action(gpui_component::dialog::Confirm { secondary: false });
+        for _ in 0..3 {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.run_until_parked();
+        }
+        let option = visual
+            .debug_bounds("extension-select-option-0")
+            .expect("select dialog did not advance while file tab active");
+        visual.simulate_click(option.center(), Default::default());
+        for _ in 0..3 {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.run_until_parked();
+        }
+        assert!(visual.debug_bounds("extension-dialog-submit").is_some());
+        visual.dispatch_action(gpui_component::dialog::Confirm { secondary: false });
+        for _ in 0..3 {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.run_until_parked();
+        }
+        assert!(visual.debug_bounds("extension-dialog-submit").is_some());
+        visual.dispatch_action(gpui_component::dialog::Cancel);
+        for _ in 0..3 {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.run_until_parked();
+        }
+        assert_eq!(sender.responses.lock().unwrap().len(), 4);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.select_tab(0, window, cx));
+        });
+        for _ in 0..3 {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        assert!(visual.debug_bounds("extension-widgets-above").is_some());
+        assert!(visual.debug_bounds("extension-status-item-0").is_some());
+        assert_eq!(
+            chat.read_with(cx, |chat, cx| chat.composer_value_for_test(cx)),
+            "hidden chat editor"
+        );
+    }
 
     #[gpui::test]
     fn standalone_diff_tab_renders_scrollbar_overlay_for_both_axis_overflow(

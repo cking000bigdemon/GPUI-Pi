@@ -4,22 +4,26 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use futures::{StreamExt as _, channel::mpsc::UnboundedReceiver};
 use gpui::{
-    Anchor, App, AppContext as _, ClipboardEntry, Context, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, FollowMode, Image, ImageFormat, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ListAlignment, ListState, ParentElement as _, PathPromptOptions, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, img,
-    prelude::FluentBuilder as _, px,
+    Anchor, AnyWindowHandle, App, AppContext as _, ClipboardEntry, Context, EventEmitter,
+    ExternalPaths, FocusHandle, Focusable, FollowMode, Image, ImageFormat, InteractiveElement as _,
+    IntoElement, KeyDownEvent, ListAlignment, ListState, ParentElement as _, PathPromptOptions,
+    Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    Window, div, img, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _,
-    StyledExt as _,
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName,
+    InteractiveElementExt as _, Sizable as _, StyledExt as _, WindowExt as _,
     button::{Button, ButtonVariants as _, Toggle, ToggleGroup, ToggleVariants as _},
+    dialog::{DialogAction, DialogClose, DialogFooter},
     dock::{Panel, PanelControl, PanelEvent},
     h_flex,
     input::{InputEvent, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
+    notification::Notification,
     popover::Popover,
     scroll::ScrollableElement as _,
+    status_bar::StatusBar,
+    tooltip::Tooltip,
     v_flex,
 };
 use pi_render::{ConversationDocument, ConversationItem, LivePhase};
@@ -27,8 +31,8 @@ use pi_render::{ConversationDocument, ConversationItem, LivePhase};
 use crate::{
     live_session::{
         ActiveSession, ComposerMode, ComposerSubmission, ControlOperation, ControlOutcome,
-        ControlRequest, PumpMessage, RequestFailureKind, RpcIntent, SessionControls,
-        SessionRuntimeEvent, ToolPreset, official_binary,
+        ControlRequest, ExtensionUiState, PumpMessage, RequestFailureKind, RpcIntent,
+        SessionControls, SessionRuntimeEvent, ToolPreset, official_binary,
     },
     session_sidebar::SessionSelected,
 };
@@ -74,6 +78,19 @@ pub struct ChatPanel {
     host_extension_degradation: Option<String>,
     activity_generation: u64,
     calibration_generation: u64,
+    extension_ui: ExtensionUiState,
+    extension_widgets_above_scroll: ScrollHandle,
+    extension_widgets_below_scroll: ScrollHandle,
+    extension_dialog_open: Option<String>,
+    // gpui 的 track_focus 每个 handle 只保留本帧最后注册节点；body/footer 必须分开。
+    extension_dialog_body_focus: Option<FocusHandle>,
+    extension_dialog_footer_focus: Option<FocusHandle>,
+    extension_dialog_needs_close: bool,
+    pending_extension_responses: Vec<pi_rpc::ExtensionUiResponse>,
+    extension_response_sender:
+        Option<std::sync::Arc<dyn crate::live_session::ExtensionResponseSender>>,
+    window_title: String,
+    next_extension_element_id: u64,
     _composer_subscription: Subscription,
     probe: Option<LayoutProbe>,
 }
@@ -193,11 +210,14 @@ impl LayoutProbe {
     pub(crate) fn record_files(&self, _: gpui::Bounds<gpui::Pixels>) {}
 }
 
+const COMPOSER_MAX_ROWS: usize = 3;
+const COMPOSER_TEXTAREA_VIEWPORT_HEIGHT: f32 = 76.;
+
 impl ChatPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(1, 5)
+                .auto_grow(1, COMPOSER_MAX_ROWS)
                 .submit_on_enter(true)
                 .placeholder("输入消息；Enter 发送，Shift+Enter 换行")
         });
@@ -272,6 +292,17 @@ impl ChatPanel {
             host_extension_degradation: None,
             activity_generation: 0,
             calibration_generation: 0,
+            extension_ui: ExtensionUiState::default(),
+            extension_widgets_above_scroll: ScrollHandle::default(),
+            extension_widgets_below_scroll: ScrollHandle::default(),
+            extension_dialog_open: None,
+            extension_dialog_body_focus: None,
+            extension_dialog_footer_focus: None,
+            extension_dialog_needs_close: false,
+            pending_extension_responses: Vec::new(),
+            extension_response_sender: None,
+            window_title: "GPUI-Pi".to_owned(),
+            next_extension_element_id: 0,
             _composer_subscription: subscription,
             probe: None,
         }
@@ -281,6 +312,34 @@ impl ChatPanel {
     pub(crate) fn with_probe(mut self, probe: LayoutProbe) -> Self {
         self.probe = Some(probe);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_extension_response_sender_for_test(
+        &mut self,
+        sender: std::sync::Arc<dyn crate::live_session::ExtensionResponseSender>,
+    ) {
+        self.extension_response_sender = Some(sender);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn composer_value_for_test(&self, cx: &App) -> String {
+        self.composer.read(cx).value().to_string()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_extension_request_for_test(
+        &mut self,
+        id: impl Into<String>,
+        request: pi_rpc::ExtensionUiRequest,
+    ) {
+        let id = id.into();
+        let duplicate = self.extension_ui.is_dialog_pending(&id);
+        if let Some(response) = self.extension_ui.apply(id.clone(), request) {
+            self.pending_extension_responses.push(response);
+        } else if duplicate {
+            self.rpc_error = Some(format!("重复 Extension UI 请求 {id} 已忽略"));
+        }
     }
 
     fn current_draft(&self, cx: &App) -> pi_data::ComposerDraft {
@@ -347,8 +406,14 @@ impl ChatPanel {
         self.host_extension_degradation = diagnostic.map(str::to_owned);
     }
 
-    pub fn load_selection(&mut self, selection: SessionSelected, cx: &mut Context<Self>) {
+    pub fn load_selection(
+        &mut self,
+        selection: SessionSelected,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.save_current_draft(cx);
+        self.reset_extension_ui(window, cx);
         self.load_generation = self.load_generation.wrapping_add(1);
         self.begin_active_generation();
         let generation = self.load_generation;
@@ -445,7 +510,7 @@ impl ChatPanel {
         true
     }
 
-    fn start_live(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn start_live(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.active.is_some() || self.control_operation.is_some() {
             return;
         }
@@ -466,10 +531,13 @@ impl ChatPanel {
         );
         match result {
             Ok((active, receiver)) => {
+                self.extension_response_sender = Some(std::sync::Arc::new(
+                    crate::live_session::ClientExtensionResponseSender::new(active.client()),
+                ));
                 self.active = Some(active);
                 self.rpc_success = None;
                 self.rpc_error = None;
-                self.spawn_pump(receiver, cx);
+                self.spawn_pump(receiver, window.window_handle(), cx);
             }
             Err(error) => {
                 self.rpc_success = None;
@@ -479,14 +547,24 @@ impl ChatPanel {
         cx.notify();
     }
 
-    fn spawn_pump(&self, mut receiver: UnboundedReceiver<PumpMessage>, cx: &mut Context<Self>) {
+    fn spawn_pump(
+        &self,
+        mut receiver: UnboundedReceiver<PumpMessage>,
+        window_handle: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |panel, cx| {
             while let Some(message) = receiver.next().await {
-                let should_stop = panel
-                    .update(cx, |panel, cx| {
-                        let should_stop = panel.handle_pump(message, cx);
-                        cx.notify();
-                        should_stop
+                let should_stop = window_handle
+                    .update(cx, |_, window, cx| {
+                        panel
+                            .update(cx, |panel, cx| {
+                                let should_stop = panel.handle_pump(message, cx);
+                                panel.process_extension_ui(window, cx);
+                                cx.notify();
+                                should_stop
+                            })
+                            .unwrap_or(true)
                     })
                     .unwrap_or(true);
                 if should_stop {
@@ -500,6 +578,8 @@ impl ChatPanel {
     fn handle_pump(&mut self, message: PumpMessage, cx: &mut Context<Self>) -> bool {
         let generation = match &message {
             PumpMessage::Events { generation, .. }
+            | PumpMessage::ExtensionUiBatch { generation, .. }
+            | PumpMessage::ExtensionUiReset { generation }
             | PumpMessage::RequestFinished { generation, .. }
             | PumpMessage::CommandsLoaded { generation, .. }
             | PumpMessage::ControlsLoaded { generation, .. }
@@ -523,10 +603,17 @@ impl ChatPanel {
             return false;
         }
         if let PumpMessage::ToolRestartFinished { preset, result, .. } = message {
+            // 旧 client 正在退出，不能把旧 dialog 的 cancelled 写给即将安装的新 client。
+            self.pending_extension_responses.clear();
+            self.extension_ui.reset();
+            self.extension_dialog_needs_close |= self.extension_dialog_open.take().is_some();
             self.control_operation = None;
             match result {
                 Ok(active) => {
                     self.set_host_extension_degradation(active.startup_diagnostic());
+                    self.extension_response_sender = Some(std::sync::Arc::new(
+                        crate::live_session::ClientExtensionResponseSender::new(active.client()),
+                    ));
                     self.active = Some(*active);
                     self.tool_preset = preset;
                     self.rpc_success = None;
@@ -537,11 +624,17 @@ impl ChatPanel {
                 }
                 Err(error) => {
                     self.active = None;
+
+                    self.extension_response_sender = None;
                     self.rpc_success = None;
                     self.rpc_error = Some(format!("工具预设重启失败；请重新启动活会话：{error}"));
                 }
             }
             return false;
+        }
+        if matches!(&message, PumpMessage::Stopped { .. }) {
+            self.extension_response_sender = None;
+            self.pending_extension_responses.clear();
         }
         if let PumpMessage::Stopped { error, .. } = &message
             && self.active.is_none()
@@ -570,6 +663,19 @@ impl ChatPanel {
             return false;
         }
         match message {
+            PumpMessage::ExtensionUiBatch { requests, .. } => {
+                for (id, request) in requests {
+                    let duplicate = self.extension_ui.is_dialog_pending(&id);
+                    if let Some(response) = self.extension_ui.apply(id.clone(), request) {
+                        self.pending_extension_responses.push(response);
+                    } else if duplicate {
+                        self.rpc_error = Some(format!("重复 Extension UI 请求 {id} 已忽略"));
+                    }
+                }
+            }
+            PumpMessage::ExtensionUiReset { .. } => {
+                self.clear_extension_ui_for_lifecycle();
+            }
             PumpMessage::Events { events, .. } => {
                 if !events.is_empty() {
                     self.rpc_success = None;
@@ -700,6 +806,10 @@ impl ChatPanel {
                 }
             }
             PumpMessage::Stopped { error, .. } => {
+                self.extension_ui.reset();
+                self.extension_response_sender = None;
+                self.pending_extension_responses.clear();
+                self.extension_dialog_needs_close |= self.extension_dialog_open.take().is_some();
                 if let Some(error) = error {
                     self.rpc_success = None;
                     self.rpc_error = Some(error);
@@ -710,6 +820,493 @@ impl ChatPanel {
             }
         }
         false
+    }
+
+    pub(crate) fn process_extension_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // MainPanel render 与 pump 都可能在同一帧调用。所有投影操作必须幂等：queue 项只
+        // take 一次、title/editor 仅在变化时写入、dialog 由 id/pending-close 串行化。
+        if self.extension_dialog_needs_close && self.extension_dialog_is_topmost(window, cx) {
+            self.extension_dialog_needs_close = false;
+            window.close_dialog(cx);
+            self.clear_extension_dialog_focus();
+        }
+        if self.extension_dialog_needs_close && !window.has_active_dialog(cx) {
+            self.extension_dialog_needs_close = false;
+            self.clear_extension_dialog_focus();
+        }
+        while let Some(diagnostic) = self.extension_ui.take_diagnostic() {
+            self.rpc_error = Some(diagnostic);
+        }
+        for response in self
+            .pending_extension_responses
+            .drain(..)
+            .collect::<Vec<_>>()
+        {
+            self.send_extension_response(response, cx);
+        }
+        while self
+            .extension_ui
+            .active_dialog_expired(std::time::Instant::now())
+        {
+            let Some(id) = self
+                .extension_ui
+                .active_dialog()
+                .map(|dialog| dialog.id.clone())
+            else {
+                break;
+            };
+            if self.extension_dialog_open.as_deref() == Some(&id) {
+                self.discard_extension_dialog(&id, "Extension UI 请求已超时", window, cx);
+                break;
+            }
+            // 排队期间已经超时的请求直接取消，不打开一帧再关闭。
+            self.send_extension_response(pi_rpc::ExtensionUiResponse::cancelled(&id), cx);
+            self.extension_ui.finish_dialog(&id);
+            self.rpc_error = Some("Extension UI 请求在队列中已超时".to_owned());
+        }
+        while let Some(notification) = self.extension_ui.take_notification() {
+            let notification = match notification.notify_type {
+                pi_rpc::NotifyType::Info => Notification::info(notification.message),
+                pi_rpc::NotifyType::Warning => Notification::warning(notification.message),
+                pi_rpc::NotifyType::Error => Notification::error(notification.message),
+            };
+            window.push_notification(notification, cx);
+        }
+        let title = self.extension_ui.title().unwrap_or("GPUI-Pi");
+        if title != self.window_title {
+            self.window_title = title.to_owned();
+            window.set_window_title(title);
+        }
+        if let Some(text) = self.extension_ui.take_editor_text() {
+            self.composer
+                .update(cx, |input, cx| input.set_value(text, window, cx));
+            if let Some(key) = self.draft_key.clone() {
+                self.drafts.set(key, self.current_draft(cx));
+            }
+        }
+        if self.extension_dialog_needs_close {
+            return;
+        }
+        self.maybe_open_extension_dialog(window, cx);
+    }
+
+    fn send_extension_response(
+        &mut self,
+        response: pi_rpc::ExtensionUiResponse,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sender) = self.extension_response_sender.clone() else {
+            self.rpc_error = Some("Extension UI 响应未写回：活会话已结束".to_owned());
+            return;
+        };
+        let id = response.id().to_owned();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |panel, cx| {
+            let result = executor.spawn(async move { sender.send(response) }).await;
+            let _ = panel.update(cx, |panel, cx| {
+                if let Err(error) = result {
+                    panel.rpc_error = Some(format!(
+                        "Extension UI 响应 {id} 未写回，已丢弃并继续队列：{error}"
+                    ));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn extension_dialog_is_topmost(&self, window: &Window, cx: &mut App) -> bool {
+        [
+            self.extension_dialog_body_focus.as_ref(),
+            self.extension_dialog_footer_focus.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|focus| focus.contains_focused(window, cx) || focus.within_focused(window, cx))
+    }
+
+    fn clear_extension_dialog_focus(&mut self) {
+        self.extension_dialog_body_focus = None;
+        self.extension_dialog_footer_focus = None;
+    }
+
+    fn request_extension_dialog_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.extension_dialog_is_topmost(window, cx) {
+            window.close_dialog(cx);
+            self.clear_extension_dialog_focus();
+            self.extension_dialog_needs_close = false;
+        } else {
+            self.extension_dialog_needs_close = true;
+        }
+    }
+
+    fn discard_extension_dialog(
+        &mut self,
+        id: &str,
+        reason: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.extension_dialog_open.as_deref() == Some(id) {
+            self.finish_extension_dialog(id, pi_rpc::ExtensionUiResponse::cancelled(id), cx);
+            self.request_extension_dialog_close(window, cx);
+            self.rpc_error = Some(reason.to_owned());
+            cx.notify();
+        }
+    }
+
+    fn maybe_open_extension_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog_request) = self.extension_ui.active_dialog().cloned() else {
+            self.extension_dialog_open = None;
+            if !self.extension_dialog_needs_close {
+                self.clear_extension_dialog_focus();
+            }
+            return;
+        };
+        if self.extension_dialog_open.as_deref() == Some(&dialog_request.id) {
+            return;
+        }
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        self.extension_dialog_open = Some(dialog_request.id.clone());
+        let dialog_body_focus = cx.focus_handle();
+        let dialog_footer_focus = cx.focus_handle();
+        self.extension_dialog_body_focus = Some(dialog_body_focus.clone());
+        self.extension_dialog_footer_focus = Some(dialog_footer_focus.clone());
+        if let Some(deadline) = dialog_request.deadline {
+            let panel = cx.weak_entity();
+            let timeout_id = dialog_request.id.clone();
+            let timeout_sequence = dialog_request.sequence;
+            let timer = cx.background_executor().clone();
+            cx.spawn(async move |_, cx| {
+                timer
+                    .timer(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .await;
+                let _ = panel.update(cx, |panel, cx| {
+                    if panel.extension_ui.active_dialog().is_some_and(|dialog| {
+                        dialog.id == timeout_id && dialog.sequence == timeout_sequence
+                    }) {
+                        panel.extension_dialog_needs_close = true;
+                        panel.finish_extension_dialog(
+                            &timeout_id,
+                            pi_rpc::ExtensionUiResponse::cancelled(&timeout_id),
+                            cx,
+                        );
+                        panel.rpc_error = Some("Extension UI 请求已超时".to_owned());
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        let panel = cx.entity();
+        let id = dialog_request.id.clone();
+        let request = dialog_request.request.clone();
+        let select_options = dialog_request.select_options.clone();
+        let element_id = self.next_extension_element_id;
+        self.next_extension_element_id = self.next_extension_element_id.wrapping_add(1);
+        let open_value_dialog = |title: String,
+                                 initial_value: String,
+                                 placeholder: Option<String>,
+                                 multiline: bool,
+                                 window: &mut Window,
+                                 cx: &mut Context<Self>| {
+            let input = cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .auto_grow(1, if multiline { 8 } else { 3 })
+                    .submit_on_enter(!multiline)
+                    .placeholder(placeholder.unwrap_or_default())
+                    .default_value(initial_value)
+            });
+            let ok_input = input.clone();
+            let ok_panel = panel.clone();
+            let cancel_panel = panel.clone();
+            let cancel_id = id.clone();
+            let ok_id = id.clone();
+            let builder_body_focus = dialog_body_focus.clone();
+            let builder_footer_focus = dialog_footer_focus.clone();
+            window.open_dialog(cx, move |dialog, _, _| {
+                dialog
+                    .title(title.clone())
+                    .child(
+                        div()
+                            .debug_selector(|| "extension-dialog-textarea".into())
+                            .track_focus(&builder_body_focus)
+                            .child(Textarea::new(&input)),
+                    )
+                    .close_button(false)
+                    .keyboard(false)
+                    .overlay_closable(false)
+                    .on_ok({
+                        let ok_input = ok_input.clone();
+                        let ok_panel = ok_panel.clone();
+                        let ok_id = ok_id.clone();
+                        move |_, _, cx| {
+                            let value = ok_input.read(cx).value().to_string();
+                            ok_panel.update(cx, |panel, cx| {
+                                panel.finish_extension_dialog(
+                                    &ok_id,
+                                    pi_rpc::ExtensionUiResponse::value(&ok_id, value),
+                                    cx,
+                                );
+                            });
+                            true
+                        }
+                    })
+                    .on_cancel({
+                        let cancel_panel = cancel_panel.clone();
+                        let cancel_id = cancel_id.clone();
+                        move |_, _, cx| {
+                            cancel_panel.update(cx, |panel, cx| {
+                                panel.finish_extension_dialog(
+                                    &cancel_id,
+                                    pi_rpc::ExtensionUiResponse::cancelled(&cancel_id),
+                                    cx,
+                                );
+                            });
+                            true
+                        }
+                    })
+                    .footer(
+                        div().track_focus(&builder_footer_focus).child(
+                            DialogFooter::new()
+                                .child(
+                                    div()
+                                        .debug_selector(|| "extension-dialog-cancel".into())
+                                        .child(
+                                            DialogClose::new().child(
+                                                Button::new("extension-dialog-cancel")
+                                                    .track_focus(&builder_footer_focus)
+                                                    .secondary()
+                                                    .label("取消"),
+                                            ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .debug_selector(|| "extension-dialog-submit".into())
+                                        .child(
+                                            DialogAction::new().child(
+                                                Button::new("extension-dialog-submit")
+                                                    .track_focus(&builder_footer_focus)
+                                                    .primary()
+                                                    .label("提交"),
+                                            ),
+                                        ),
+                                ),
+                        ),
+                    )
+            });
+            dialog_body_focus.focus(window, cx);
+        };
+        match request {
+            pi_rpc::ExtensionUiRequest::Select { title, .. } => {
+                let options = Arc::new(select_options.unwrap_or_default());
+                let builder_body_focus = dialog_body_focus.clone();
+                let builder_footer_focus = dialog_footer_focus.clone();
+                window.open_dialog(cx, move |dialog, _, _| {
+                    let cancel_panel = panel.clone();
+                    let cancel_id = id.clone();
+                    dialog
+                        .title(title.clone())
+                        .close_button(false)
+                        .keyboard(false)
+                        .overlay_closable(false)
+                        .child(v_flex().track_focus(&builder_body_focus).gap_1().children(
+                            options.iter().enumerate().map(|(index, option)| {
+                                let option_panel = panel.clone();
+                                let option_id = id.clone();
+                                let value = option.raw.clone();
+                                Button::new(format!("extension-select-option-{element_id}-{index}"))
+                                    .track_focus(&builder_body_focus)
+                                    .debug_selector(move || {
+                                        format!("extension-select-option-{index}")
+                                    })
+                                    .secondary()
+                                    .label(option.display.clone())
+                                    .on_click(move |_, window, cx| {
+                                        option_panel.update(cx, |panel, cx| {
+                                            panel.finish_extension_dialog(
+                                                &option_id,
+                                                pi_rpc::ExtensionUiResponse::value(
+                                                    &option_id,
+                                                    value.clone(),
+                                                ),
+                                                cx,
+                                            );
+                                        });
+                                        window.close_dialog(cx);
+                                    })
+                            }),
+                        ))
+                        .on_ok(|_, _, _| false)
+                        .on_cancel({
+                            let cancel_panel = cancel_panel.clone();
+                            let cancel_id = cancel_id.clone();
+                            move |_, _, cx| {
+                                cancel_panel.update(cx, |panel, cx| {
+                                    panel.finish_extension_dialog(
+                                        &cancel_id,
+                                        pi_rpc::ExtensionUiResponse::cancelled(&cancel_id),
+                                        cx,
+                                    );
+                                });
+                                true
+                            }
+                        })
+                        .footer(
+                            div().track_focus(&builder_footer_focus).child(
+                                DialogFooter::new().child(
+                                    DialogClose::new().child(
+                                        Button::new("extension-select-cancel")
+                                            .track_focus(&builder_footer_focus)
+                                            .secondary()
+                                            .label("取消"),
+                                    ),
+                                ),
+                            ),
+                        )
+                });
+                dialog_body_focus.focus(window, cx);
+            }
+            pi_rpc::ExtensionUiRequest::Confirm { title, message, .. } => {
+                let ok_panel = panel.clone();
+                let cancel_panel = panel.clone();
+                let ok_id = id.clone();
+                let cancel_id = id.clone();
+                let builder_body_focus = dialog_body_focus.clone();
+                let builder_footer_focus = dialog_footer_focus.clone();
+                window.open_dialog(cx, move |dialog, _, _| {
+                    dialog
+                        .title(title.clone())
+                        .close_button(false)
+                        .keyboard(false)
+                        .overlay_closable(false)
+                        .child(
+                            div()
+                                .track_focus(&builder_body_focus)
+                                .child(message.clone()),
+                        )
+                        .on_ok({
+                            let ok_panel = ok_panel.clone();
+                            let ok_id = ok_id.clone();
+                            move |_, _, cx| {
+                                ok_panel.update(cx, |panel, cx| {
+                                    panel.finish_extension_dialog(
+                                        &ok_id,
+                                        pi_rpc::ExtensionUiResponse::confirmed(&ok_id, true),
+                                        cx,
+                                    );
+                                });
+                                true
+                            }
+                        })
+                        .on_cancel({
+                            let cancel_panel = cancel_panel.clone();
+                            let cancel_id = cancel_id.clone();
+                            move |_, _, cx| {
+                                cancel_panel.update(cx, |panel, cx| {
+                                    panel.finish_extension_dialog(
+                                        &cancel_id,
+                                        pi_rpc::ExtensionUiResponse::cancelled(&cancel_id),
+                                        cx,
+                                    );
+                                });
+                                true
+                            }
+                        })
+                        .footer(
+                            div().track_focus(&builder_footer_focus).child(
+                                DialogFooter::new()
+                                    .child(
+                                        div()
+                                            .debug_selector(|| "extension-confirm-cancel".into())
+                                            .child(
+                                                DialogClose::new().child(
+                                                    Button::new("extension-confirm-cancel")
+                                                        .track_focus(&builder_footer_focus)
+                                                        .secondary()
+                                                        .label("取消"),
+                                                ),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .debug_selector(|| "extension-confirm-submit".into())
+                                            .child(
+                                                DialogAction::new().child(
+                                                    Button::new("extension-confirm-submit")
+                                                        .track_focus(&builder_footer_focus)
+                                                        .primary()
+                                                        .label("确认"),
+                                                ),
+                                            ),
+                                    ),
+                            ),
+                        )
+                });
+                dialog_body_focus.focus(window, cx);
+            }
+            pi_rpc::ExtensionUiRequest::Input {
+                title, placeholder, ..
+            } => open_value_dialog(title, String::new(), placeholder, false, window, cx),
+            pi_rpc::ExtensionUiRequest::Editor { title, prefill } => {
+                open_value_dialog(title, prefill.unwrap_or_default(), None, true, window, cx)
+            }
+            _ => {
+                self.pending_extension_responses
+                    .push(pi_rpc::ExtensionUiResponse::cancelled(&id));
+                self.extension_ui.finish_dialog(&id);
+                self.extension_dialog_open = None;
+                self.clear_extension_dialog_focus();
+                self.rpc_error = Some("未知 Extension UI dialog 请求已取消".to_owned());
+            }
+        }
+    }
+
+    fn finish_extension_dialog(
+        &mut self,
+        id: &str,
+        response: pi_rpc::ExtensionUiResponse,
+        cx: &mut Context<Self>,
+    ) {
+        if self.extension_dialog_open.as_deref() != Some(id)
+            || self
+                .extension_ui
+                .active_dialog()
+                .map(|dialog| dialog.id.as_str())
+                != Some(id)
+        {
+            return;
+        }
+        self.send_extension_response(response, cx);
+        self.extension_ui.finish_dialog(id);
+        self.extension_dialog_open = None;
+        cx.notify();
+    }
+
+    fn clear_extension_ui_for_lifecycle(&mut self) {
+        // lifecycle reset 可能紧邻进程替换；旧 dialog 的 cancelled 不能排队写给新 client。
+        self.pending_extension_responses.clear();
+        self.extension_ui.reset();
+        self.extension_dialog_needs_close |= self.extension_dialog_open.take().is_some();
+    }
+
+    fn reset_extension_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cancelled = self.extension_ui.drain_cancelled_dialogs();
+        for response in cancelled {
+            self.send_extension_response(response, cx);
+        }
+        if self.extension_dialog_open.take().is_some() {
+            self.request_extension_dialog_close(window, cx);
+        } else {
+            self.clear_extension_dialog_focus();
+        }
+        self.extension_ui.reset();
+        self.extension_response_sender = None;
+        self.window_title = "GPUI-Pi".to_owned();
+        window.set_window_title("GPUI-Pi");
     }
 
     fn apply_runtime_events(&mut self, events: Vec<SessionRuntimeEvent>) {
@@ -1884,6 +2481,20 @@ impl Render for ChatPanel {
             .as_ref()
             .map(|controls| controls.thinking_level);
         let selected_tool_preset = self.tool_preset;
+
+        let above_widgets = self
+            .extension_ui
+            .widgets(pi_rpc::WidgetPlacement::AboveEditor)
+            .cloned()
+            .collect::<Vec<_>>();
+        let below_widgets = self
+            .extension_ui
+            .widgets(pi_rpc::WidgetPlacement::BelowEditor)
+            .cloned()
+            .collect::<Vec<_>>();
+        let custom_ui_capability = self.extension_ui.custom_ui_capability();
+        let show_custom_ui_capability = self.extension_ui.has_seen_extension_ui();
+        let statuses = self.extension_ui.statuses().cloned().collect::<Vec<_>>();
         let auto_compaction = self
             .controls
             .as_ref()
@@ -2126,6 +2737,14 @@ impl Render for ChatPanel {
                                 .child(error),
                         )
                     })
+                    .when(!above_widgets.is_empty(), |view| {
+                        view.child(render_extension_widgets(
+                            "extension-widgets-above",
+                            &above_widgets,
+                            &self.extension_widgets_above_scroll,
+                            cx,
+                        ))
+                    })
                     .child(
                         v_flex()
                             .debug_selector(|| "live-composer".into())
@@ -2142,6 +2761,7 @@ impl Render for ChatPanel {
                                 composer.child(attachments)
                             })
                             .child(
+
                                 h_flex()
                                     .debug_selector(|| "r13-session-controls".into())
                                     .gap_2()
@@ -2231,9 +2851,25 @@ impl Render for ChatPanel {
                                             .on_click(cx.listener(Self::export_html)),
                                     ),
                             )
-                            .child(Textarea::new(&self.composer).h(px(76.)))
+                            .child(
+                                div()
+                                    .debug_selector(|| "composer-textarea-viewport".into())
+                                    .h(px(COMPOSER_TEXTAREA_VIEWPORT_HEIGHT))
+                                    .min_h_0()
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .debug_selector(|| "composer-textarea-control".into())
+                                            .size_full()
+                                            .min_h_0()
+                                            .overflow_hidden()
+                                            .child(Textarea::new(&self.composer).size_full()),
+                                    ),
+                            )
                             .child(
                                 h_flex()
+                                    .debug_selector(|| "composer-actions".into())
+                                    .flex_none()
                                     .gap_2()
                                     // 左：附件与上下文控件，一律 ghost + small（规范 5.6）。
                                     .child(
@@ -2467,7 +3103,73 @@ impl Render for ChatPanel {
                                             })),
                                     ),
                             ),
-                    ),
+                    )
+                    .when(!below_widgets.is_empty(), |view| {
+                        view.child(render_extension_widgets(
+                            "extension-widgets-below",
+                            &below_widgets,
+                            &self.extension_widgets_below_scroll,
+                            cx,
+                        ))
+                    })
+                    .when(!statuses.is_empty() || show_custom_ui_capability, |view| {
+                        view.child(
+                            div()
+                                .debug_selector(|| "extension-status-bar".into())
+                                .child(
+                                    StatusBar::new()
+                                        .when(!statuses.is_empty(), |bar| {
+                                            bar.left(h_flex().min_w_0().gap_2().children(
+                                                statuses.into_iter().enumerate().map(
+                                                    |(index, status)| {
+                                                        let full = format!(
+                                                            "{}: {}",
+                                                            status.display_key, status.text
+                                                        );
+                                                        div()
+                                                            .id(format!(
+                                                                "extension-status-item-{index}"
+                                                            ))
+                                                            .debug_selector(move || {
+                                                                format!(
+                                                                    "extension-status-item-{index}"
+                                                                )
+                                                            })
+                                                            .text_xs()
+                                                            .text_color(
+                                                                cx.theme().muted_foreground,
+                                                            )
+                                                            .child(elide_extension_text(&full, 40))
+                                                            .tooltip(move |window, cx| {
+                                                                Tooltip::new(full.clone())
+                                                                    .build(window, cx)
+                                                            })
+                                                    },
+                                                ),
+                                            ))
+                                        })
+                                        .when(show_custom_ui_capability, |bar| {
+                                            bar.right(
+                                                div()
+                                                    .id("extension-custom-ui-capability")
+                                                    .debug_selector(|| {
+                                                        "extension-custom-ui-capability".into()
+                                                    })
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(custom_ui_capability)
+                                                    .tooltip(move |window, cx| {
+                                                        Tooltip::new(format!(
+                                                            "钉死 RPC 不支持 extension custom UI（{}）",
+                                                            crate::live_session::UNSUPPORTED_BY_PINNED_RPC
+                                                        ))
+                                                        .build(window, cx)
+                                                    }),
+                                            )
+                                        }),
+                                ),
+                        )
+                    }),
             )
     }
 }
@@ -2578,6 +3280,91 @@ const fn thinking_label(level: pi_rpc::ThinkingLevel) -> &'static str {
         pi_rpc::ThinkingLevel::Xhigh => "XHigh",
         pi_rpc::ThinkingLevel::Max => "Max",
     }
+}
+
+fn elide_extension_text(text: &str, limit: usize) -> String {
+    let mut chars = text.chars();
+    let prefix = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+fn render_extension_widgets(
+    selector: &'static str,
+    widgets: &[crate::live_session::ExtensionWidget],
+    scroll_handle: &ScrollHandle,
+    cx: &App,
+) -> gpui::AnyElement {
+    let placement = selector;
+    let viewport_selector = format!("{selector}-viewport");
+    let content = v_flex()
+        .w_full()
+        .min_h_full()
+        .flex_none()
+        .gap_2()
+        .px_2()
+        .children(widgets.iter().enumerate().map(|(widget_index, widget)| {
+            v_flex()
+                .id(format!("extension-widget-{placement}-{widget_index}"))
+                .debug_selector(move || format!("{placement}-widget-{widget_index}"))
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().border.opacity(0.8))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(widget.display_key.clone()),
+                )
+                .children(
+                    widget
+                        .lines
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(index, line)| {
+                            div()
+                                .id(format!(
+                                    "extension-widget-line-{placement}-{widget_index}-{index}"
+                                ))
+                                .debug_selector(move || {
+                                    format!("{placement}-widget-{widget_index}-line-{index}")
+                                })
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(elide_extension_text(&line, 80))
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(line.clone()).build(window, cx)
+                                })
+                        }),
+                )
+        }));
+    let scroll_area = v_flex()
+        .id(format!("{selector}-area"))
+        .debug_selector(move || viewport_selector.clone())
+        .size_full()
+        .max_h(px(144.))
+        .overflow_y_scroll()
+        .track_scroll(scroll_handle)
+        .lock_scroll_axis()
+        .child(content);
+
+    div()
+        .id(selector)
+        .debug_selector(move || selector.into())
+        .relative()
+        .w_full()
+        .max_h(px(144.))
+        .child(scroll_area)
+        // scrollbar 必须与滚动 area 同级，否则 gpui 会把内容 offset 也施加到 overlay。
+        .vertical_scrollbar(scroll_handle)
+        .into_any_element()
 }
 
 fn centered_state(
@@ -2932,6 +3719,31 @@ mod tests {
         });
     }
 
+    struct ChatDialogHarness {
+        panel: gpui::Entity<ChatPanel>,
+    }
+
+    struct FocusDialogFixture {
+        focus: FocusHandle,
+    }
+
+    impl Render for FocusDialogFixture {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.focus).child("other dialog")
+        }
+    }
+
+    impl Render for ChatDialogHarness {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.panel
+                .update(cx, |panel, cx| panel.process_extension_ui(window, cx));
+            div()
+                .size_full()
+                .child(self.panel.clone())
+                .children(Root::render_dialog_layer(window, cx))
+        }
+    }
+
     fn render_status_with_panel(
         cx: &mut TestAppContext,
         status: ChatStatus,
@@ -2952,7 +3764,8 @@ mod tests {
                 panel
             });
             *result.borrow_mut() = Some(panel.clone());
-            Root::new(panel, window, cx)
+            let harness = cx.new(|_| ChatDialogHarness { panel });
+            Root::new(harness, window, cx)
         });
         let mut visual = VisualTestContext::from_window(handle.into(), cx);
         for _ in 0..8 {
@@ -2987,6 +3800,606 @@ mod tests {
             max_tokens: 4_096,
             extra: Default::default(),
         }
+    }
+
+    #[gpui::test]
+    fn extension_status_bar_is_absent_until_status_or_capability_is_seen(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        assert!(visual.debug_bounds("extension-status-bar").is_none());
+        assert!(visual.debug_bounds("extension-status-item-0").is_none());
+        assert!(
+            visual
+                .debug_bounds("extension-custom-ui-capability")
+                .is_none()
+        );
+
+        panel.update(cx, |panel, cx| {
+            panel.extension_ui.apply(
+                "status".into(),
+                pi_rpc::ExtensionUiRequest::SetStatus {
+                    status_key: "fixture".into(),
+                    status_text: Some("ready".into()),
+                },
+            );
+            cx.notify();
+        });
+        draw_frames(&mut visual, 3);
+        assert!(visual.debug_bounds("extension-status-bar").is_some());
+        assert!(visual.debug_bounds("extension-status-item-0").is_some());
+
+        panel.update(cx, |panel, cx| {
+            panel.extension_ui.reset();
+            panel.extension_ui.apply(
+                "capability".into(),
+                pi_rpc::ExtensionUiRequest::SetTitle {
+                    title: "Seen extension".into(),
+                },
+            );
+            cx.notify();
+        });
+        draw_frames(&mut visual, 3);
+        assert!(visual.debug_bounds("extension-status-bar").is_some());
+        assert!(visual.debug_bounds("extension-status-item-0").is_none());
+        assert!(
+            visual
+                .debug_bounds("extension-custom-ui-capability")
+                .is_some()
+        );
+    }
+
+    #[gpui::test]
+    fn extension_widgets_status_and_editor_text_render_in_native_layers(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        assert!(
+            visual
+                .debug_bounds("extension-custom-ui-capability")
+                .is_none()
+        );
+        let long_editor = format!("line\nwith\ttab\u{0}\u{202e}{}", "x".repeat(5000));
+        let expected_editor =
+            crate::live_session::sanitize_extension_text(&long_editor, usize::MAX);
+        panel.update(cx, |panel, cx| {
+            panel.extension_ui.apply(
+                "above".into(),
+                pi_rpc::ExtensionUiRequest::SetWidget {
+                    widget_key: "above".into(),
+                    widget_lines: Some(vec!["above line".into()]),
+                    widget_placement: None,
+                },
+            );
+            panel.extension_ui.apply(
+                "below".into(),
+                pi_rpc::ExtensionUiRequest::SetWidget {
+                    widget_key: "below".into(),
+                    widget_lines: Some(vec!["below line".into()]),
+                    widget_placement: Some(pi_rpc::WidgetPlacement::BelowEditor),
+                },
+            );
+            panel.extension_ui.apply(
+                "status".into(),
+                pi_rpc::ExtensionUiRequest::SetStatus {
+                    status_key: "fixture".into(),
+                    status_text: Some("ready".into()),
+                },
+            );
+            panel.extension_ui.apply(
+                "text".into(),
+                pi_rpc::ExtensionUiRequest::SetEditorText {
+                    text: long_editor.clone(),
+                },
+            );
+            cx.notify();
+        });
+        draw_frames(&mut visual, 4);
+        assert!(visual.debug_bounds("extension-widgets-above").is_some());
+        assert!(visual.debug_bounds("extension-widgets-below").is_some());
+        assert!(visual.debug_bounds("extension-status-item-0").is_some());
+        assert!(
+            visual
+                .debug_bounds("extension-custom-ui-capability")
+                .is_some()
+        );
+        assert_eq!(
+            panel.read_with(cx, |panel, cx| panel.composer.read(cx).value().to_string()),
+            expected_editor
+        );
+    }
+
+    #[gpui::test]
+    fn extension_widget_scroll_handles_are_independent(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, cx| {
+            let lines = (0..8)
+                .map(|index| format!("widget line {index}"))
+                .collect::<Vec<_>>();
+            for widget_index in 0..3 {
+                for (placement, wire_placement) in [
+                    ("above", None),
+                    ("below", Some(pi_rpc::WidgetPlacement::BelowEditor)),
+                ] {
+                    let id = format!("{placement}-{widget_index}");
+                    panel.extension_ui.apply(
+                        id.clone(),
+                        pi_rpc::ExtensionUiRequest::SetWidget {
+                            widget_key: id,
+                            widget_lines: Some(lines.clone()),
+                            widget_placement: wire_placement,
+                        },
+                    );
+                }
+            }
+            cx.notify();
+        });
+        draw_frames(&mut visual, 4);
+        let above_viewport_before = visual
+            .debug_bounds("extension-widgets-above-viewport")
+            .expect("above widget viewport missing");
+        let below_viewport_before = visual
+            .debug_bounds("extension-widgets-below-viewport")
+            .expect("below widget viewport missing");
+        let above_first_before = visual
+            .debug_bounds("extension-widgets-above-widget-0-line-0")
+            .expect("above first line missing")
+            .origin
+            .y;
+        let below_first_before = visual
+            .debug_bounds("extension-widgets-below-widget-0-line-0")
+            .expect("below first line missing")
+            .origin
+            .y;
+        assert_eq!(above_viewport_before.size.height, px(144.));
+        assert_eq!(below_viewport_before.size.height, px(144.));
+        panel.update(cx, |panel, _| {
+            assert!(panel.extension_widgets_above_scroll.max_offset().y > px(0.));
+            assert!(panel.extension_widgets_below_scroll.max_offset().y > px(0.));
+            panel
+                .extension_widgets_above_scroll
+                .set_offset(point(px(0.), px(-80.)));
+        });
+        draw_frames(&mut visual, 3);
+        let above_viewport_after = visual
+            .debug_bounds("extension-widgets-above-viewport")
+            .expect("above widget viewport disappeared");
+        let below_viewport_after = visual
+            .debug_bounds("extension-widgets-below-viewport")
+            .expect("below widget viewport disappeared");
+        let above_first_after = visual
+            .debug_bounds("extension-widgets-above-widget-0-line-0")
+            .expect("above first line disappeared")
+            .origin
+            .y;
+        let below_first_after = visual
+            .debug_bounds("extension-widgets-below-widget-0-line-0")
+            .expect("below first line disappeared")
+            .origin
+            .y;
+        assert_eq!(above_viewport_after, above_viewport_before);
+        assert_eq!(below_viewport_after, below_viewport_before);
+        assert!(above_first_after < above_first_before);
+        assert_eq!(below_first_after, below_first_before);
+        panel.update(cx, |panel, _| {
+            assert!(panel.extension_widgets_above_scroll.offset().y < px(0.));
+            assert_eq!(panel.extension_widgets_below_scroll.offset().y, px(0.));
+        });
+    }
+
+    #[derive(Default)]
+    struct RecordingResponseSender {
+        responses: std::sync::Mutex<Vec<pi_rpc::ExtensionUiResponse>>,
+        error: Option<String>,
+    }
+
+    impl crate::live_session::ExtensionResponseSender for RecordingResponseSender {
+        fn send(&self, response: pi_rpc::ExtensionUiResponse) -> Result<(), String> {
+            if let Some(error) = &self.error {
+                return Err(error.clone());
+            }
+            self.responses.lock().unwrap().push(response);
+            Ok(())
+        }
+    }
+
+    #[gpui::test]
+    fn extension_dialog_queue_uses_real_callbacks_and_response_sink(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        let sender = std::sync::Arc::new(RecordingResponseSender::default());
+        let raw_select = format!("family 👨‍👩‍👧‍👦\tvalue\u{202e}{}", "x".repeat(300));
+        panel.update(cx, |panel, cx| {
+            panel.extension_response_sender = Some(sender.clone());
+            for (id, request) in [
+                (
+                    "select",
+                    pi_rpc::ExtensionUiRequest::Select {
+                        title: "Select".into(),
+                        options: vec![raw_select.clone(), "Beta".into()],
+                        timeout: None,
+                    },
+                ),
+                (
+                    "confirm",
+                    pi_rpc::ExtensionUiRequest::Confirm {
+                        title: "Confirm".into(),
+                        message: "Continue?".into(),
+                        timeout: None,
+                    },
+                ),
+                (
+                    "input",
+                    pi_rpc::ExtensionUiRequest::Input {
+                        title: "Input".into(),
+                        placeholder: Some("placeholder-only".into()),
+                        timeout: None,
+                    },
+                ),
+                (
+                    "editor",
+                    pi_rpc::ExtensionUiRequest::Editor {
+                        title: "Editor".into(),
+                        prefill: Some("prefill".into()),
+                    },
+                ),
+            ] {
+                panel.extension_ui.apply(id.into(), request);
+            }
+            cx.notify();
+        });
+        draw_frames(&mut visual, 3);
+        let option = visual
+            .debug_bounds("extension-select-option-0")
+            .expect("select option footer missing");
+        visual.simulate_click(option.center(), Default::default());
+        draw_frames(&mut visual, 3);
+        visual.dispatch_action(gpui_component::dialog::Confirm { secondary: false });
+        draw_frames(&mut visual, 3);
+        panel.update(cx, |panel, cx| {
+            assert_eq!(
+                panel
+                    .extension_ui
+                    .active_dialog()
+                    .map(|dialog| dialog.id.as_str()),
+                Some("input")
+            );
+            cx.notify();
+        });
+        visual.dispatch_action(gpui_component::dialog::Confirm { secondary: false });
+        draw_frames(&mut visual, 3);
+        visual.dispatch_action(gpui_component::dialog::Cancel);
+        draw_frames(&mut visual, 3);
+        visual.run_until_parked();
+        let responses = sender.responses.lock().unwrap();
+        assert_eq!(responses.len(), 4);
+        assert_eq!(
+            responses[0],
+            pi_rpc::ExtensionUiResponse::value("select", raw_select)
+        );
+        assert_eq!(
+            responses[1],
+            pi_rpc::ExtensionUiResponse::confirmed("confirm", true)
+        );
+        assert_eq!(
+            responses[2],
+            pi_rpc::ExtensionUiResponse::value("input", "")
+        );
+        assert_eq!(
+            responses[3],
+            pi_rpc::ExtensionUiResponse::cancelled("editor")
+        );
+        panel.update(cx, |panel, _| {
+            assert!(panel.extension_ui.active_dialog().is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn extension_dialog_send_failure_discards_and_advances(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        let sender = std::sync::Arc::new(RecordingResponseSender {
+            responses: std::sync::Mutex::new(Vec::new()),
+            error: Some("sink failed".to_owned()),
+        });
+        panel.update(cx, |panel, cx| {
+            panel.extension_response_sender = Some(sender);
+            for id in ["first", "second"] {
+                panel.extension_ui.apply(
+                    id.into(),
+                    pi_rpc::ExtensionUiRequest::Confirm {
+                        title: id.into(),
+                        message: "Continue?".into(),
+                        timeout: None,
+                    },
+                );
+            }
+            cx.notify();
+        });
+        draw_frames(&mut visual, 3);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.finish_extension_dialog(
+                    "first",
+                    pi_rpc::ExtensionUiResponse::confirmed("first", true),
+                    cx,
+                );
+            });
+            window.close_dialog(cx);
+        });
+        draw_frames(&mut visual, 3);
+        visual.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert_eq!(panel.extension_dialog_open.as_deref(), Some("second"));
+            assert!(
+                panel
+                    .rpc_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("sink failed"))
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn extension_dialog_pending_close_never_pops_other_dialog_and_converges_once(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        let sender = std::sync::Arc::new(RecordingResponseSender::default());
+        panel.update(cx, |panel, cx| {
+            panel.extension_response_sender = Some(sender.clone());
+            panel.extension_ui.apply(
+                "extension".into(),
+                pi_rpc::ExtensionUiRequest::Confirm {
+                    title: "Extension".into(),
+                    message: "Continue?".into(),
+                    timeout: None,
+                },
+            );
+            cx.notify();
+        });
+        draw_frames(&mut visual, 3);
+        let other_focus = visual.update(|window, cx| {
+            let focus = cx.focus_handle();
+            let fixture = cx.new(|_| FocusDialogFixture {
+                focus: focus.clone(),
+            });
+            window.open_dialog(cx, move |dialog, _, _| dialog.child(fixture.clone()));
+            focus.focus(window, cx);
+            focus
+        });
+        draw_frames(&mut visual, 3);
+        assert!(visual.update(|window, cx| other_focus.contains_focused(window, cx)));
+        panel.update(cx, |panel, cx| {
+            panel.finish_extension_dialog(
+                "extension",
+                pi_rpc::ExtensionUiResponse::cancelled("extension"),
+                cx,
+            );
+            panel.extension_dialog_needs_close = true;
+            cx.notify();
+        });
+        draw_frames(&mut visual, 3);
+        assert!(visual.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(visual.update(|window, cx| other_focus.contains_focused(window, cx)));
+        visual.update(|window, _| window.blur());
+        panel.update(cx, |panel, cx| {
+            panel.extension_dialog_needs_close = true;
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        assert!(visual.update(|window, cx| window.has_active_dialog(cx)));
+        visual.update(|window, cx| other_focus.focus(window, cx));
+        panel.update(cx, |panel, cx| {
+            panel.extension_dialog_needs_close = true;
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        assert!(visual.update(|window, cx| other_focus.contains_focused(window, cx)));
+        visual.update(|window, cx| window.close_dialog(cx));
+        draw_frames(&mut visual, 3);
+        draw_frames(&mut visual, 3);
+        assert!(panel.read_with(cx, |panel, _| !panel.extension_dialog_needs_close));
+        assert!(!visual.update(|window, cx| window.has_active_dialog(cx)));
+        visual.run_until_parked();
+        assert_eq!(sender.responses.lock().unwrap().len(), 1);
+    }
+
+    #[gpui::test]
+    fn extension_dialog_body_and_footer_focus_timeout_reset_and_advance(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+
+        panel.update(cx, |panel, cx| {
+            panel.extension_ui.apply(
+                "input-timeout".into(),
+                pi_rpc::ExtensionUiRequest::Input {
+                    title: "Input".into(),
+                    placeholder: None,
+                    timeout: Some(200),
+                },
+            );
+            cx.notify();
+        });
+        draw_frames(&mut visual, 3);
+        let body_focus = panel.read_with(cx, |panel, _| {
+            panel.extension_dialog_body_focus.clone().unwrap()
+        });
+        visual.update(|window, cx| body_focus.focus(window, cx));
+        visual
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(220));
+        visual.run_until_parked();
+        draw_frames(&mut visual, 4);
+        assert!(!visual.update(|window, cx| window.has_active_dialog(cx)));
+
+        panel.update(cx, |panel, cx| {
+            panel.extension_ui.apply(
+                "editor-reset".into(),
+                pi_rpc::ExtensionUiRequest::Editor {
+                    title: "Editor".into(),
+                    prefill: Some("fixture".into()),
+                },
+            );
+            cx.notify();
+        });
+        draw_frames(&mut visual, 3);
+        let editor_bounds = visual
+            .debug_bounds("extension-dialog-textarea")
+            .expect("editor Textarea wrapper missing");
+        visual.simulate_click(editor_bounds.center(), Default::default());
+        let body_focus = panel.read_with(cx, |panel, _| {
+            panel.extension_dialog_body_focus.clone().unwrap()
+        });
+        assert!(visual.update(|window, cx| {
+            body_focus.contains_focused(window, cx) || body_focus.within_focused(window, cx)
+        }));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.reset_extension_ui(window, cx));
+        });
+        draw_frames(&mut visual, 3);
+        assert!(!visual.update(|window, cx| window.has_active_dialog(cx)));
+
+        for request in [
+            pi_rpc::ExtensionUiRequest::Confirm {
+                title: "Confirm footer".into(),
+                message: "Continue?".into(),
+                timeout: None,
+            },
+            pi_rpc::ExtensionUiRequest::Select {
+                title: "Select footer".into(),
+                options: vec!["Alpha".into()],
+                timeout: None,
+            },
+        ] {
+            panel.update(cx, |panel, cx| {
+                panel.extension_ui.apply("footer-reset".into(), request);
+                cx.notify();
+            });
+            draw_frames(&mut visual, 3);
+            let footer_focus = panel.read_with(cx, |panel, _| {
+                panel.extension_dialog_footer_focus.clone().unwrap()
+            });
+            visual.update(|window, cx| footer_focus.focus(window, cx));
+            assert!(visual.update(|window, cx| {
+                footer_focus.contains_focused(window, cx) || footer_focus.within_focused(window, cx)
+            }));
+            visual.update(|window, cx| {
+                panel.update(cx, |panel, cx| panel.reset_extension_ui(window, cx));
+            });
+            draw_frames(&mut visual, 3);
+            assert!(!visual.update(|window, cx| window.has_active_dialog(cx)));
+        }
+
+        panel.update(cx, |panel, cx| {
+            panel.extension_ui.apply(
+                "confirm-advance".into(),
+                pi_rpc::ExtensionUiRequest::Confirm {
+                    title: "Confirm".into(),
+                    message: "Continue?".into(),
+                    timeout: None,
+                },
+            );
+            panel.extension_ui.apply(
+                "select-next".into(),
+                pi_rpc::ExtensionUiRequest::Select {
+                    title: "Next".into(),
+                    options: vec!["Beta".into()],
+                    timeout: None,
+                },
+            );
+            cx.notify();
+        });
+        draw_frames(&mut visual, 3);
+        let submit = visual
+            .debug_bounds("extension-confirm-submit")
+            .expect("confirm footer submit missing");
+        visual.simulate_click(submit.center(), Default::default());
+        draw_frames(&mut visual, 3);
+        assert!(visual.debug_bounds("extension-select-option-0").is_some());
+    }
+
+    #[gpui::test]
+    fn queued_expired_extension_dialog_is_cancelled_without_opening(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        let sender = std::sync::Arc::new(RecordingResponseSender::default());
+        panel.update(cx, |panel, cx| {
+            panel.extension_response_sender = Some(sender.clone());
+            panel.extension_ui.apply(
+                "expired".into(),
+                pi_rpc::ExtensionUiRequest::Confirm {
+                    title: "Expired".into(),
+                    message: "Must not flash".into(),
+                    timeout: Some(50),
+                },
+            );
+            panel.extension_ui.apply(
+                "next".into(),
+                pi_rpc::ExtensionUiRequest::Confirm {
+                    title: "Next".into(),
+                    message: "Visible".into(),
+                    timeout: None,
+                },
+            );
+            cx.notify();
+        });
+        visual
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(60));
+        visual.run_until_parked();
+        draw_frames(&mut visual, 3);
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.extension_dialog_open.clone()),
+            Some("next".to_owned())
+        );
+        visual.run_until_parked();
+        assert_eq!(
+            sender.responses.lock().unwrap().as_slice(),
+            &[pi_rpc::ExtensionUiResponse::cancelled("expired")]
+        );
+    }
+
+    #[gpui::test]
+    fn extension_dialog_timeout_closes_and_advances_fifo(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, cx| {
+            panel.extension_ui.apply(
+                "timed".into(),
+                pi_rpc::ExtensionUiRequest::Confirm {
+                    title: "Timed".into(),
+                    message: "Continue?".into(),
+                    timeout: Some(1),
+                },
+            );
+            panel.extension_ui.apply(
+                "next".into(),
+                pi_rpc::ExtensionUiRequest::Input {
+                    title: "Next".into(),
+                    placeholder: None,
+                    timeout: None,
+                },
+            );
+            cx.notify();
+        });
+        draw_frames(&mut visual, 6);
+        panel.update(cx, |panel, _| {
+            assert_eq!(panel.extension_dialog_open.as_deref(), Some("next"));
+            assert_eq!(
+                panel
+                    .extension_ui
+                    .active_dialog()
+                    .map(|dialog| dialog.id.as_str()),
+                Some("next")
+            );
+            assert!(
+                panel
+                    .rpc_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("超时"))
+            );
+        });
     }
 
     #[gpui::test]
@@ -3565,38 +4978,28 @@ mod tests {
     }
 
     #[gpui::test]
-    fn r13_runtime_statuses_render_as_points_and_retry_can_clear(cx: &mut TestAppContext) {
-        let (mut visual, panel) =
-            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
-        panel.update(cx, |panel, cx| {
-            panel.apply_runtime_events(vec![
-                SessionRuntimeEvent::CompactionStarted,
-                SessionRuntimeEvent::RetryStarted {
-                    attempt: 2,
-                    max_attempts: 3,
-                    delay_ms: 2_000,
-                    error: "rate limited".to_owned(),
+
+    fn lifecycle_extension_reset_discards_pending_cancelled_responses(cx: &mut TestAppContext) {
+        let (_visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, _| {
+            panel.extension_ui.apply(
+                "old-dialog".into(),
+                pi_rpc::ExtensionUiRequest::Confirm {
+                    title: "Old".into(),
+                    message: "Old process".into(),
+                    timeout: None,
                 },
-            ]);
-            cx.notify();
+            );
+            panel
+                .pending_extension_responses
+                .push(pi_rpc::ExtensionUiResponse::cancelled("already-pending"));
+            panel.extension_dialog_open = Some("old-dialog".into());
+            panel.clear_extension_ui_for_lifecycle();
+            assert!(panel.pending_extension_responses.is_empty());
+            assert!(panel.extension_ui.active_dialog().is_none());
+            assert!(panel.extension_dialog_open.is_none());
+            assert!(panel.extension_dialog_needs_close);
         });
-        draw_frames(&mut visual, 2);
-        assert!(visual.debug_bounds("compaction-status").is_some());
-        assert!(visual.debug_bounds("auto-retry-status").is_some());
-        panel.update(cx, |panel, cx| {
-            panel.apply_runtime_events(vec![
-                SessionRuntimeEvent::CompactionEnded { error: None },
-                SessionRuntimeEvent::RetryEnded {
-                    success: true,
-                    attempt: 2,
-                    error: None,
-                },
-            ]);
-            cx.notify();
-        });
-        draw_frames(&mut visual, 2);
-        assert!(visual.debug_bounds("compaction-status").is_none());
-        assert!(visual.debug_bounds("auto-retry-status").is_none());
     }
 
     #[gpui::test]
@@ -3625,6 +5028,76 @@ mod tests {
         let composer = ready.debug_bounds("live-composer").unwrap();
         assert!(chat.size.width > px(0.) && composer.size.height > px(0.));
         assert!(composer.bottom() <= chat.bottom());
+    }
+
+    #[gpui::test]
+    fn multiline_extension_text_keeps_full_state_and_fixed_composer_region(
+        cx: &mut TestAppContext,
+    ) {
+        assert_eq!(COMPOSER_MAX_ROWS, 3);
+        assert_eq!(COMPOSER_TEXTAREA_VIEWPORT_HEIGHT, 76.);
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, cx| {
+            panel.extension_ui.apply(
+                "below".into(),
+                pi_rpc::ExtensionUiRequest::SetWidget {
+                    widget_key: "below".into(),
+                    widget_lines: Some(vec!["below widget".into()]),
+                    widget_placement: Some(pi_rpc::WidgetPlacement::BelowEditor),
+                },
+            );
+            cx.notify();
+        });
+        draw_frames(&mut visual, 3);
+        let composer_before = visual
+            .debug_bounds("live-composer")
+            .expect("composer missing before long text");
+        let actions_before = visual
+            .debug_bounds("composer-actions")
+            .expect("composer actions missing before long text");
+        let below_before = visual
+            .debug_bounds("extension-widgets-below")
+            .expect("below widget missing before long text");
+        let expected = (0..40)
+            .map(|index| format!("extension line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.composer.update(cx, |input, cx| {
+                    input.set_value(expected.clone(), window, cx);
+                });
+                cx.notify();
+            });
+        });
+        draw_frames(&mut visual, 4);
+        let viewport = visual
+            .debug_bounds("composer-textarea-viewport")
+            .expect("composer textarea viewport missing");
+        let control = visual
+            .debug_bounds("composer-textarea-control")
+            .expect("composer textarea control wrapper missing");
+        let composer_after = visual
+            .debug_bounds("live-composer")
+            .expect("composer missing after long text");
+        let actions_after = visual
+            .debug_bounds("composer-actions")
+            .expect("composer actions missing after long text");
+        let below_after = visual
+            .debug_bounds("extension-widgets-below")
+            .expect("below widget missing after long text");
+        assert_eq!(
+            panel.read_with(cx, |panel, cx| panel.composer.read(cx).value().to_string()),
+            expected
+        );
+        assert_eq!(viewport.size.height, px(COMPOSER_TEXTAREA_VIEWPORT_HEIGHT));
+        assert!(control.top() >= viewport.top() && control.bottom() <= viewport.bottom());
+        assert_eq!(composer_after.size.height, composer_before.size.height);
+        assert_eq!(actions_after.origin.y, actions_before.origin.y);
+        assert_eq!(below_after.origin.y, below_before.origin.y);
+        assert!(viewport.bottom() <= actions_after.top());
+        assert!(actions_after.bottom() <= below_after.top());
     }
 
     #[gpui::test]

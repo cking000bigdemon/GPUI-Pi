@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use gpui::{App, Window};
 use gpui_component::{WindowExt as _, notification::Notification};
-use pi_data::{ProjectTrustStatus, TrustError, project_trust_status, trust_project};
+use pi_data::{ProjectTrustStatus, TrustError, read_project_trust_status, trust_project};
 
 /// 会话选择与手动目录选择共用同一套项目 trust 门禁。
 pub(crate) fn prompt_project_trust(
@@ -24,7 +24,7 @@ pub(crate) fn prompt_project_trust(
             .spawn({
                 let agent_dir = agent_dir.clone();
                 let cwd = cwd.clone();
-                async move { project_trust_status(agent_dir, cwd, None) }
+                async move { read_project_trust_status(agent_dir, cwd, None) }
             })
             .await;
         let _ = window_handle.update(cx, |_, window, cx| {
