@@ -1507,25 +1507,52 @@ Start-Sleep -Seconds 10
     #[test]
     fn cli_stdout_is_drained_while_child_runs_and_is_bounded() {
         let dir = tempdir().unwrap();
-        let script = dir.path().join("large-output.cmd");
-        fs::write(
-            &script,
-            "@echo off\r\nfor /L %%i in (1,1,5000) do <nul set /p =0123456789abcdef\r\n",
-        )
-        .unwrap();
-        let output = run_cli_capture_status(&script, &[], dir.path(), Duration::from_secs(5));
-        assert!(matches!(output, Ok((_, bytes)) if bytes.len() > 64 * 1024));
+        let fixture_dir = dir.path().join("output fixtures with spaces");
+        fs::create_dir(&fixture_dir).unwrap();
 
-        let oversized = dir.path().join("oversized-output.cmd");
+        // 使用一次 type 批量输出固定字节，避免共享 CI runner 上逐字符 set /p 先撞到 timeout。
+        // `%~dp0` 由 cmd 从脚本自身路径解析，不拼接外部输入，且覆盖含空格路径。
+        let bounded_payload = fixture_dir.join("bounded payload.txt");
+        let bounded_script = fixture_dir.join("bounded output.cmd");
+        fs::write(&bounded_payload, vec![b'x'; MAX_CLI_OUTPUT_BYTES]).unwrap();
         fs::write(
-            &oversized,
-            "@echo off\r\nfor /L %%i in (1,1,20000) do <nul set /p =0123456789abcdef\r\n",
+            &bounded_script,
+            "@echo off\r\ntype \"%~dp0bounded payload.txt\"\r\n",
         )
         .unwrap();
-        assert!(matches!(
-            run_cli_capture_status(&oversized, &[], dir.path(), Duration::from_secs(5)),
-            Err(ModelServiceError::CliOutputTooLarge)
-        ));
+        let bounded =
+            run_cli_capture_status(&bounded_script, &[], &fixture_dir, Duration::from_secs(5));
+        let (status, bytes) = bounded
+            .unwrap_or_else(|error| panic!("恰好达到 CLI 输出上限应成功，实际错误：{error:?}"));
+        assert!(status.success(), "fixture 退出状态异常：{status:?}");
+        assert_eq!(
+            bytes.len(),
+            MAX_CLI_OUTPUT_BYTES,
+            "恰好达到上限的输出必须完整保留"
+        );
+        assert!(
+            bytes.iter().all(|byte| *byte == b'x'),
+            "fixture 输出内容不得被 cmd 文本处理改变"
+        );
+
+        let oversized_payload = fixture_dir.join("oversized payload.txt");
+        let oversized_script = fixture_dir.join("oversized output.cmd");
+        fs::write(&oversized_payload, vec![b'y'; MAX_CLI_OUTPUT_BYTES + 1]).unwrap();
+        fs::write(
+            &oversized_script,
+            "@echo off\r\ntype \"%~dp0oversized payload.txt\"\r\n",
+        )
+        .unwrap();
+        match run_cli_capture_status(&oversized_script, &[], &fixture_dir, Duration::from_secs(5)) {
+            Err(ModelServiceError::CliOutputTooLarge) => {}
+            Err(error) => {
+                panic!("超过 CLI 输出上限 1 字节应返回 CliOutputTooLarge，实际错误：{error:?}")
+            }
+            Ok((status, bytes)) => panic!(
+                "超过 CLI 输出上限 1 字节不应成功：status={status:?}, bytes={}",
+                bytes.len()
+            ),
+        }
     }
 
     #[test]
