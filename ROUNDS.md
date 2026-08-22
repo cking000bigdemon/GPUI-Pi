@@ -1,7 +1,7 @@
 # 轮次进度
 
 拆解与验收标准见 [`docs/立项文档.md`](docs/立项文档.md) § 七；目录规则见 [`rounds/README.md`](rounds/README.md)，每轮任务卡位于 `rounds/round-NN/round-NN.md`。
-每轮完成后由执行方更新本表 —— 状态、PR、完成日期三列都要填。R21–R27 为 Issue [#27](https://github.com/cking000bigdemon/GPUI-Pi/issues/27) 的 post-v1 架构扩展；当前仅提交方案评审，未开始代码实现。
+每轮完成后由执行方更新本表 —— 状态、PR、完成日期三列都要填。R21–R27 为 Issue [#27](https://github.com/cking000bigdemon/GPUI-Pi/issues/27) 的 post-v1 架构扩展；当前仅提交方案评审，未开始代码实现，各轮任务卡由执行方在开工时按 [`rounds/README.md`](rounds/README.md) 建立。
 
 | 轮 | 内容 | 执行方 | 状态 | PR | 完成 |
 |---|---|---|---|---|---|
@@ -19,14 +19,14 @@
 | **R11** | 文件浏览器 + 查看器 | Windows | ✅ 已完成 | [#18](https://github.com/cking000bigdemon/GPUI-Pi/pull/18) | 2026-08-19 |
 | **R12** | git diff / worktree / 本轮改动文件 | Windows | ✅ 已完成 | [#22](https://github.com/cking000bigdemon/GPUI-Pi/pull/22) | 2026-08-20 |
 | **R13** | 分支树 · compaction · retry · 导出 | Windows | ✅ 已完成 | [#23](https://github.com/cking000bigdemon/GPUI-Pi/pull/23) | 2026-08-20 |
-| **R14** | Extension UI Protocol | Windows | ✅ CI 全绿，PR 待合并 | [#26](https://github.com/cking000bigdemon/GPUI-Pi/pull/26) | — |
+| **R14** | Extension UI Protocol | Windows | ✅ 已完成 | [#26](https://github.com/cking000bigdemon/GPUI-Pi/pull/26) | 2026-08-21 |
 | **R15** | 项目命令环境 bash 扩展（`.ts`） | Windows | ✅ 已完成 | [#24](https://github.com/cking000bigdemon/GPUI-Pi/pull/24) | 2026-08-20 |
 | **R16** | 模型配置面板 + 登录 | Windows | ✅ 已完成 | [#25](https://github.com/cking000bigdemon/GPUI-Pi/pull/25) | 2026-08-20 |
 | **R17** | 打包分发 | Windows | ⬜ | — | — |
 | **R18** | 1:1 验收 + 文档定稿 | Windows | ⬜ | — | — |
 | **R19** | Windows 应用图标（独立维护） | Windows | ✅ 已完成 | [#21](https://github.com/cking000bigdemon/GPUI-Pi/pull/21) | 2026-08-19 |
-| **R20** | Release 试用第一批问题修复（UI-001–UI-008） | Windows | ✅ validation / 视觉全绿，PR 待合并 | [#28](https://github.com/cking000bigdemon/GPUI-Pi/pull/28) | — |
-| **R21** | 权威设计同步 + 单会话 Runtime 集中化 | Windows | 📐 方案评审中，未实现 | — | — |
+| **R20** | Release 试用第一批问题修复（UI-001–UI-008） | Windows | ✅ 已完成 | [#28](https://github.com/cking000bigdemon/GPUI-Pi/pull/28) | 2026-08-22 |
+| **R21** | 权威设计同步 + 单会话 Runtime 集中化 + 会话态收敛 | Windows | 📐 方案评审中，未实现 | — | — |
 | **R22** | 单 Runtime 有界 Actor 与事件背压 | Windows | ⬜ | — | — |
 | **R23** | Scheduler / 状态机 / Park-Resume / Idle TTL | Windows | ⬜ | — | — |
 | **R24** | 有界多用户 Session UI 接线 | Windows | ⬜ | — | — |
@@ -44,3 +44,5 @@
 | **M3** | R10–R15 | 功能追平 | — |
 | **M4** | R16–R18 | 交付 | 附录 A 不全绿不发版 |
 | **M5** | R21–R27 | 有界多会话 + 内存治理 + 内建子代理 | R22 背压不过不得开放 R24；R25 整树清理不过不得启用 mutating 子代理 |
+
+> **M4 尚未收口（R17 / R18 仍为 ⬜），M4 与 M5 的先后是待决事项** —— 见 [`docs/立项文档.md`](docs/立项文档.md) § 七 阶段 E 的待决条款：口径 A 先封 v1 再开 M5（默认建议），口径 B 先做 M5 但附录 A 基线须在 R24 后重建。**未选定前不得开工 R21。**
