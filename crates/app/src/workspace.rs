@@ -19,7 +19,9 @@ use crate::model_config::ModelConfigPanel;
 #[cfg(test)]
 use crate::panels::LayoutProbe;
 use crate::panels::{ChatPanel, SessionsChanged};
-use crate::session_sidebar::{SessionSelected, SessionSidebar, WorktreeSelected};
+use crate::session_sidebar::{
+    NewSessionRequested, SessionSelected, SessionSidebar, WorktreeSelected,
+};
 use crate::trust_prompt::prompt_project_trust;
 
 const MAIN_DOCK_ID: &str = "gpui-pi-main-dock";
@@ -37,6 +39,7 @@ pub struct Workspace {
     selected_session: Option<SessionSelected>,
     _appearance_subscription: Subscription,
     _session_subscription: Subscription,
+    _new_session_subscription: Subscription,
     _worktree_subscription: Subscription,
     _sessions_changed_subscription: Subscription,
 }
@@ -150,6 +153,37 @@ impl Workspace {
             },
         );
 
+        let fresh_chat = chat.clone();
+        let fresh_files = file_explorer.clone();
+        let fresh_main = workspace.clone();
+        let new_session_subscription = cx.subscribe_in(
+            &sidebar,
+            window,
+            move |workspace, _, event: &NewSessionRequested, window, cx| {
+                match fresh_chat.update(cx, |panel, cx| {
+                    panel.start_new_session(event.cwd.clone(), window, cx)
+                }) {
+                    Ok(()) => {
+                        workspace.selected_directory = Some(event.cwd.clone());
+                        workspace.selected_session = None;
+                        fresh_files.update(cx, |panel, cx| {
+                            panel.set_root(Some(event.cwd.clone()), window, cx);
+                        });
+                        fresh_main.update(cx, |panel, cx| {
+                            panel.set_root(Some(event.cwd.clone()), cx);
+                        });
+                    }
+                    Err(error) => window.push_notification(
+                        gpui_component::notification::Notification::error(format!(
+                            "新建会话失败：{error}"
+                        )),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            },
+        );
+
         let worktree_subscription = cx.subscribe_in(
             &sidebar,
             window,
@@ -176,6 +210,7 @@ impl Workspace {
             selected_session: None,
             _appearance_subscription: appearance_subscription,
             _session_subscription: session_subscription,
+            _new_session_subscription: new_session_subscription,
             _worktree_subscription: worktree_subscription,
             _sessions_changed_subscription: sessions_changed_subscription,
         }

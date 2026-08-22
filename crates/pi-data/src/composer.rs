@@ -70,6 +70,8 @@ pub enum ImageValidationError {
     Unsupported,
     #[error("图片数据为空或已损坏")]
     Invalid,
+    #[error("不支持的剪贴板图片格式：SVG；请改用 PNG、JPEG、GIF 或 WebP")]
+    UnsupportedSvg,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -404,6 +406,30 @@ pub fn image_from_bytes(bytes: Vec<u8>) -> Result<DraftImage, ImageValidationErr
     })
 }
 
+/// 校验 GPUI 剪贴板给出的图片编码，并转换为 RPC 草稿。
+///
+/// Windows 的 CF_DIB 会由 GPUI 包装成 BMP；钉版本范围内没有公开的重编码 API，
+/// 因此本轮明确返回错误而不是静默丢弃或修改依赖钉点。
+pub fn image_from_clipboard_bytes(
+    mime_type: &str,
+    bytes: Vec<u8>,
+) -> Result<DraftImage, ImageValidationError> {
+    if bytes.is_empty() {
+        return Err(ImageValidationError::Invalid);
+    }
+    if bytes.len() > MAX_ATTACHED_IMAGE_BYTES {
+        return Err(ImageValidationError::TooLarge);
+    }
+    match mime_type {
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" => image_from_bytes(bytes),
+        "image/svg+xml" => Err(ImageValidationError::UnsupportedSvg),
+        // GPUI 没有公开的编码 API；在不新增依赖、不改 Cargo.lock 的前提下，
+        // Windows CF_DIB/BMP 必须明确报错，不能继续静默丢弃。
+        "image/bmp" => Err(ImageValidationError::Unsupported),
+        _ => Err(ImageValidationError::Unsupported),
+    }
+}
+
 pub fn validate_image_batch(
     existing: usize,
     incoming: &[DraftImage],
@@ -636,6 +662,18 @@ mod tests {
         assert_eq!(
             validate_image_batch(MAX_ATTACHED_IMAGES, &[image]),
             Err(ImageValidationError::TooMany)
+        );
+    }
+
+    #[test]
+    fn clipboard_bmp_and_svg_are_explicitly_rejected() {
+        assert_eq!(
+            image_from_clipboard_bytes("image/bmp", b"BMfixture".to_vec()),
+            Err(ImageValidationError::Unsupported)
+        );
+        assert_eq!(
+            image_from_clipboard_bytes("image/svg+xml", b"<svg/>".to_vec()),
+            Err(ImageValidationError::UnsupportedSvg)
         );
     }
 

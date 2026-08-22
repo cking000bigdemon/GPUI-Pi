@@ -4,11 +4,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use futures::{StreamExt as _, channel::mpsc::UnboundedReceiver};
 use gpui::{
-    Anchor, AnyWindowHandle, App, AppContext as _, ClipboardEntry, Context, EventEmitter,
+    Anchor, AnyWindowHandle, App, AppContext as _, Bounds, ClipboardEntry, Context, EventEmitter,
     ExternalPaths, FocusHandle, Focusable, FollowMode, Image, ImageFormat, InteractiveElement as _,
     IntoElement, KeyDownEvent, ListAlignment, ListState, ParentElement as _, PathPromptOptions,
-    Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
-    Window, div, img, prelude::FluentBuilder as _, px,
+    Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Window, div, img, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName,
@@ -17,7 +17,7 @@ use gpui_component::{
     dialog::{DialogAction, DialogClose, DialogFooter},
     dock::{Panel, PanelControl, PanelEvent},
     h_flex,
-    input::{InputEvent, Textarea, TextareaState},
+    input::{InputEvent, Paste, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
     popover::Popover,
@@ -71,6 +71,8 @@ pub struct ChatPanel {
     tail_attached: bool,
     follow_requested: bool,
     minimap_visible: bool,
+    workspace_bounds: Option<Bounds<Pixels>>,
+    message_pane_bounds: Option<Bounds<Pixels>>,
     expanded_tools: HashSet<String>,
     expanded_processes: HashSet<String>,
     rpc_success: Option<String>,
@@ -91,6 +93,7 @@ pub struct ChatPanel {
         Option<std::sync::Arc<dyn crate::live_session::ExtensionResponseSender>>,
     window_title: String,
     next_extension_element_id: u64,
+    fresh_session: bool,
     _composer_subscription: Subscription,
     probe: Option<LayoutProbe>,
 }
@@ -101,6 +104,27 @@ struct RetryStatus {
     max_attempts: u32,
     delay_ms: u64,
     error: String,
+}
+
+#[derive(Clone, Copy)]
+struct ComposerInputShellStyle {
+    background: gpui::Hsla,
+    border: gpui::Hsla,
+    border_layers: u8,
+    shadow_layers: u8,
+}
+
+fn composer_input_shell_style(focused: bool, cx: &App) -> ComposerInputShellStyle {
+    ComposerInputShellStyle {
+        background: cx.theme().background,
+        border: if focused {
+            cx.theme().ring
+        } else {
+            cx.theme().border
+        },
+        border_layers: 1,
+        shadow_layers: 1,
+    }
 }
 
 const fn sessions_changed_for_outcome(outcome: &ControlOutcome) -> bool {
@@ -210,8 +234,7 @@ impl LayoutProbe {
     pub(crate) fn record_files(&self, _: gpui::Bounds<gpui::Pixels>) {}
 }
 
-const COMPOSER_MAX_ROWS: usize = 3;
-const COMPOSER_TEXTAREA_VIEWPORT_HEIGHT: f32 = 76.;
+const COMPOSER_MAX_ROWS: usize = 8;
 
 impl ChatPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -285,6 +308,8 @@ impl ChatPanel {
             tail_attached: true,
             follow_requested: false,
             minimap_visible: true,
+            workspace_bounds: None,
+            message_pane_bounds: None,
             expanded_tools: HashSet::new(),
             expanded_processes: HashSet::new(),
             rpc_success: None,
@@ -303,6 +328,7 @@ impl ChatPanel {
             extension_response_sender: None,
             window_title: "GPUI-Pi".to_owned(),
             next_extension_element_id: 0,
+            fresh_session: false,
             _composer_subscription: subscription,
             probe: None,
         }
@@ -426,6 +452,7 @@ impl ChatPanel {
         self.rpc_success = None;
         self.rpc_error = None;
         self.host_extension_degradation = None;
+        self.fresh_session = false;
         self.draft_key = Some(selection.id.clone());
         self.composer_cwd = Some(selection.cwd.clone());
         self.file_index = None;
@@ -448,6 +475,8 @@ impl ChatPanel {
         self.tail_attached = true;
         self.follow_requested = false;
         self.minimap_visible = true;
+        self.workspace_bounds = None;
+        self.message_pane_bounds = None;
         self.expanded_tools.clear();
         self.expanded_processes.clear();
         // 新会话使用独立 ListState；首次加载仍只执行一次静态全量测量。
@@ -488,6 +517,87 @@ impl ChatPanel {
             });
         })
         .detach();
+    }
+
+    pub fn start_new_session(
+        &mut self,
+        cwd: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let generation = self.active_generation.wrapping_add(1);
+        let document = ConversationDocument {
+            session_id: format!("fresh-{generation}"),
+            source_path: PathBuf::new(),
+            cwd: cwd.clone(),
+            messages: Arc::from([]),
+            items: Arc::from([]),
+            minimap: Arc::from([]),
+            diagnostics: Arc::from([]),
+        };
+        let (active, receiver) = ActiveSession::spawn_fresh(
+            generation,
+            official_binary(),
+            cwd.clone(),
+            document.clone(),
+            ToolPreset::Inherit,
+        )?;
+
+        self.save_current_draft(cx);
+        self.reset_extension_ui(window, cx);
+        if let Some(old) = self.active.take() {
+            old.shutdown();
+        }
+        let reset = reset_session_scoped_state(
+            self.load_generation,
+            &mut self.file_index,
+            &mut self.popup,
+            &mut self.popup_index,
+        );
+        self.load_generation = reset.load_generation;
+        let load_generation = self.load_generation;
+        self.active_generation = generation;
+        self.activity_generation = 0;
+        self.calibration_generation = 0;
+        self.status = ChatStatus::Ready(Arc::new(document.clone()));
+        self.sync_list_document(&document, true);
+        self.list_state.reset(0);
+        self.list_items.clear();
+        self.active = Some(active);
+        self.extension_response_sender = self.active.as_ref().map(|active| {
+            Arc::new(crate::live_session::ClientExtensionResponseSender::new(
+                active.client(),
+            )) as Arc<dyn crate::live_session::ExtensionResponseSender>
+        });
+        self.draft_key = Some(format!("fresh-{generation}"));
+        self.drafts
+            .clear(self.draft_key.as_deref().unwrap_or_default());
+        self.composer
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.composer_cwd = Some(cwd.clone());
+        self.start_file_index(load_generation, cwd, cx);
+        self.attachments.clear();
+        self.slash_commands.clear();
+        self.controls = None;
+        self.model_names = Arc::new(std::collections::HashMap::new());
+        self.tool_preset = ToolPreset::Inherit;
+        self.control_operation = None;
+        self.branch_tree = None;
+        self.branch_preview_leaf = None;
+        self.branch_preview_document = None;
+        self.retry_status = None;
+        self.compacting = false;
+        self.rpc_success = None;
+        self.rpc_error = None;
+        self.host_extension_degradation = None;
+        self.fresh_session = true;
+        self.tail_attached = true;
+        self.follow_requested = false;
+        self.expanded_tools.clear();
+        self.expanded_processes.clear();
+        self.spawn_pump(receiver, window.window_handle(), cx);
+        cx.notify();
+        Ok(())
     }
 
     fn finish_load(
@@ -756,7 +866,23 @@ impl ChatPanel {
                 }
             },
             PumpMessage::ControlsLoaded { result, .. } => match result {
-                Ok(controls) => self.apply_controls(controls),
+                Ok(controls) => {
+                    if self.fresh_session {
+                        if let Some(old_key) = self.draft_key.clone() {
+                            migrate_draft_key(&mut self.drafts, &old_key, &controls.session_id);
+                        }
+                        self.draft_key = Some(controls.session_id.clone());
+                    }
+                    if let Some(path) = controls.session_file.clone() {
+                        active.set_session_identity(controls.session_id.clone(), path);
+                        if self.fresh_session {
+                            self.fresh_session = false;
+                            self.status = ChatStatus::Ready(Arc::new(active.document()));
+                            cx.emit(SessionsChanged);
+                        }
+                    }
+                    self.apply_controls(controls)
+                }
                 Err(error) => {
                     self.rpc_success = None;
                     self.rpc_error = Some(format!("加载会话控制失败：{error}"));
@@ -1550,8 +1676,12 @@ impl ChatPanel {
             return;
         };
         let history = history.clone();
-        let session_path = history.source_path.clone();
-        let cwd = session_cwd(&session_path).unwrap_or_else(|| PathBuf::from("."));
+        let session_path = restart_session_path(self.controls.as_ref(), &history);
+        let cwd = session_path
+            .as_deref()
+            .and_then(session_cwd)
+            .or_else(|| self.composer_cwd.clone())
+            .unwrap_or_else(|| history.cwd.clone());
         self.control_operation = Some(ControlOperation::Tools);
         self.rpc_success = None;
         self.rpc_error = None;
@@ -1852,14 +1982,6 @@ impl ChatPanel {
             cx.stop_propagation();
             return;
         }
-        if event.keystroke.modifiers.secondary()
-            && event.keystroke.key.eq_ignore_ascii_case("v")
-            && self.attach_clipboard_images(cx)
-        {
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
         let Some(popup) = &self.popup else {
             return;
         };
@@ -1994,7 +2116,11 @@ impl ChatPanel {
                     return;
                 }
                 match result {
-                    Ok(images) => panel.add_draft_images(images, cx),
+                    Ok(images) => {
+                        if let Err(error) = panel.add_draft_images(images, cx) {
+                            panel.rpc_error = Some(error.to_string());
+                        }
+                    }
                     Err(error) => {
                         panel.rpc_success = None;
                         panel.rpc_error = Some(error);
@@ -2006,12 +2132,12 @@ impl ChatPanel {
         .detach();
     }
 
-    fn add_draft_images(&mut self, images: Vec<pi_data::DraftImage>, cx: &mut Context<Self>) {
-        if let Err(error) = pi_data::validate_image_batch(self.attachments.len(), &images) {
-            self.rpc_success = None;
-            self.rpc_error = Some(error.to_string());
-            return;
-        }
+    fn add_draft_images(
+        &mut self,
+        images: Vec<pi_data::DraftImage>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), pi_data::ImageValidationError> {
+        pi_data::validate_image_batch(self.attachments.len(), &images)?;
         self.attachments
             .extend(images.into_iter().filter_map(attachment_from_draft));
         if let Some(key) = self.draft_key.clone() {
@@ -2019,24 +2145,38 @@ impl ChatPanel {
         }
         self.rpc_success = None;
         self.rpc_error = None;
+        Ok(())
     }
 
     fn attach_clipboard_images(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(item) = cx.read_from_clipboard() else {
             return false;
         };
-        let images = item
-            .into_entries()
-            .filter_map(|entry| match entry {
-                ClipboardEntry::Image(image) => gpui_image_to_draft(image),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if images.is_empty() {
-            return false;
+        let decision = classify_clipboard_paste(item.entries);
+        match decision {
+            ClipboardPasteDecision::TextOnly => false,
+            ClipboardPasteDecision::Images { images, warning } => {
+                self.rpc_success = None;
+                let result = self.add_draft_images(images, cx);
+                self.rpc_error = clipboard_image_add_feedback(result, warning);
+                true
+            }
+            ClipboardPasteDecision::ImageError { message, has_text } => {
+                self.rpc_success = None;
+                self.rpc_error = Some(message);
+                !has_text
+            }
         }
-        self.add_draft_images(images, cx);
-        true
+    }
+
+    fn capture_composer_paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        if self.attach_clipboard_images(cx) {
+            cx.stop_propagation();
+            cx.notify();
+        } else {
+            // 纯文本或“图片全失败但含文本”必须继续交给 Textarea 的原生 Paste。
+            cx.propagate();
+        }
     }
 
     fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -2131,20 +2271,49 @@ impl ChatPanel {
         cx.notify();
     }
 
-    fn toggle_tool(&mut self, key: String, item_id: String, cx: &mut Context<Self>) {
-        if !self.expanded_tools.insert(key.clone()) {
-            self.expanded_tools.remove(&key);
+    fn update_workspace_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+        if self.workspace_bounds != Some(bounds) {
+            self.workspace_bounds = Some(bounds);
+            cx.notify();
         }
-        if let ChatStatus::Ready(document) = &self.status
-            && let Some(index) = document.items.iter().position(|item| match item {
+    }
+
+    fn update_message_pane_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+        if self.message_pane_bounds != Some(bounds) {
+            self.message_pane_bounds = Some(bounds);
+            cx.notify();
+        }
+    }
+
+    fn toggle_tool(&mut self, key: String, item_id: String, cx: &mut Context<Self>) {
+        let anchor = if let ChatStatus::Ready(document) = &self.status {
+            document.items.iter().position(|item| match item {
                 ConversationItem::Message(message) => message.id == item_id,
                 ConversationItem::Process(group) => {
                     group.messages.iter().any(|message| message.id == item_id)
                 }
             })
-        {
-            // 原位替换只废弃该项，不会重开全量测量。
+        } else {
+            None
+        };
+        let logical_anchor = self.list_state.logical_scroll_top();
+        let was_tailing = self.tail_attached
+            && (self.list_state.is_following_tail()
+                || self.list_state.is_scrolled_to_end().unwrap_or(true));
+        if !was_tailing {
+            self.list_state.pause_following_tail();
+            self.tail_attached = false;
+        }
+        if !self.expanded_tools.insert(key.clone()) {
+            self.expanded_tools.remove(&key);
+        }
+        if let Some(index) = anchor {
             self.list_state.splice(index..index + 1, 1);
+            // splice 命中逻辑顶项时会把 offset 重置为 0；立刻恢复原 ListOffset，
+            // 不依赖下一帧测量即可保住用户正在阅读的视口锚点。
+            if !was_tailing {
+                self.list_state.scroll_to(logical_anchor);
+            }
         }
         cx.notify();
     }
@@ -2244,7 +2413,7 @@ impl ChatPanel {
                                 .rounded_md()
                                 .border_1()
                                 .border_color(cx.theme().border)
-                                .child(img(attachment.preview.clone()).size(px(40.)))
+                                .child(img(attachment.preview.clone()).size(px(56.)))
                                 .child(
                                     Button::new(("remove-attachment", index))
                                         .xsmall()
@@ -2399,6 +2568,14 @@ impl Render for ChatPanel {
                             panel.update(cx, |panel, cx| panel.toggle_minimap(cx));
                         }
                     })
+                    .on_message_pane_bounds({
+                        let panel = cx.entity();
+                        move |bounds, cx| {
+                            panel.update(cx, |panel, cx| {
+                                panel.update_message_pane_bounds(bounds, cx)
+                            });
+                        }
+                    })
                     .on_tail_attachment_change(move |attached, _, cx| {
                         tail_panel.update(cx, |panel, cx| {
                             panel.tail_attached = attached;
@@ -2421,6 +2598,10 @@ impl Render for ChatPanel {
                     .into_any_element()
             }
         };
+        let composer_pane_layout = self
+            .workspace_bounds
+            .zip(self.message_pane_bounds)
+            .map(|(workspace, pane)| (pane.origin.x - workspace.origin.x, pane.size.width));
         let phase = self.active.as_ref().map(|active| active.phase());
         let running = matches!(phase, Some(LivePhase::Running));
         let stopping = matches!(phase, Some(LivePhase::Stopping));
@@ -2495,6 +2676,28 @@ impl Render for ChatPanel {
         let custom_ui_capability = self.extension_ui.custom_ui_capability();
         let show_custom_ui_capability = self.extension_ui.has_seen_extension_ui();
         let statuses = self.extension_ui.statuses().cloned().collect::<Vec<_>>();
+        // S-8：StatusBar 一行最多 3 个独立文本节点。能力与 overflow 都先占额度，
+        // 剩余额度才分配给状态，避免“状态上限 + overflow”实际渲染出第 4 段。
+        let status_node_budget = 3usize - usize::from(show_custom_ui_capability);
+        let status_visible_limit = if statuses.len() > status_node_budget {
+            status_node_budget.saturating_sub(1)
+        } else {
+            statuses.len()
+        };
+        let hidden_status_count = statuses.len().saturating_sub(status_visible_limit);
+        let hidden_status_tooltip = statuses
+            .iter()
+            .skip(status_visible_limit)
+            .map(|status| format!("{}: {}", status.display_key, status.text))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let visible_statuses = statuses
+            .iter()
+            .take(status_visible_limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let composer_focused = self.composer.focus_handle(cx).is_focused(window);
+        let composer_shell_style = composer_input_shell_style(composer_focused, cx);
         let auto_compaction = self
             .controls
             .as_ref()
@@ -2594,13 +2797,21 @@ impl Render for ChatPanel {
                     .children(rows)
             });
 
+        let workspace_panel = cx.entity();
         div()
             .id("chat-workspace")
             .debug_selector(|| "chat-workspace".into())
+            .on_prepaint(move |bounds, _, cx| {
+                workspace_panel.update(cx, |panel, cx| {
+                    panel.update_workspace_bounds(bounds, cx)
+                });
+            })
             .when_some(probe, |this, probe| {
                 this.on_prepaint(move |bounds, _, _| probe.record_workspace(bounds))
             })
             .track_focus(&self.focus_handle)
+            // Paste 是 Textarea 自己消费的 action；必须在祖先 capture 阶段先分流图片。
+            .capture_action(cx.listener(Self::capture_composer_paste))
             .on_key_down(cx.listener(Self::composer_key_down))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.start_attach_paths(paths.paths().to_vec(), cx);
@@ -2749,14 +2960,31 @@ impl Render for ChatPanel {
                         v_flex()
                             .debug_selector(|| "live-composer".into())
                             .flex_none()
-                            .gap_2()
-                            .px_2()
-                            .py_2()
+                            .w_full()
                             .border_t_1()
                             .border_color(cx.theme().border)
-                            // 规范 5.6：composer 是编辑区，底色与画布同源，靠顶边框与消息流分开。
+                            // 通栏只承担顶边框与背景，内容列与消息列同宽同轴。
                             .bg(cx.theme().background)
-                            .when_some(popup, |composer, popup| composer.child(popup))
+                            .child(
+                                h_flex()
+                                    .debug_selector(|| "composer-column-outer".into())
+                                    .w_full()
+                                    .when_some(composer_pane_layout, |column, (inset, width)| {
+                                        column.ml(inset).w(width)
+                                    })
+                                    .px_4()
+                                    .justify_center()
+                                    .child(
+                                        v_flex()
+                                            .debug_selector(|| "composer-content-column".into())
+                                            .flex_none()
+                                            .w_full()
+                                            .min_w_0()
+                                            // 与 chat.rs message-column 共享 S-13 的 820px 上限。
+                                            .max_w(px(820.))
+                                            .gap_2()
+                                            .py_2()
+                                    .when_some(popup, |composer, popup| composer.child(popup))
                             .when_some(attachments, |composer, attachments| {
                                 composer.child(attachments)
                             })
@@ -2854,16 +3082,32 @@ impl Render for ChatPanel {
                             .child(
                                 div()
                                     .debug_selector(|| "composer-textarea-viewport".into())
-                                    .h(px(COMPOSER_TEXTAREA_VIEWPORT_HEIGHT))
-                                    .min_h_0()
-                                    .overflow_hidden()
+                                    // 输入壳是独立纵向行；附件增加高度时应由消息画布让位，
+                                    // 不能让此 viewport 收缩后由 flex_none 子壳溢出覆盖操作行。
+                                    .flex_none()
                                     .child(
                                         div()
                                             .debug_selector(|| "composer-textarea-control".into())
-                                            .size_full()
+                                            .flex_none()
                                             .min_h_0()
+                                            .rounded_xl()
+                                            // Textarea 关闭 appearance 后不再自带表面；壳体显式使用
+                                            // editor token，避免透明层与 Windows 阴影混成灰色糊块。
+                                            .bg(composer_shell_style.background)
+                                            .when(composer_shell_style.border_layers == 1, |shell| {
+                                                shell.border_1()
+                                            })
+                                            .border_color(composer_shell_style.border)
+                                            .when(composer_shell_style.shadow_layers == 1, |shell| {
+                                                shell.shadow_sm()
+                                            })
                                             .overflow_hidden()
-                                            .child(Textarea::new(&self.composer).size_full()),
+                                            .child(
+                                                Textarea::new(&self.composer)
+                                                    .appearance(false)
+                                                    .bordered(false)
+                                                    .w_full(),
+                                            ),
                                     ),
                             )
                             .child(
@@ -3103,6 +3347,8 @@ impl Render for ChatPanel {
                                             })),
                                     ),
                             ),
+                            ),
+                            ),
                     )
                     .when(!below_widgets.is_empty(), |view| {
                         view.child(render_extension_widgets(
@@ -3118,35 +3364,67 @@ impl Render for ChatPanel {
                                 .debug_selector(|| "extension-status-bar".into())
                                 .child(
                                     StatusBar::new()
-                                        .when(!statuses.is_empty(), |bar| {
-                                            bar.left(h_flex().min_w_0().gap_2().children(
-                                                statuses.into_iter().enumerate().map(
-                                                    |(index, status)| {
-                                                        let full = format!(
-                                                            "{}: {}",
-                                                            status.display_key, status.text
-                                                        );
-                                                        div()
-                                                            .id(format!(
-                                                                "extension-status-item-{index}"
-                                                            ))
-                                                            .debug_selector(move || {
-                                                                format!(
-                                                                    "extension-status-item-{index}"
+                                        .when(!visible_statuses.is_empty(), |bar| {
+                                            bar.left(
+                                                h_flex()
+                                                    .min_w_0()
+                                                    .gap_2()
+                                                    .children(
+                                                        visible_statuses
+                                                            .into_iter()
+                                                            .enumerate()
+                                                            .map(|(index, status)| {
+                                                                let full = format!(
+                                                                    "{}: {}",
+                                                                    status.display_key, status.text
+                                                                );
+                                                                div()
+                                                                    .id(format!(
+                                                                        "extension-status-item-{index}"
+                                                                    ))
+                                                                    .debug_selector(move || {
+                                                                        format!(
+                                                                            "extension-status-item-{index}"
+                                                                        )
+                                                                    })
+                                                                    .text_xs()
+                                                                    .text_color(
+                                                                        cx.theme().muted_foreground,
+                                                                    )
+                                                                    .child(elide_extension_text(
+                                                                        &full, 40,
+                                                                    ))
+                                                                    .tooltip(move |window, cx| {
+                                                                        Tooltip::new(full.clone())
+                                                                            .build(window, cx)
+                                                                    })
+                                                            }),
+                                                    )
+                                                    .when(hidden_status_count > 0, |row| {
+                                                        row.child(
+                                                            div()
+                                                                .id("extension-status-overflow")
+                                                                .debug_selector(|| {
+                                                                    "extension-status-overflow"
+                                                                        .into()
+                                                                })
+                                                                .text_xs()
+                                                                .text_color(
+                                                                    cx.theme().muted_foreground,
                                                                 )
-                                                            })
-                                                            .text_xs()
-                                                            .text_color(
-                                                                cx.theme().muted_foreground,
-                                                            )
-                                                            .child(elide_extension_text(&full, 40))
-                                                            .tooltip(move |window, cx| {
-                                                                Tooltip::new(full.clone())
+                                                                .child(format!(
+                                                                    "还有 {hidden_status_count} 项"
+                                                                ))
+                                                                .tooltip(move |window, cx| {
+                                                                    Tooltip::new(
+                                                                        hidden_status_tooltip
+                                                                            .clone(),
+                                                                    )
                                                                     .build(window, cx)
-                                                            })
-                                                    },
-                                                ),
-                                            ))
+                                                                }),
+                                                        )
+                                                    }),
+                                            )
                                         })
                                         .when(show_custom_ui_capability, |bar| {
                                             bar.right(
@@ -3261,13 +3539,115 @@ fn attachment_from_draft(draft: pi_data::DraftImage) -> Option<ComposerAttachmen
     })
 }
 
-fn gpui_image_to_draft(image: Image) -> Option<pi_data::DraftImage> {
-    let draft = pi_data::image_from_bytes(image.bytes).ok()?;
-    matches!(
-        image.format,
-        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::Webp
-    )
-    .then_some(draft)
+fn gpui_image_to_draft(image: Image) -> Result<pi_data::DraftImage, pi_data::ImageValidationError> {
+    pi_data::image_from_clipboard_bytes(image.format.mime_type(), image.bytes)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClipboardPasteDecision {
+    TextOnly,
+    Images {
+        images: Vec<pi_data::DraftImage>,
+        warning: Option<String>,
+    },
+    ImageError {
+        message: String,
+        has_text: bool,
+    },
+}
+
+fn classify_clipboard_paste(entries: Vec<ClipboardEntry>) -> ClipboardPasteDecision {
+    classify_clipboard_paste_with(entries, gpui_image_to_draft)
+}
+
+fn classify_clipboard_paste_with(
+    entries: Vec<ClipboardEntry>,
+    mut convert: impl FnMut(Image) -> Result<pi_data::DraftImage, pi_data::ImageValidationError>,
+) -> ClipboardPasteDecision {
+    let has_text = entries
+        .iter()
+        .any(|entry| matches!(entry, ClipboardEntry::String(_)));
+    let mut images = Vec::new();
+    let mut errors = Vec::new();
+    let mut saw_image = false;
+    for entry in entries {
+        if let ClipboardEntry::Image(image) = entry {
+            saw_image = true;
+            match convert(image) {
+                Ok(image) => images.push(image),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+    }
+    if !images.is_empty() {
+        let warning = (!errors.is_empty()).then(|| {
+            format!(
+                "已添加 {} 张剪贴板图片；另有 {} 张未添加：{}",
+                images.len(),
+                errors.len(),
+                errors.join("；")
+            )
+        });
+        ClipboardPasteDecision::Images { images, warning }
+    } else if saw_image {
+        ClipboardPasteDecision::ImageError {
+            message: format!("剪贴板图片读取失败：{}", errors.join("；")),
+            has_text,
+        }
+    } else {
+        ClipboardPasteDecision::TextOnly
+    }
+}
+
+fn clipboard_image_add_feedback(
+    result: Result<(), pi_data::ImageValidationError>,
+    warning: Option<String>,
+) -> Option<String> {
+    match result {
+        Ok(()) => warning,
+        Err(error) => Some(error.to_string()),
+    }
+}
+
+fn migrate_draft_key(drafts: &mut pi_data::DraftStore, from: &str, to: &str) {
+    if from == to {
+        return;
+    }
+    let draft = drafts.get(from);
+    drafts.set(to.to_owned(), draft);
+    drafts.clear(from);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionScopedReset {
+    load_generation: u64,
+}
+
+fn reset_session_scoped_state(
+    load_generation: u64,
+    file_index: &mut Option<pi_data::FileIndex>,
+    popup: &mut Option<ComposerPopup>,
+    popup_index: &mut usize,
+) -> SessionScopedReset {
+    *file_index = None;
+    *popup = None;
+    *popup_index = 0;
+    SessionScopedReset {
+        load_generation: load_generation.wrapping_add(1),
+    }
+}
+
+fn restart_session_path(
+    controls: Option<&SessionControls>,
+    history: &ConversationDocument,
+) -> Option<PathBuf> {
+    controls
+        .and_then(|controls| controls.session_file.clone())
+        .filter(|path| !path.as_os_str().is_empty() && path.is_file())
+        .or_else(|| {
+            (!history.source_path.as_os_str().is_empty() && history.source_path.is_file())
+                .then(|| history.source_path.clone())
+        })
 }
 
 const fn thinking_label(level: pi_rpc::ThinkingLevel) -> &'static str {
@@ -3402,8 +3782,8 @@ mod tests {
     use std::{io::Write as _, path::PathBuf};
 
     use gpui::{
-        AppContext as _, Modifiers, MouseButton, Pixels, Point, TestAppContext, VisualTestContext,
-        point, size,
+        AppContext as _, ClipboardItem, Modifiers, MouseButton, Pixels, Point, TestAppContext,
+        VisualTestContext, point, size,
     };
     use gpui_component::Root;
     use pi_render::MessageRole;
@@ -3744,9 +4124,10 @@ mod tests {
         }
     }
 
-    fn render_status_with_panel(
+    fn render_status_with_panel_sized(
         cx: &mut TestAppContext,
         status: ChatStatus,
+        window_size: gpui::Size<gpui::Pixels>,
     ) -> (VisualTestContext, gpui::Entity<ChatPanel>) {
         cx.update(|cx| {
             gpui_component::init(cx);
@@ -3754,7 +4135,7 @@ mod tests {
         });
         let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
         let result = captured.clone();
-        let handle = cx.open_window(size(gpui::px(520.), gpui::px(480.)), move |window, cx| {
+        let handle = cx.open_window(window_size, move |window, cx| {
             let panel = cx.new(|cx| {
                 let mut panel = ChatPanel::new(window, cx);
                 if let ChatStatus::Ready(document) = &status {
@@ -3774,6 +4155,13 @@ mod tests {
         }
         let panel = captured.borrow().clone().unwrap();
         (visual, panel)
+    }
+
+    fn render_status_with_panel(
+        cx: &mut TestAppContext,
+        status: ChatStatus,
+    ) -> (VisualTestContext, gpui::Entity<ChatPanel>) {
+        render_status_with_panel_sized(cx, status, size(gpui::px(520.), gpui::px(480.)))
     }
 
     fn render_status(cx: &mut TestAppContext, status: ChatStatus) -> VisualTestContext {
@@ -3846,6 +4234,48 @@ mod tests {
                 .debug_bounds("extension-custom-ui-capability")
                 .is_some()
         );
+    }
+
+    #[gpui::test]
+    fn extension_status_bar_limits_visible_text_fragments_and_summarizes_overflow(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, cx| {
+            for index in 0..5 {
+                panel.extension_ui.apply(
+                    format!("status-{index}"),
+                    pi_rpc::ExtensionUiRequest::SetStatus {
+                        status_key: format!("key-{index}"),
+                        status_text: Some(format!("value-{index}")),
+                    },
+                );
+            }
+            // 任意 extension UI 请求都会启用能力片段，因此左侧最多只能再显示 2 段。
+            cx.notify();
+        });
+        draw_frames(&mut visual, 3);
+        assert!(visual.debug_bounds("extension-status-item-0").is_some());
+        assert!(visual.debug_bounds("extension-status-item-1").is_none());
+        assert!(visual.debug_bounds("extension-status-item-2").is_none());
+        assert!(visual.debug_bounds("extension-status-overflow").is_some());
+        assert!(
+            visual
+                .debug_bounds("extension-custom-ui-capability")
+                .is_some()
+        );
+        let visible_text_nodes = [
+            "extension-status-item-0",
+            "extension-status-item-1",
+            "extension-status-item-2",
+            "extension-status-overflow",
+            "extension-custom-ui-capability",
+        ]
+        .into_iter()
+        .filter(|selector| visual.debug_bounds(selector).is_some())
+        .count();
+        assert_eq!(visible_text_nodes, 3, "S-8 要求独立文本节点总数不超过 3");
     }
 
     #[gpui::test]
@@ -4528,6 +4958,70 @@ mod tests {
         assert!(visual.debug_bounds("tool-card-details").is_some());
     }
 
+    #[test]
+    fn splice_restore_preserves_logical_list_offset() {
+        let state = ListState::new(3, ListAlignment::Top, px(1200.));
+        let expected = gpui::ListOffset {
+            item_ix: 1,
+            offset_in_item: px(17.),
+        };
+        state.scroll_to(expected);
+        state.splice(1..2, 1);
+        assert_eq!(state.logical_scroll_top().offset_in_item, px(0.));
+        state.scroll_to(expected);
+        let restored = state.logical_scroll_top();
+        assert_eq!(restored.item_ix, expected.item_ix);
+        assert_eq!(restored.offset_in_item, expected.offset_in_item);
+    }
+
+    #[gpui::test]
+    fn tool_detail_toggle_keeps_top_level_item_anchor(cx: &mut TestAppContext) {
+        let document = rich_document();
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document));
+        let process_toggle = visual.debug_bounds("process-group-toggle").unwrap();
+        visual.simulate_click(process_toggle.center(), Modifiers::default());
+        draw_frames(&mut visual, 3);
+        let before = panel.read_with(cx, |panel, _| {
+            let index = panel
+                .list_items
+                .iter()
+                .position(|item| item.id == "process-u")
+                .unwrap();
+            let bounds = panel.list_state.bounds_for_item(index).unwrap();
+            (
+                index,
+                bounds.top() - panel.list_state.viewport_bounds().top(),
+            )
+        });
+        panel.update(cx, |panel, cx| {
+            panel.toggle_tool("trace:tool:tool".to_owned(), "trace".to_owned(), cx);
+        });
+        draw_frames(&mut visual, 4);
+        let after = panel.read_with(cx, |panel, _| {
+            let bounds = panel.list_state.bounds_for_item(before.0).unwrap();
+            bounds.top() - panel.list_state.viewport_bounds().top()
+        });
+        assert!((after - before.1).abs() <= px(1.));
+    }
+
+    #[gpui::test]
+    fn tool_detail_toggle_keeps_default_normal_list_attached_at_tail(cx: &mut TestAppContext) {
+        let document = rich_document();
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document));
+        panel.update(cx, |panel, _| {
+            panel.tail_attached = true;
+            panel.list_state.scroll_to_end();
+            assert!(!panel.list_state.is_following_tail());
+        });
+        draw_frames(&mut visual, 2);
+        panel.update(cx, |panel, cx| {
+            assert_ne!(panel.list_state.is_scrolled_to_end(), Some(false));
+            panel.toggle_tool("trace:tool:tool".to_owned(), "trace".to_owned(), cx);
+            assert!(panel.tail_attached);
+            assert!(!panel.list_state.is_following_tail());
+        });
+    }
+
     #[gpui::test]
     fn ready_chat_folds_completed_process_trace(cx: &mut TestAppContext) {
         let (mut ready, panel) = render_status_with_panel(cx, ChatStatus::Ready(rich_document()));
@@ -4604,6 +5098,64 @@ mod tests {
         visual.simulate_click(bounds.center(), gpui::Modifiers::default());
         let panel = captured.borrow().clone().unwrap();
         panel.update(cx, |panel, _| assert!(!panel.tail_attached));
+    }
+
+    fn assert_attachment_composer_rows_do_not_overlap(
+        visual: &mut VisualTestContext,
+        expected_attachment: bool,
+    ) {
+        let viewport = visual
+            .debug_bounds("composer-textarea-viewport")
+            .expect("composer textarea viewport missing");
+        let control = visual
+            .debug_bounds("composer-textarea-control")
+            .expect("composer textarea control missing");
+        let actions = visual
+            .debug_bounds("composer-actions")
+            .expect("composer actions missing");
+        assert!(viewport.bottom() <= actions.top());
+        assert!(control.bottom() <= actions.top());
+        assert!(
+            actions.top() - control.bottom() >= px(8.),
+            "必须保留规范 gap_2"
+        );
+        if expected_attachment {
+            let attachments = visual
+                .debug_bounds("composer-attachments")
+                .expect("production attachment strip missing");
+            assert!(attachments.size.height > px(0.));
+            assert!(attachments.bottom() <= viewport.top());
+            assert!(viewport.top() - attachments.bottom() >= px(8.));
+        } else {
+            assert!(visual.debug_bounds("composer-attachments").is_none());
+        }
+    }
+
+    #[gpui::test]
+    fn composer_attachment_keeps_input_and_actions_separate_in_empty_and_ready_states(
+        cx: &mut TestAppContext,
+    ) {
+        for status in [ChatStatus::Empty, ChatStatus::Ready(document("hello"))] {
+            let (mut visual, panel) =
+                render_status_with_panel_sized(cx, status, size(px(1000.), px(1000.)));
+            assert_attachment_composer_rows_do_not_overlap(&mut visual, false);
+
+            panel.update(cx, |panel, cx| {
+                let draft =
+                    pi_data::image_from_bytes(b"\x89PNG\r\n\x1a\nlayout-fixture".to_vec()).unwrap();
+                panel.attachments = vec![attachment_from_draft(draft).unwrap()];
+                cx.notify();
+            });
+            draw_frames(&mut visual, 3);
+            assert_attachment_composer_rows_do_not_overlap(&mut visual, true);
+
+            panel.update(cx, |panel, cx| {
+                panel.attachments.clear();
+                cx.notify();
+            });
+            draw_frames(&mut visual, 3);
+            assert_attachment_composer_rows_do_not_overlap(&mut visual, false);
+        }
     }
 
     #[gpui::test]
@@ -5022,6 +5574,31 @@ mod tests {
     }
 
     #[gpui::test]
+    fn composer_input_shell_uses_editor_surface_single_border_and_shadow(cx: &mut TestAppContext) {
+        let mut visual = render_status(cx, ChatStatus::Ready(document("hello")));
+        let shell = visual
+            .debug_bounds("composer-textarea-control")
+            .expect("composer input shell missing");
+        let viewport = visual
+            .debug_bounds("composer-textarea-viewport")
+            .expect("composer textarea viewport missing");
+        assert!(shell.size.width > px(0.) && shell.size.height > px(0.));
+        assert!(shell.top() >= viewport.top() && shell.bottom() <= viewport.bottom());
+        visual.update(|_, cx| {
+            let style = composer_input_shell_style(false, cx);
+            assert_eq!(style.background, cx.theme().background);
+            assert_eq!(style.border, cx.theme().border);
+            assert_eq!(style.border_layers, 1);
+            assert_eq!(style.shadow_layers, 1);
+            let focused = composer_input_shell_style(true, cx);
+            assert_eq!(focused.background, style.background);
+            assert_eq!(focused.border, cx.theme().ring);
+            assert_eq!(focused.border_layers, 1);
+            assert_eq!(focused.shadow_layers, 1);
+        });
+    }
+
+    #[gpui::test]
     fn minimum_chat_keeps_composer_visible(cx: &mut TestAppContext) {
         let mut ready = render_status(cx, ChatStatus::Ready(document("hello")));
         let chat = ready.debug_bounds("chat-workspace").unwrap();
@@ -5031,11 +5608,51 @@ mod tests {
     }
 
     #[gpui::test]
-    fn multiline_extension_text_keeps_full_state_and_fixed_composer_region(
+    fn composer_input_tracks_real_message_column_with_minimap_expanded_and_collapsed(
         cx: &mut TestAppContext,
     ) {
-        assert_eq!(COMPOSER_MAX_ROWS, 3);
-        assert_eq!(COMPOSER_TEXTAREA_VIEWPORT_HEIGHT, 76.);
+        for width in [640., 1000.] {
+            let document = rich_document();
+            assert!(!document.minimap.is_empty());
+            let (mut visual, panel) = render_status_with_panel_sized(
+                cx,
+                ChatStatus::Ready(document),
+                size(px(width), px(480.)),
+            );
+            // 首帧由 ChatWindow prepaint 回传消息 pane，后续帧让 ChatPanel 消费 bounds。
+            draw_frames(&mut visual, 2);
+            panel.update(cx, |panel, _| {
+                assert!(panel.message_pane_bounds.is_some());
+                assert!(panel.workspace_bounds.is_some());
+            });
+            let message_column = visual
+                .debug_bounds("message-column")
+                .expect("message column missing with expanded minimap");
+            let input_shell = visual
+                .debug_bounds("composer-textarea-control")
+                .expect("composer input shell missing");
+            assert_eq!(input_shell.origin.x, message_column.origin.x);
+            assert_eq!(input_shell.right(), message_column.right());
+
+            panel.update(cx, |panel, cx| panel.toggle_minimap(cx));
+            draw_frames(&mut visual, 3);
+            assert!(visual.debug_bounds("chat-minimap-collapsed").is_some());
+            let collapsed_column = visual
+                .debug_bounds("message-column")
+                .expect("message column missing with collapsed minimap");
+            let collapsed_shell = visual
+                .debug_bounds("composer-textarea-control")
+                .expect("composer input shell missing after minimap collapse");
+            assert_eq!(collapsed_shell.origin.x, collapsed_column.origin.x);
+            assert_eq!(collapsed_shell.right(), collapsed_column.right());
+        }
+    }
+
+    #[gpui::test]
+    fn multiline_extension_text_keeps_full_state_and_bounded_composer_region(
+        cx: &mut TestAppContext,
+    ) {
+        assert_eq!(COMPOSER_MAX_ROWS, 8);
         let (mut visual, panel) =
             render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
         panel.update(cx, |panel, cx| {
@@ -5087,17 +5704,191 @@ mod tests {
         let below_after = visual
             .debug_bounds("extension-widgets-below")
             .expect("below widget missing after long text");
+        let chat = visual
+            .debug_bounds("chat-workspace")
+            .expect("chat workspace missing");
+        let content_column = visual
+            .debug_bounds("composer-content-column")
+            .expect("composer content column missing");
         assert_eq!(
             panel.read_with(cx, |panel, cx| panel.composer.read(cx).value().to_string()),
             expected
         );
-        assert_eq!(viewport.size.height, px(COMPOSER_TEXTAREA_VIEWPORT_HEIGHT));
+        assert!(viewport.size.height > px(0.));
         assert!(control.top() >= viewport.top() && control.bottom() <= viewport.bottom());
-        assert_eq!(composer_after.size.height, composer_before.size.height);
-        assert_eq!(actions_after.origin.y, actions_before.origin.y);
-        assert_eq!(below_after.origin.y, below_before.origin.y);
+        assert!(composer_after.size.height >= composer_before.size.height);
+        assert!(composer_after.size.height < px(320.));
+        assert!(actions_after.origin.y >= actions_before.origin.y);
+        assert!(below_after.origin.y >= below_before.origin.y);
         assert!(viewport.bottom() <= actions_after.top());
         assert!(actions_after.bottom() <= below_after.top());
+        assert!(below_after.bottom() <= chat.bottom());
+        let message_column = visual
+            .debug_bounds("message-column")
+            .expect("message column missing");
+        assert_eq!(content_column.size.width, message_column.size.width);
+        assert_eq!(content_column.origin.x, message_column.origin.x);
+    }
+
+    #[test]
+    fn fresh_session_reset_clears_project_scoped_index_and_popup_state() {
+        let mut file_index = Some(pi_data::FileIndex {
+            entries: vec![pi_data::FileIndexEntry {
+                path: "old-project.rs".into(),
+                is_dir: false,
+            }],
+            truncated: false,
+        });
+        let mut popup = Some(ComposerPopup::Slash(Vec::new()));
+        let mut popup_index = 7;
+        let reset = reset_session_scoped_state(10, &mut file_index, &mut popup, &mut popup_index);
+        assert!(file_index.is_none());
+        assert!(popup.is_none());
+        assert_eq!(popup_index, 0);
+        assert_eq!(reset.load_generation, 11);
+    }
+
+    #[test]
+    fn clipboard_partition_keeps_successes_and_only_falls_back_to_text_without_images() {
+        let text = ClipboardEntry::String(gpui::ClipboardString::new("cells".into()));
+        let png = ClipboardEntry::Image(Image::from_bytes(ImageFormat::Png, vec![1]));
+        let bmp = ClipboardEntry::Image(Image::from_bytes(ImageFormat::Bmp, vec![2]));
+        let accepted = pi_data::DraftImage {
+            data: "image".into(),
+            mime_type: "image/png".into(),
+        };
+
+        let mixed = classify_clipboard_paste_with(vec![text.clone(), png, bmp.clone()], |image| {
+            if image.format == ImageFormat::Png {
+                Ok(accepted.clone())
+            } else {
+                Err(pi_data::ImageValidationError::Unsupported)
+            }
+        });
+        assert!(matches!(
+            mixed,
+            ClipboardPasteDecision::Images { images, warning: Some(_) }
+                if images == vec![accepted]
+        ));
+
+        let failed_with_text = classify_clipboard_paste_with(vec![text, bmp.clone()], |_| {
+            Err(pi_data::ImageValidationError::Unsupported)
+        });
+        assert!(matches!(
+            failed_with_text,
+            ClipboardPasteDecision::ImageError { has_text: true, .. }
+        ));
+        let failed_only = classify_clipboard_paste_with(vec![bmp], |_| {
+            Err(pi_data::ImageValidationError::Unsupported)
+        });
+        assert!(matches!(
+            failed_only,
+            ClipboardPasteDecision::ImageError {
+                has_text: false,
+                ..
+            }
+        ));
+    }
+
+    #[gpui::test]
+    fn composer_paste_action_captures_png_as_attachment_without_changing_text(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.composer.update(cx, |input, cx| {
+                    input.set_value("keep text", window, cx);
+                    input.focus(window, cx);
+                });
+            });
+        });
+        draw_frames(&mut visual, 2);
+
+        let png = Image::from_bytes(
+            ImageFormat::Png,
+            b"\x89PNG\r\n\x1a\nclipboard-fixture".to_vec(),
+        );
+        visual.write_to_clipboard(ClipboardItem::new_image(&png));
+        visual.dispatch_action(Paste);
+        draw_frames(&mut visual, 2);
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.attachments.len(), 1);
+            assert_eq!(panel.composer.read(cx).value().as_ref(), "keep text");
+        });
+    }
+
+    #[gpui::test]
+    fn composer_paste_action_propagates_plain_text_to_textarea(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.composer.update(cx, |input, cx| {
+                    input.set_value("before ", window, cx);
+                    let cursor = input.value().len();
+                    input.set_selected_range(cursor..cursor, cx);
+                    input.focus(window, cx);
+                });
+            });
+        });
+        draw_frames(&mut visual, 2);
+
+        visual.write_to_clipboard(ClipboardItem::new_string("plain text".to_owned()));
+        visual.dispatch_action(Paste);
+        draw_frames(&mut visual, 2);
+
+        panel.read_with(cx, |panel, cx| {
+            assert!(panel.attachments.is_empty());
+            assert_eq!(
+                panel.composer.read(cx).value().as_ref(),
+                "before plain text"
+            );
+        });
+    }
+
+    #[test]
+    fn clipboard_batch_rejection_preserves_limit_error_over_partial_warning() {
+        let png = ClipboardEntry::Image(Image::from_bytes(ImageFormat::Png, vec![1]));
+        let bmp = ClipboardEntry::Image(Image::from_bytes(ImageFormat::Bmp, vec![2]));
+        let accepted = pi_data::DraftImage {
+            data: "image".into(),
+            mime_type: "image/png".into(),
+        };
+        let decision = classify_clipboard_paste_with(vec![png, bmp], |image| {
+            if image.format == ImageFormat::Png {
+                Ok(accepted.clone())
+            } else {
+                Err(pi_data::ImageValidationError::Unsupported)
+            }
+        });
+        let ClipboardPasteDecision::Images { images, warning } = decision else {
+            panic!("PNG + BMP 应分类为成功图片附带 partial warning");
+        };
+        let batch_result = pi_data::validate_image_batch(pi_data::MAX_ATTACHED_IMAGES, &images);
+        assert_eq!(
+            clipboard_image_add_feedback(batch_result, warning),
+            Some(pi_data::ImageValidationError::TooMany.to_string())
+        );
+        assert_eq!(
+            clipboard_image_add_feedback(Ok(()), Some("部分失败".to_owned())),
+            Some("部分失败".to_owned())
+        );
+    }
+
+    #[test]
+    fn fresh_draft_key_migration_moves_content_and_clears_temporary_key() {
+        let mut drafts = pi_data::DraftStore::default();
+        let draft = pi_data::ComposerDraft {
+            text: "unsent".into(),
+            images: Vec::new(),
+        };
+        drafts.set("fresh-1", draft.clone());
+        migrate_draft_key(&mut drafts, "fresh-1", "real-session");
+        assert_eq!(drafts.get("real-session"), draft);
+        assert_eq!(drafts.get("fresh-1"), pi_data::ComposerDraft::default());
     }
 
     #[gpui::test]
@@ -5122,6 +5913,42 @@ mod tests {
             assert!(panel.finish_load(2, "new".to_owned(), Ok(document("new"))));
             assert!(matches!(panel.status, ChatStatus::Ready(_)));
         });
+    }
+
+    #[test]
+    fn restart_path_prefers_existing_control_file_and_rejects_unpersisted_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let control_path = directory.path().join("control.jsonl");
+        let history_path = directory.path().join("history.jsonl");
+        std::fs::write(&control_path, "").unwrap();
+        std::fs::write(&history_path, "").unwrap();
+        let mut history = (*document("hello")).clone();
+        history.source_path = history_path.clone();
+        let controls = SessionControls {
+            model: None,
+            thinking_level: pi_rpc::ThinkingLevel::Off,
+            models: Vec::new(),
+            thinking_levels: Vec::new(),
+            session_file: Some(control_path.clone()),
+            session_id: "session".into(),
+            tree: pi_rpc::TreeData {
+                tree: Vec::new(),
+                leaf_id: None,
+            },
+            auto_compaction_enabled: true,
+            auto_retry_enabled: true,
+            is_compacting: false,
+        };
+        assert_eq!(
+            restart_session_path(Some(&controls), &history),
+            Some(control_path)
+        );
+
+        let missing = directory.path().join("missing.jsonl");
+        let mut unpersisted = controls;
+        unpersisted.session_file = Some(missing);
+        history.source_path = PathBuf::new();
+        assert_eq!(restart_session_path(Some(&unpersisted), &history), None);
     }
 
     #[test]

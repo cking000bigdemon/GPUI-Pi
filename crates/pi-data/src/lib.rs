@@ -27,7 +27,7 @@ pub use composer::{
     FileIndex, FileIndexEntry, ImageValidationError, MAX_ATTACHED_IMAGE_BYTES, MAX_ATTACHED_IMAGES,
     SupportedImageFormat, apply_at_insertion, build_at_insertion, build_entries_from_files,
     build_file_index, detect_image_format, extract_at_query, filter_file_entries, image_from_bytes,
-    merge_restored_submission, validate_image_batch,
+    image_from_clipboard_bytes, merge_restored_submission, validate_image_batch,
 };
 pub use config::{
     ConfigError, models_path, read_auto_retry_enabled, read_json, read_models, read_settings,
