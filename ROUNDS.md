@@ -1,7 +1,7 @@
 # 轮次进度
 
 拆解与验收标准见 [`docs/立项文档.md`](docs/立项文档.md) § 七；目录规则见 [`rounds/README.md`](rounds/README.md)，每轮任务卡位于 `rounds/round-NN/round-NN.md`。
-每轮完成后由执行方更新本表 —— 状态、PR、完成日期三列都要填。
+每轮完成后由执行方更新本表 —— 状态、PR、完成日期三列都要填。R21–R27 为 Issue [#27](https://github.com/cking000bigdemon/GPUI-Pi/issues/27) 的 post-v1 架构扩展；当前仅提交方案评审，未开始代码实现。
 
 | 轮 | 内容 | 执行方 | 状态 | PR | 完成 |
 |---|---|---|---|---|---|
@@ -26,6 +26,13 @@
 | **R18** | 1:1 验收 + 文档定稿 | Windows | ⬜ | — | — |
 | **R19** | Windows 应用图标（独立维护） | Windows | ✅ 已完成 | [#21](https://github.com/cking000bigdemon/GPUI-Pi/pull/21) | 2026-08-19 |
 | **R20** | Release 试用第一批问题修复（UI-001–UI-008） | Windows | ✅ validation / 视觉全绿，PR 待合并 | [#28](https://github.com/cking000bigdemon/GPUI-Pi/pull/28) | — |
+| **R21** | 权威设计同步 + 单会话 Runtime 集中化 | Windows | 📐 方案评审中，未实现 | — | — |
+| **R22** | 单 Runtime 有界 Actor 与事件背压 | Windows | ⬜ | — | — |
+| **R23** | Scheduler / 状态机 / Park-Resume / Idle TTL | Windows | ⬜ | — | — |
+| **R24** | 有界多用户 Session UI 接线 | Windows | ⬜ | — | — |
+| **R25** | Windows Job Object + 进程树与内存治理 | Windows | ⬜ | — | — |
+| **R26** | 内建只读子代理任务与配额调度 | Windows | ⬜ | — | — |
+| **R27** | mutating 子代理 + worktree writer 隔离 | Windows | ⬜ | — | — |
 
 ## 里程碑
 
@@ -36,3 +43,4 @@
 | **M2** | R4–R8 | **可日用** | 到此为止也是稳定终态 |
 | **M3** | R10–R15 | 功能追平 | — |
 | **M4** | R16–R18 | 交付 | 附录 A 不全绿不发版 |
+| **M5** | R21–R27 | 有界多会话 + 内存治理 + 内建子代理 | R22 背压不过不得开放 R24；R25 整树清理不过不得启用 mutating 子代理 |

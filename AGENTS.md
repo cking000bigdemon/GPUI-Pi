@@ -51,7 +51,7 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 
 ```powershell
 .\scripts\validate.ps1              # 全量（含 GPUI 编译，慢）
-.\scripts\validate.ps1 -Logic       # 只跑 pi-rpc / pi-data / pi-render（快）
+.\scripts\validate.ps1 -Logic       # 当前只跑 pi-rpc / pi-data / pi-render；R21 引入 pi-runtime 时同步纳入
 ```
 
 **任何一次迭代结束都必须跑 validate**，不许"看起来对了就下一步"。
@@ -100,7 +100,7 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 | 范围 | 执行方 |
 |---|---|
 | R0 工程骨架 | 130 Arch（历史；已迁移） |
-| **R1–R18 全部实现、测试、打包** | **Windows** |
+| **R1 起全部实现、测试、打包** | **Windows** |
 | CI | `windows-latest` 阻断（唯一 job） |
 
 **项目已迁移为 Windows solo**：不再维护 Linux 构建、不再跑 Linux CI，`ubuntu-latest` 相关 job 已从 `.github/workflows/ci.yml` 移除。所有 `.sh` 脚本与 Linux 分支说明仅为历史遗留，不再维护更新。从 Linux 交叉编译 Windows 的 GPUI 目标**不可行**（DirectX + COM + MSVC 链接器）。
@@ -112,10 +112,21 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 | `pi-rpc` | ❌ | 子进程、JSONL 协议、命令/事件类型 |
 | `pi-data` | ❌ | `~/.pi/agent` 文件层 |
 | `pi-render` | ❌ | 消息 → 可渲染中间模型（Markdown 分块 / ANSI / diff / 工具卡片） |
+| `pi-runtime`（R21 引入） | ❌ | 应用级有界 RuntimeManager、Actor、Snapshot、调度、资源预算与内建子代理任务；所有 app 内建 `pi --mode rpc` 的唯一生产创建入口 |
 | `gpui-pi-ui` (`crates/ui`) | ✅ | 跨面板复用的组件封装 |
-| `gpui-pi` (`crates/app`) | ✅ | 窗口、面板、状态编排、入口 |
+| `gpui-pi` (`crates/app`) | ✅ | 窗口、面板、轻量状态投影、入口；不得直接拥有 `pi_rpc::Client` |
 
-**能放进前三个就不要放进后两个** —— 那三个不需要窗口和 GPU 就能全量单测，是自动化验收的全部基础。
+**能放进前四个就不要放进后两个** —— 四个纯逻辑 crate 不需要窗口和 GPU，可脱离 GPUI 完整单测。`pi-rpc` 只负责单进程监督，跨 Session 的调度、回收和预算统一属于 `pi-runtime`。
+
+## Post-v1 有界运行时（R21–R27）
+
+- 权威拆分见 `docs/立项文档.md` § 七 阶段 E；对应 GitHub Issue 为 #27。
+- 实施顺序固定为：R21 集中化 → R22 Actor/背压 → R23 Scheduler/Park → R24 多会话 UI → R25 Windows Job Object/内存 → R26 只读子代理 → R27 mutating writer/worktree 隔离。**R22 背压未通过前禁止开放多会话**。
+- `RuntimeManager` 是应用级共享服务，跨窗口、Workspace、用户 Session、内建子代理和 maintenance job 共用总预算；禁止在 `ChatPanel` 或单个窗口内各建一套 Manager。
+- app 生产代码创建用户 Session、内建子代理或 maintenance `pi --mode rpc`（包括历史 HTML 导出）必须经过 `RuntimeManager`；`pi-rpc` 自身隔离测试可直接创建 `Client`。Provider 登录等一次性非 RPC CLI 不计入 Session Runtime。
+- `SessionHandle` 不得暴露 raw `Client`、可变 reducer、无界 receiver 或 app 专用 `PumpMessage`；UI 通过稳定 `RuntimeId`、Snapshot revision 与 Dirty 通知消费状态。Pi `session_id` 可后置校准，不作为不可变 Handle 主键。
+- 第三方 Extension 自行启动的进程在不修改钉死 RPC、不给扩展加沙箱时无法强制纳管；项目只承诺 GPUI-Pi 内建 Runtime 全量纳管，对第三方进程做观测与提示，不得宣称全部强制控制。
+- Issue 中并发数、Warm 数量、Idle TTL 与内存水位是可配置初始值，后续按 Windows 实测调整；不得把建议值硬编码成不可变产品契约。
 
 ## 编码约定
 
