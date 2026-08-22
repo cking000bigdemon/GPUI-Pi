@@ -109,7 +109,7 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 |---|---|---|
 | `pi-rpc` | ❌ | 子进程、JSONL 协议、命令/事件类型 |
 | `pi-data` | ❌ | `~/.pi/agent` 文件层 |
-| `pi-render` | ❌ | 消息 → 可渲染中间模型（Markdown 分块 / ANSI / diff / 工具卡片） |
+| `pi-render` | ❌ | 消息 → 可渲染中间模型（Markdown 分块 / ANSI / diff / 工具卡片）。**app / ui 与 pi-runtime 共享的类型层**，不是 pi-runtime 的下游：`crates/ui` 对它的直接依赖必须保留 |
 | `pi-runtime`（R21 引入） | ❌ | 应用级有界 RuntimeManager、Actor、Snapshot、调度、资源预算与内建子代理任务；所有 app 内建 `pi --mode rpc` 的唯一生产创建入口 |
 | `gpui-pi-ui` (`crates/ui`) | ✅ | 跨面板复用的组件封装 |
 | `gpui-pi` (`crates/app`) | ✅ | 窗口、面板、轻量状态投影、入口；不得直接拥有 `pi_rpc::Client` |
@@ -118,12 +118,17 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 
 ## Post-v1 有界运行时（R21–R27）
 
-- 权威拆分见 `docs/立项文档.md` § 七 阶段 E；对应 GitHub Issue 为 #27。
+- 权威拆分见 `docs/立项文档.md` § 七 阶段 E；对应 GitHub Issue 为 #27。**阶段 E 与 R17/R18 的先后属待决事项，未按 § 七 阶段 E 的待决条款选定前不得开工 R21。**
 - 实施顺序固定为：R21 集中化 → R22 Actor/背压 → R23 Scheduler/Park → R24 多会话 UI → R25 Windows Job Object/内存 → R26 只读子代理 → R27 mutating writer/worktree 隔离。**R22 背压未通过前禁止开放多会话**。
 - `RuntimeManager` 是应用级共享服务，跨窗口、Workspace、用户 Session、内建子代理和 maintenance job 共用总预算；禁止在 `ChatPanel` 或单个窗口内各建一套 Manager。
-- app 生产代码创建用户 Session、内建子代理或 maintenance `pi --mode rpc`（包括历史 HTML 导出）必须经过 `RuntimeManager`；`pi-rpc` 自身隔离测试可直接创建 `Client`。Provider 登录等一次性非 RPC CLI 不计入 Session Runtime。
+- app 生产代码创建用户 Session、内建子代理或 maintenance `pi --mode rpc`（包括历史 HTML 导出）必须经过 `RuntimeManager`；`pi-rpc` 自身隔离测试可直接创建 `Client`。Provider 登录等一次性非 RPC CLI 不计入 Session Runtime。Maintenance job 走独立小配额，**不占用户会话运行槽**。
+- **重启决策权归 Manager**：经 `RuntimeManager` 创建的 Runtime 一律把 `pi-rpc` 的 `max_restarts` 设为 0，崩溃恢复走 Manager 状态机。确需保留底层自动重启的场景，必须订阅 `LifecycleEvent::Restarting / Restarted` 并把该次重启计入运行槽与内存预算——绝不允许底层在 Manager 判 `Failed`、释放运行槽之后自行拉起进程。
+- **Park/Resume 优先复用 `switch_session`**：`IdleWarm` 是可被任意 Session 复用的热进程池，不是某个 Session 的预热副本；冷启动只作为无空闲 Runtime 时的回退。
 - `SessionHandle` 不得暴露 raw `Client`、可变 reducer、无界 receiver 或 app 专用 `PumpMessage`；UI 通过稳定 `RuntimeId`、Snapshot revision 与 Dirty 通知消费状态。Pi `session_id` 可后置校准，不作为不可变 Handle 主键。
-- 第三方 Extension 自行启动的进程在不修改钉死 RPC、不给扩展加沙箱时无法强制纳管；项目只承诺 GPUI-Pi 内建 Runtime 全量纳管，对第三方进程做观测与提示，不得宣称全部强制控制。
+- **两类子代理，边界不许含糊**：Scheduler 的并发与深度配额只覆盖 **Manager 派发**的子代理；pi 内核与 extension 自行 spawn 的子代理绕过配额（官方 `subagent` 示例扩展对每次调用 spawn 一个 `pi --mode json -p --no-session`，且支持 `tasks` 数组并行）。因此 R26 验收不得表述为"所有子代理"。反过来也不得说这类进程"无法强制控制"——它们在 Runtime 的进程树 / Job Object 内，R25 的进程数与内存硬限制对其有效；真正做不到的只是**按任务语义限流**。
+- R26/R27 自建子代理的立项理由必须成立且写明：有会话文件（可恢复、可回看）、有进度与结果 UI、mutating 任务有 worktree 隔离。子代理会话用钉死协议已有的 `new_session { parentSession }` 把父子关系落盘，不得只存在 Manager 内存里。
+- R21 的「`ChatPanel` 会话态收敛为 `SessionUiState`」属本轮授权范围，**不受红线 3 约束**——R21 已要改遍 `active` / `reducer` 的全部引用点，留到 R24 等于同一批代码改两遍。
+- R25 的内存与进程数采样必须经可注入的 `ResourceProbe` 抽象，水位策略用 fake probe 做确定性测试（与 R23 的 fake clock 同构），避免只能手测而撞红线 4。Job Object 所需 API 在已有的 `windows-sys` 内，加 feature 即可，**不改 `Cargo.lock`、不触红线 2**。
 - Issue 中并发数、Warm 数量、Idle TTL 与内存水位是可配置初始值，后续按 Windows 实测调整；不得把建议值硬编码成不可变产品契约。
 
 ## 编码约定
