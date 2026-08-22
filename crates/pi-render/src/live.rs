@@ -298,6 +298,17 @@ impl LiveSessionReducer {
         &self.follow_up
     }
 
+    /// fresh RPC 启动后，`get_state` 才给出 pi 分配的真实身份。
+    /// 只更新身份，不触碰已缓存的消息与流式草稿。
+    pub fn set_session_identity(
+        &mut self,
+        session_id: impl Into<String>,
+        source_path: impl Into<PathBuf>,
+    ) {
+        self.session_id = session_id.into();
+        self.source_path = source_path.into();
+    }
+
     /// 用 settled 后从持久文件重读的权威快照替换临时流式状态。
     pub fn calibrate(&mut self, history: ConversationDocument) {
         self.session_id = history.session_id.clone();
@@ -616,17 +627,41 @@ fn canonical_message_content(message: &Value) -> String {
         Value::String(text) => text.clone(),
         Value::Array(blocks) => blocks
             .iter()
-            .map(|block| {
-                block
+            .map(|block| match block.get("type").and_then(Value::as_str) {
+                Some("image") => canonical_image_identity(block),
+                _ => block
                     .get("text")
                     .or_else(|| block.get("thinking"))
                     .and_then(Value::as_str)
-                    .map_or_else(|| block.to_string(), str::to_owned)
+                    .map_or_else(|| block.to_string(), str::to_owned),
             })
             .collect::<Vec<_>>()
             .join("\u{1f}"),
         other => other.to_string(),
     }
+}
+
+fn canonical_image_identity(value: &Value) -> String {
+    let source = value.get("source");
+    let mime = value
+        .get("mimeType")
+        .or_else(|| value.get("mime_type"))
+        .or_else(|| source.and_then(|source| source.get("media_type")))
+        .or_else(|| source.and_then(|source| source.get("mimeType")))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let data = value
+        .get("data")
+        .or_else(|| source.and_then(|source| source.get("data")))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    format!("image:{mime}:{}:{}", data.len(), stable_text_hash(data))
+}
+
+fn stable_text_hash(text: &str) -> u64 {
+    text.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
 }
 
 fn render_live_message(
@@ -664,6 +699,7 @@ fn render_live_message(
                     Some("toolCall") => {
                         blocks.push(Block::Tool(render_live_tool(item, live_tools)))
                     }
+                    Some("image") => blocks.push(Block::Image(crate::parse_image(item))),
                     Some(kind) => blocks.push(Block::Unknown(crate::UnknownBlock {
                         kind: kind.to_owned(),
                         text: item.to_string(),

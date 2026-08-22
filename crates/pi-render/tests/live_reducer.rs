@@ -1,7 +1,7 @@
 use pi_render::{
-    Block, ConversationDocument, ConversationItem, LiveAssistantUpdate, LiveBlockKind, LiveEvent,
-    LivePhase, LiveSessionReducer, MarkdownBlock, Message, MessageRole, MinimapNode, ModelRef,
-    ToolOutput, ToolStatus,
+    Block, ConversationDocument, ConversationItem, ImageState, LiveAssistantUpdate, LiveBlockKind,
+    LiveEvent, LivePhase, LiveSessionReducer, MarkdownBlock, Message, MessageRole, MinimapNode,
+    ModelRef, ToolOutput, ToolStatus,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -123,6 +123,78 @@ fn user_start_and_end_upsert_by_stable_run_identity() {
         document.messages[0].timestamp.as_deref(),
         Some("authoritative")
     );
+}
+
+#[test]
+fn fresh_identity_update_survives_the_next_live_document_snapshot() {
+    let mut reducer = LiveSessionReducer::empty("fresh-1", "");
+    reducer.set_session_identity("real-session", "C:/sessions/real.jsonl");
+    reducer.apply(LiveEvent::AgentStart);
+    reducer.apply(LiveEvent::MessageStart {
+        message: json!({"role":"user","content":"hello"}),
+    });
+
+    let document = reducer.document();
+    assert_eq!(document.session_id, "real-session");
+    assert_eq!(
+        document.source_path,
+        std::path::PathBuf::from("C:/sessions/real.jsonl")
+    );
+    assert_eq!(document.messages.len(), 1);
+}
+
+#[test]
+fn live_image_is_stable_across_nested_start_flat_end_and_assistant_stream() {
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=";
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.apply(LiveEvent::AgentStart);
+    reducer.apply(LiveEvent::MessageStart {
+        message: json!({
+            "role":"user",
+            "content":[
+                {"type":"text","text":"look"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":png}}
+            ]
+        }),
+    });
+    let started = reducer.document();
+    assert_eq!(started.messages.len(), 1);
+    assert!(matches!(
+        &started.messages[0].blocks[1],
+        Block::Image(image) if image.state == ImageState::Inline && image.mime_type.as_deref() == Some("image/png")
+    ));
+    assert!(!started.text_snapshot().contains(png));
+
+    reducer.apply(LiveEvent::MessageStart {
+        message: json!({"role":"assistant","content":[]}),
+    });
+    reducer.apply(LiveEvent::MessageUpdate(LiveAssistantUpdate::BlockDelta {
+        index: 0,
+        kind: LiveBlockKind::Text,
+        delta: "working".to_owned(),
+    }));
+    let streaming = reducer.document();
+    assert!(matches!(streaming.messages[0].blocks[1], Block::Image(_)));
+
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({
+            "role":"user",
+            "content":[
+                {"type":"text","text":"look"},
+                {"type":"image","data":png,"mimeType":"image/png"}
+            ]
+        }),
+    });
+    let ended = reducer.document();
+    assert_eq!(
+        ended
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .count(),
+        1
+    );
+    assert!(matches!(ended.messages[0].blocks[1], Block::Image(_)));
 }
 
 #[test]

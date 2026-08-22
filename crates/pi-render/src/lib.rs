@@ -1362,7 +1362,7 @@ fn apply_sgr(params: &str, style: &mut AnsiStyle) {
     }
 }
 
-fn parse_image(value: &Value) -> ImageBlock {
+pub(crate) fn parse_image(value: &Value) -> ImageBlock {
     let mut mime = value
         .get("mimeType")
         .or_else(|| value.get("mime_type"))
@@ -1764,15 +1764,93 @@ fn has_answer_content(message: &Message) -> bool {
 }
 
 fn push_minimap_node(nodes: &mut Vec<MinimapNode>, message: &Message, turn: usize) {
-    if let Some(label) = first_visible_text(message) {
-        nodes.push(MinimapNode {
+    if message.role == MessageRole::User {
+        if let Some(label) = first_visible_text(message) {
+            nodes.push(MinimapNode {
+                message_id: message.id.clone(),
+                turn,
+                role: message.role,
+                label: truncate_chars(&label, 80),
+                level: Some(1),
+            });
+        }
+        return;
+    }
+
+    let headings = message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::Markdown(markdown) => Some(markdown_headings(&markdown.source)),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    if headings.is_empty() {
+        if let Some(label) = first_visible_text(message) {
+            nodes.push(MinimapNode {
+                message_id: message.id.clone(),
+                turn,
+                role: message.role,
+                label: truncate_chars(&label, 80),
+                level: Some(2),
+            });
+        }
+    } else {
+        nodes.extend(headings.into_iter().map(|(level, label)| MinimapNode {
             message_id: message.id.clone(),
             turn,
             role: message.role,
             label: truncate_chars(&label, 80),
-            level: None,
-        });
+            level: Some(level.saturating_add(1)),
+        }));
     }
+}
+
+fn markdown_headings(source: &str) -> Vec<(u8, String)> {
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut headings = Vec::new();
+    let mut index = 0;
+    let mut fenced = false;
+    while index < lines.len() {
+        let line = lines[index];
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+            index += 1;
+            continue;
+        }
+        if fenced {
+            index += 1;
+            continue;
+        }
+        let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
+        if (1..=3).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' ') {
+            let label = trimmed[hashes + 1..].trim().trim_end_matches('#').trim();
+            if !label.is_empty() {
+                headings.push((hashes as u8, label.to_owned()));
+            }
+            index += 1;
+            continue;
+        }
+        if index + 1 < lines.len() && !trimmed.is_empty() {
+            let underline = lines[index + 1].trim();
+            let level = if underline.len() >= 3 && underline.chars().all(|ch| ch == '=') {
+                Some(1)
+            } else if underline.len() >= 3 && underline.chars().all(|ch| ch == '-') {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(level) = level {
+                headings.push((level, trimmed.to_owned()));
+                index += 2;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    headings
 }
 
 fn first_visible_text(message: &Message) -> Option<String> {
@@ -2039,8 +2117,30 @@ mod tests {
         assert!(document.minimap.iter().any(|node| {
             node.label.contains("Result")
                 && node.role == MessageRole::Assistant
-                && node.level.is_none()
+                && node.level == Some(2)
         }));
+    }
+
+    #[test]
+    fn minimap_extracts_atx_and_setext_h1_to_h3_and_ignores_deeper_headings() {
+        let document = render_fixture(&[
+            serde_json::json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            serde_json::json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":"# One\nbody\n## Two\n### Three\n#### Four\nSetext\n---\n```\n# fenced\n```"}}),
+        ]);
+        assert_eq!(
+            document
+                .minimap
+                .iter()
+                .map(|node| (node.label.as_str(), node.level))
+                .collect::<Vec<_>>(),
+            [
+                ("question", Some(1)),
+                ("One", Some(2)),
+                ("Two", Some(3)),
+                ("Three", Some(4)),
+                ("Setext", Some(3)),
+            ]
+        );
     }
 
     #[test]

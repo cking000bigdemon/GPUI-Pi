@@ -1,14 +1,14 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use gpui::{
     App, AppContext as _, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _,
-    StyledExt as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName,
+    InteractiveElementExt as _, Sizable as _, StyledExt as _, WindowExt as _,
     button::{Button, ButtonVariant, ButtonVariants as _},
     dialog::{DialogAction, DialogClose, DialogFooter},
     dock::{Panel, PanelControl, PanelEvent},
@@ -48,6 +48,13 @@ pub struct WorktreeSelected {
     pub cwd: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct NewSessionRequested {
+    pub cwd: PathBuf,
+}
+
+const PROJECT_SESSION_VISIBLE_ROWS: usize = 8;
+
 pub struct SessionSidebar {
     focus_handle: FocusHandle,
     status: SidebarStatus,
@@ -73,6 +80,9 @@ pub struct SessionSidebar {
     /// linked worktree 的移除操作只在对应行 hover 时出现（规范 S-9）。
     hovered_worktree_index: Option<usize>,
     worktree_input: gpui::Entity<InputState>,
+    collapsed_projects: HashSet<String>,
+    project_scrolls: HashMap<String, ScrollHandle>,
+    pending_reveal_project: Option<String>,
     probe: Option<LayoutProbe>,
 }
 
@@ -106,6 +116,9 @@ impl SessionSidebar {
             worktree_expanded: false,
             hovered_worktree_index: None,
             worktree_input,
+            collapsed_projects: HashSet::new(),
+            project_scrolls: HashMap::new(),
+            pending_reveal_project: None,
             probe: None,
         };
         sidebar.refresh(window, cx);
@@ -137,6 +150,9 @@ impl SessionSidebar {
             hovered_worktree_index: None,
             worktree_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder("新建 worktree 分支")),
+            collapsed_projects: HashSet::new(),
+            project_scrolls: HashMap::new(),
+            pending_reveal_project: None,
             probe: None,
         }
     }
@@ -201,6 +217,17 @@ impl SessionSidebar {
         if self.load_generation != generation {
             return false;
         }
+        let available = view
+            .iter()
+            .map(|project| project.key.clone())
+            .collect::<HashSet<_>>();
+        self.collapsed_projects
+            .retain(|key| available.contains(key));
+        self.project_scrolls
+            .retain(|key, _| available.contains(key));
+        for key in &available {
+            self.project_scrolls.entry(key.clone()).or_default();
+        }
         self.summaries = summaries;
         self.diagnostics_count = diagnostics_count;
         self.status = SidebarStatus::Ready(view);
@@ -223,6 +250,7 @@ impl SessionSidebar {
         cx: &mut Context<Self>,
     ) {
         self.selected_id = Some(session.id.clone());
+        self.pending_reveal_project = project_key_for_session(&self.status, &session.id);
         self.set_browsing_cwd(Some(session.cwd.clone()), cx);
         cx.emit(SessionSelected {
             id: session.id.clone(),
@@ -725,9 +753,9 @@ impl SessionSidebar {
         let export_html_id = id.clone();
         let selected = self.selected_id.as_deref() == Some(&node.id);
         let busy = self.busy_actions.contains(&node.id);
-        // 规范 S-8：一行不堆超过 3 个片段，所以元信息拆两行，分支名进 tooltip。
-        let (metric_primary, metric_secondary) = format_metrics(node);
-        let branch_tooltip = node.branch.clone();
+        // 规范 S-8：可见元信息保持单行三片段以内，用量、花费与分支收进 tooltip。
+        let metric = format_metrics(node);
+        let metric_tooltip = session_metric_tooltip(node);
         // 低频操作在悬停行才出现；busy 时保持可见，否则禁用态一闪就消失，用户看不到反馈。
         let actions_visible = self.hovered_id.as_deref() == Some(&node.id) || busy;
         v_flex()
@@ -735,7 +763,10 @@ impl SessionSidebar {
             .child(
                 div()
                     .id(SharedString::from(format!("session-row-{}", node.id)))
-                    .debug_selector(|| "session-row".into())
+                    .debug_selector({
+                        let id = node.id.clone();
+                        move || format!("session-row-{id}")
+                    })
                     .ml(px(depth as f32 * 12.))
                     .p_2()
                     .rounded_md()
@@ -783,13 +814,6 @@ impl SessionSidebar {
                                     .child(div().text_sm().truncate().child(node.title.clone()))
                                     .child(
                                         div()
-                                            .text_xs()
-                                            .truncate()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(metric_primary),
-                                    )
-                                    .child(
-                                        div()
                                             .id(SharedString::from(format!(
                                                 "session-metric-{}",
                                                 node.id
@@ -797,13 +821,11 @@ impl SessionSidebar {
                                             .text_xs()
                                             .truncate()
                                             .text_color(cx.theme().muted_foreground)
-                                            .when_some(branch_tooltip, |row, branch| {
-                                                row.tooltip(move |window, cx| {
-                                                    Tooltip::new(format!("分支：{branch}"))
-                                                        .build(window, cx)
-                                                })
+                                            .tooltip(move |window, cx| {
+                                                Tooltip::new(metric_tooltip.clone())
+                                                    .build(window, cx)
                                             })
-                                            .child(metric_secondary),
+                                            .child(metric),
                                     ),
                             )
                             .when(actions_visible, |row| {
@@ -908,6 +930,7 @@ impl SessionSidebar {
 impl EventEmitter<PanelEvent> for SessionSidebar {}
 impl EventEmitter<SessionSelected> for SessionSidebar {}
 impl EventEmitter<WorktreeSelected> for SessionSidebar {}
+impl EventEmitter<NewSessionRequested> for SessionSidebar {}
 
 impl Focusable for SessionSidebar {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -1068,6 +1091,7 @@ impl Render for SessionSidebar {
                             )
                     })
             });
+        let pending_reveal_project = self.pending_reveal_project.take();
         let content = match &self.status {
             SidebarStatus::Loading => v_flex()
                 .flex_1()
@@ -1091,31 +1115,135 @@ impl Render for SessionSidebar {
                 .text_color(cx.theme().muted_foreground)
                 .child("没有历史会话")
                 .into_any_element(),
-            SidebarStatus::Ready(projects) => v_flex()
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scrollbar()
-                .gap_3()
-                .children(projects.iter().map(|project| {
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .px_2()
-                                .text_xs()
-                                .font_semibold()
-                                .text_color(cx.theme().muted_foreground)
-                                .truncate()
-                                .child(project_label(&project.root)),
-                        )
-                        .children(
-                            project
-                                .sessions
-                                .iter()
-                                .map(|session| self.render_session_node(session, 0, cx)),
-                        )
-                }))
-                .into_any_element(),
+            SidebarStatus::Ready(projects) => {
+                let groups = projects
+                    .iter()
+                    .map(|project| {
+                        let key = project.key.clone();
+                        let toggle_key = key.clone();
+                        let create_cwd = project.root.clone();
+                        let collapsed = self.collapsed_projects.contains(&key);
+                        let scroll = self.project_scrolls.get(&key).cloned().unwrap_or_default();
+                        let session_count = session_count(&project.sessions);
+                        if pending_reveal_project.as_deref() == Some(key.as_str())
+                            && let Some(selected) = self.selected_id.as_deref()
+                            && let Some(index) =
+                                selected_top_level_index(&project.sessions, selected)
+                        {
+                            scroll.scroll_to_item(index);
+                        }
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .id(SharedString::from(format!("project-header-{key}")))
+                                    .debug_selector(|| "project-session-header".into())
+                                    .gap_1p5()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .hover(|row| row.bg(cx.theme().muted))
+                                    .on_click(cx.listener(move |sidebar, _, _, cx| {
+                                        if !sidebar.collapsed_projects.insert(toggle_key.clone()) {
+                                            sidebar.collapsed_projects.remove(&toggle_key);
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        Icon::new(if collapsed {
+                                            IconName::ChevronRight
+                                        } else {
+                                            IconName::ChevronDown
+                                        })
+                                        .size_4(),
+                                    )
+                                    .child(
+                                        div()
+                                            .debug_selector(|| "project-session-title".into())
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .text_color(cx.theme().foreground)
+                                            .truncate()
+                                            .child(project_label(&project.root)),
+                                    )
+                                    .child(
+                                        Button::new(format!("new-session-{key}"))
+                                            .debug_selector(|| "new-project-session".into())
+                                            .ghost()
+                                            .small()
+                                            .icon(IconName::Plus)
+                                            .label("新建会话")
+                                            .tooltip("在此项目启动全新会话")
+                                            .on_click(cx.listener(
+                                                move |sidebar, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    sidebar.selected_id = None;
+                                                    sidebar.set_browsing_cwd(
+                                                        Some(create_cwd.clone()),
+                                                        cx,
+                                                    );
+                                                    prompt_project_trust(
+                                                        sidebar.agent_dir.clone(),
+                                                        &create_cwd,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                    cx.emit(NewSessionRequested {
+                                                        cwd: create_cwd.clone(),
+                                                    });
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    ),
+                            )
+                            .when(!collapsed, |group| {
+                                let session_rows = project
+                                    .sessions
+                                    .iter()
+                                    .map(|session| self.render_session_node(session, 0, cx))
+                                    .collect::<Vec<_>>();
+                                group.child(
+                                    // 两层分责：外层只做严格 paint/hitbox clip，内层只做滚动。
+                                    // pb_1 使用既有 spacing token，把 512px 外框的有效绘制区收至
+                                    // 8×60 + 7×4 = 508px，完整保留第 8 行并截断第 9 行。
+                                    div()
+                                        .debug_selector(|| "project-session-viewport".into())
+                                        .when(
+                                            session_count > PROJECT_SESSION_VISIBLE_ROWS,
+                                            |viewport| viewport.max_h_128(),
+                                        )
+                                        .pb_1()
+                                        .overflow_hidden()
+                                        .child(
+                                            v_flex()
+                                                .id(SharedString::from(format!(
+                                                    "project-scroll-{key}"
+                                                )))
+                                                .debug_selector(|| "project-session-scroll".into())
+                                                .size_full()
+                                                .min_h_0()
+                                                .gap_1()
+                                                .track_scroll(&scroll)
+                                                .overflow_y_scroll()
+                                                .lock_scroll_axis()
+                                                .vertical_scrollbar(&scroll)
+                                                .children(session_rows),
+                                        ),
+                                )
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .gap_3()
+                    .children(groups)
+                    .into_any_element()
+            }
         };
         div()
             .id("session-sidebar")
@@ -1208,29 +1336,29 @@ impl Render for SessionSidebar {
     }
 }
 
-/// 会话行元信息，拆成两行返回。
-///
-/// 规范 S-8 限制一行最多 3 个片段，原来的单行把「运行中 · 时间 · 消息数 · token · 花费 · 分支」
-/// 六段挤在一起，窄侧栏里必然截断。这里第一行放时间性信息，第二行放用量，分支交给 tooltip。
-fn format_metrics(session: &SessionView) -> (String, String) {
+/// 会话行只保留运行/时间/消息数；用量、花费与分支由同一行的 tooltip 承载。
+fn format_metrics(session: &SessionView) -> String {
     let running = if session.running { "运行中 · " } else { "" };
-    let primary = format!(
+    format!(
         "{running}{} · {} 条消息",
         format_relative_time(session.modified),
         session.message_count,
+    )
+}
+
+fn session_metric_tooltip(session: &SessionView) -> String {
+    let context = session.metrics.recent_context_tokens.map_or_else(
+        || "最近上下文：未知".to_owned(),
+        |tokens| format!("最近上下文：{tokens} tokens"),
     );
-    let token = session
-        .metrics
-        .recent_context_tokens
-        .map(format_tokens)
-        .unwrap_or_else(|| "— token".to_owned());
-    let branch = session
-        .branch
-        .as_deref()
-        .map(|branch| format!(" · {}", truncate_text(branch, 16)))
-        .unwrap_or_default();
-    let secondary = format!("{token} · ${:.4}{branch}", session.metrics.cumulative_cost);
-    (primary, secondary)
+    let branch = session.branch.as_deref().map_or_else(
+        || "分支：未记录".to_owned(),
+        |branch| format!("分支：{branch}"),
+    );
+    format!(
+        "{branch}\n累计用量：{} tokens\n累计花费：${:.4}\n{context}",
+        session.metrics.cumulative_tokens, session.metrics.cumulative_cost,
+    )
 }
 
 fn format_relative_time(modified: std::time::SystemTime) -> String {
@@ -1243,24 +1371,6 @@ fn format_relative_time(modified: std::time::SystemTime) -> String {
         3_600..=86_399 => format!("{} 小时前", seconds / 3_600),
         86_400..=2_591_999 => format!("{} 天前", seconds / 86_400),
         _ => format!("{} 个月前", seconds / 2_592_000),
-    }
-}
-
-fn truncate_text(text: &str, max_chars: usize) -> String {
-    let mut chars = text.chars();
-    let prefix: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{prefix}…")
-    } else {
-        prefix
-    }
-}
-
-fn format_tokens(tokens: u64) -> String {
-    if tokens >= 1_000 {
-        format!("{:.1}k token", tokens as f64 / 1_000.0)
-    } else {
-        format!("{tokens} token")
     }
 }
 
@@ -1317,6 +1427,42 @@ fn project_label(root: &Path) -> String {
         )
 }
 
+fn session_count(sessions: &[SessionView]) -> usize {
+    sessions
+        .iter()
+        .map(|session| 1 + session_count(&session.children))
+        .sum()
+}
+
+fn selected_top_level_index(sessions: &[SessionView], id: &str) -> Option<usize> {
+    sessions
+        .iter()
+        .position(|session| session_contains(session, id))
+}
+
+fn session_contains(session: &SessionView, id: &str) -> bool {
+    session.id == id
+        || session
+            .children
+            .iter()
+            .any(|child| session_contains(child, id))
+}
+
+fn project_key_for_session(status: &SidebarStatus, id: &str) -> Option<String> {
+    let SidebarStatus::Ready(projects) = status else {
+        return None;
+    };
+    projects
+        .iter()
+        .find(|project| {
+            project
+                .sessions
+                .iter()
+                .any(|session| session_contains(session, id))
+        })
+        .map(|project| project.key.clone())
+}
+
 fn find_session<'a>(projects: &'a [ProjectSessionView], id: &str) -> Option<&'a SessionView> {
     fn find<'a>(sessions: &'a [SessionView], id: &str) -> Option<&'a SessionView> {
         sessions.iter().find_map(|session| {
@@ -1342,12 +1488,13 @@ mod tests {
 
     use super::*;
 
-    fn ready_sidebar(window: &mut Window, cx: &mut Context<SessionSidebar>) -> SessionSidebar {
-        let session = SessionView {
-            id: "fixture-session".to_owned(),
-            path: PathBuf::from("fixture.jsonl"),
+    fn fixture_session(id: impl Into<String>) -> SessionView {
+        let id = id.into();
+        SessionView {
+            id: id.clone(),
+            path: PathBuf::from(format!("{id}.jsonl")),
             cwd: PathBuf::from("C:/fixture/project"),
-            title: "Fixture session".to_owned(),
+            title: format!("Fixture session {id}"),
             modified: SystemTime::UNIX_EPOCH,
             message_count: 3,
             metrics: SessionMetrics {
@@ -1356,8 +1503,15 @@ mod tests {
                 recent_context_tokens: Some(42_000),
             },
             branch: Some("feature/fixture".to_owned()),
-            running: true,
+            running: id == "fixture-session",
             children: Vec::new(),
+        }
+    }
+
+    fn ready_sidebar(window: &mut Window, cx: &mut Context<SessionSidebar>) -> SessionSidebar {
+        let session = SessionView {
+            title: "Fixture session".to_owned(),
+            ..fixture_session("fixture-session")
         };
         SessionSidebar {
             focus_handle: cx.focus_handle(),
@@ -1386,6 +1540,9 @@ mod tests {
             worktree_expanded: false,
             hovered_worktree_index: None,
             worktree_input: cx.new(|cx| InputState::new(window, cx)),
+            collapsed_projects: HashSet::new(),
+            project_scrolls: HashMap::new(),
+            pending_reveal_project: None,
             probe: None,
         }
     }
@@ -1648,15 +1805,153 @@ mod tests {
         visual
     }
 
+    fn many_sessions_sidebar(
+        window: &mut Window,
+        cx: &mut Context<SessionSidebar>,
+    ) -> SessionSidebar {
+        let mut sidebar = ready_sidebar(window, cx);
+        let SidebarStatus::Ready(projects) = &mut sidebar.status else {
+            unreachable!()
+        };
+        projects[0].sessions = (0..10)
+            .map(|index| SessionView {
+                title: format!("提交清单并修复首批问题 · 子代理会话 {index} 的长标题"),
+                branch: Some(format!("feature/视觉复验-{index}")),
+                ..fixture_session(format!("session-{index}"))
+            })
+            .collect();
+        sidebar
+            .project_scrolls
+            .insert(projects[0].key.clone(), ScrollHandle::default());
+        sidebar
+    }
+
+    #[gpui::test]
+    fn project_session_scroll_shows_eight_rows_and_does_not_snap_back(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            gpui_pi_ui::theme::init_fonts(cx).expect("font init failed");
+        });
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let output = captured.clone();
+        let handle = cx.open_window(size(px(320.), px(700.)), move |window, cx| {
+            let sidebar = cx.new(|cx| many_sessions_sidebar(window, cx));
+            *output.borrow_mut() = Some(sidebar.clone());
+            Root::new(sidebar, window, cx)
+        });
+        let sidebar = captured.borrow().clone().unwrap();
+        let mut visual = VisualTestContext::from_window(handle.into(), cx);
+        draw(&mut visual, 4);
+        let viewport = visual
+            .debug_bounds("project-session-viewport")
+            .expect("项目会话严格裁切 viewport 必须存在");
+        let scroll_bounds = visual
+            .debug_bounds("project-session-scroll")
+            .expect("项目会话内层滚动区必须存在");
+        let first = visual
+            .debug_bounds("session-row-session-0")
+            .expect("第一行必须存在");
+        let eighth = visual
+            .debug_bounds("session-row-session-7")
+            .expect("第八行必须存在");
+        let ninth = visual
+            .debug_bounds("session-row-session-8")
+            .expect("第九行必须存在");
+        assert_eq!(viewport.size.height, px(512.), "外层必须保持 max_h_128");
+        assert_eq!(
+            scroll_bounds.size.height,
+            px(508.),
+            "pb_1 后有效 clip 高度必须为 508px"
+        );
+        assert_eq!(scroll_bounds.origin.x, viewport.origin.x);
+        assert_eq!(scroll_bounds.origin.y, viewport.origin.y);
+        assert_eq!(first.size.height, px(60.), "规范 p_2 的双行会话行高度");
+        assert!(
+            first.top() >= viewport.top() && eighth.bottom() <= viewport.bottom(),
+            "默认 viewport 必须完整显示前 8 条会话"
+        );
+        let effective_clip_bottom = scroll_bounds.bottom();
+        assert_eq!(
+            eighth.bottom(),
+            effective_clip_bottom,
+            "有效 clip 必须紧接第 8 行"
+        );
+        assert!(
+            ninth.top() >= effective_clip_bottom,
+            "第九行默认必须严格位于有效 clip 外"
+        );
+        sidebar.update(cx, |sidebar, _| assert!(sidebar.selected_id.is_none()));
+        // 点击截图中最可能露出的第 9 行标题上沿候选点，而非只点 center；
+        // 正确 clip 后该 hitbox 不得穿透外层 viewport。
+        let clipped_title_candidate = point(ninth.left() + px(32.), ninth.top() + px(8.));
+        visual.simulate_click(clipped_title_candidate, Modifiers::default());
+        sidebar.update(cx, |sidebar, _| {
+            assert!(sidebar.selected_id.is_none(), "被裁切的第 9 行不得命中")
+        });
+
+        let scroll = sidebar.read_with(cx, |sidebar, _| {
+            sidebar.project_scrolls.get("fixture").unwrap().clone()
+        });
+        scroll.set_offset(gpui::point(px(0.), -first.size.height * 2.));
+        sidebar.update(cx, |_, cx| cx.notify());
+        draw(&mut visual, 3);
+        assert!(scroll.offset().y < px(0.), "普通重绘不得把用户滚动弹回顶部");
+        let scrolled_ninth = visual
+            .debug_bounds("session-row-session-8")
+            .expect("滚动后第九行必须仍存在");
+        assert!(
+            scrolled_ninth.top() >= scroll_bounds.top()
+                && scrolled_ninth.bottom() <= scroll_bounds.bottom(),
+            "滚动后第九行必须完整进入 viewport"
+        );
+        visual.simulate_click(scrolled_ninth.center(), Modifiers::default());
+        sidebar.update(cx, |sidebar, _| {
+            assert_eq!(sidebar.selected_id.as_deref(), Some("session-8"));
+        });
+    }
+
+    #[test]
+    fn selected_child_reveals_its_top_level_session() {
+        let child = fixture_session("child");
+        let mut parent = fixture_session("parent");
+        parent.children.push(child);
+        let sibling = fixture_session("sibling");
+        assert_eq!(
+            selected_top_level_index(&[parent, sibling], "child"),
+            Some(0)
+        );
+    }
+
     #[gpui::test]
     fn ready_sidebar_renders_project_row_and_diagnostics(cx: &mut TestAppContext) {
         let mut visual = ready_sidebar_window(cx);
         assert!(visual.debug_bounds("session-sidebar").is_some());
         assert!(visual.debug_bounds("session-diagnostics").is_some());
         let row = visual
-            .debug_bounds("session-row")
+            .debug_bounds("session-row-fixture-session")
             .expect("session row missing");
         assert!(row.size.width > px(0.) && row.size.height > px(0.));
+    }
+
+    #[gpui::test]
+    fn project_header_collapses_sessions_and_keeps_new_session_entry_visible(
+        cx: &mut TestAppContext,
+    ) {
+        let mut visual = ready_sidebar_window(cx);
+        assert_non_zero_debug_bounds(&mut visual, "project-session-header");
+        let title = visual
+            .debug_bounds("project-session-title")
+            .expect("项目标题必须存在");
+        let action = visual
+            .debug_bounds("new-project-session")
+            .expect("新建会话入口必须存在");
+        assert!(title.size.height >= action.size.height * 0.5);
+        assert_non_zero_debug_bounds(&mut visual, "new-project-session");
+        let header = visual.debug_bounds("project-session-header").unwrap();
+        visual.simulate_click(header.center(), Modifiers::default());
+        draw(&mut visual, 2);
+        assert!(visual.debug_bounds("session-row-fixture-session").is_none());
+        assert_non_zero_debug_bounds(&mut visual, "new-project-session");
     }
 
     /// T2 ③：低频行操作按规范 S-9 收进 hover 态，hover 前不占位、hover 后可点。
@@ -1671,7 +1966,7 @@ mod tests {
         }
 
         let row = visual
-            .debug_bounds("session-row")
+            .debug_bounds("session-row-fixture-session")
             .expect("session row missing");
         visual.simulate_mouse_move(row.center(), None, Modifiers::default());
         draw(&mut visual, 2);
@@ -1727,20 +2022,16 @@ mod tests {
             running: true,
             children: Vec::new(),
         };
-        let (primary, secondary) = format_metrics(&session);
-        // 规范 S-8：每行最多 3 个片段，原来的单行是 6 段。
-        assert_eq!(primary, "运行中 · 刚刚 · 3 条消息");
-        assert_eq!(secondary, "42.0k token · $0.1250 · feature/fixture");
-        assert_eq!(primary.matches(" · ").count(), 2);
-        assert_eq!(secondary.matches(" · ").count(), 2);
+        let metric = format_metrics(&session);
+        // 规范 S-8：紧凑指标行最多 3 个片段，分支与 token/cost 收进 tooltip/详情。
+        assert_eq!(metric, "运行中 · 刚刚 · 3 条消息");
+        assert_eq!(metric.matches(" · ").count(), 2);
 
         let plain = SessionView {
             branch: None,
             running: false,
             ..session
         };
-        let (primary, secondary) = format_metrics(&plain);
-        assert_eq!(primary, "刚刚 · 3 条消息");
-        assert_eq!(secondary, "42.0k token · $0.1250");
+        assert_eq!(format_metrics(&plain), "刚刚 · 3 条消息");
     }
 }

@@ -771,6 +771,7 @@ pub struct ActiveSession {
     client: Client,
     reducer: LiveSessionReducer,
     pump: UnboundedSender<PumpMessage>,
+    calibration_path: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
     startup_diagnostic: Option<String>,
     agent_dir: Option<PathBuf>,
 }
@@ -778,13 +779,43 @@ pub struct ActiveSession {
 struct ActiveSessionSpawn {
     generation: u64,
     binary: PathBuf,
-    session_path: PathBuf,
+    session_path: Option<PathBuf>,
     cwd: PathBuf,
     history: ConversationDocument,
     tool_preset: ToolPreset,
 }
 
 impl ActiveSession {
+    pub fn spawn_fresh(
+        generation: u64,
+        binary: PathBuf,
+        cwd: PathBuf,
+        history: ConversationDocument,
+        tool_preset: ToolPreset,
+    ) -> Result<(Self, UnboundedReceiver<PumpMessage>), String> {
+        let (pump, receiver) = mpsc::unbounded();
+        let active = Self::spawn_with_pump(
+            ActiveSessionSpawn {
+                generation,
+                binary,
+                session_path: None,
+                cwd,
+                history,
+                tool_preset,
+            },
+            pump,
+            true,
+            pi_data::agent_dir(),
+        )?;
+        if let Some(message) = active.startup_diagnostic.clone() {
+            let _ = active.pump.unbounded_send(PumpMessage::Diagnostic {
+                generation,
+                message,
+            });
+        }
+        Ok((active, receiver))
+    }
+
     pub fn spawn(
         generation: u64,
         binary: PathBuf,
@@ -818,7 +849,7 @@ impl ActiveSession {
             ActiveSessionSpawn {
                 generation,
                 binary,
-                session_path,
+                session_path: Some(session_path),
                 cwd,
                 history,
                 tool_preset,
@@ -854,18 +885,22 @@ impl ActiveSession {
                 agent_dir.as_os_str().to_owned(),
             ));
         }
-        let session_path = config
-            .initial_session
-            .clone()
-            .expect("active session requires an initial path");
+        let calibration_path =
+            std::sync::Arc::new(std::sync::Mutex::new(config.initial_session.clone()));
         let client = Client::spawn(config).map_err(|error| error.to_string())?;
         let events = client.subscribe();
-        spawn_event_pump(spawn.generation, session_path, events, pump.clone());
+        spawn_event_pump(
+            spawn.generation,
+            calibration_path.clone(),
+            events,
+            pump.clone(),
+        );
         let active = Self {
             generation: spawn.generation,
             client,
             reducer: LiveSessionReducer::new(spawn.history),
             pump,
+            calibration_path,
             startup_diagnostic: diagnostic,
             agent_dir,
         };
@@ -905,6 +940,13 @@ impl ActiveSession {
 
     pub fn calibrate(&mut self, document: ConversationDocument) {
         self.reducer.calibrate(document);
+    }
+
+    /// fresh 会话的身份由 pi 在启动后决定。同步 reducer 与事件泵的校准路径，
+    /// 避免下一批 live event 把真实 session id/path 覆盖回临时值。
+    pub fn set_session_identity(&mut self, session_id: String, path: PathBuf) {
+        set_calibration_path(&self.calibration_path, Some(path.clone()));
+        self.reducer.set_session_identity(session_id, path);
     }
 
     pub fn dispatch(
@@ -1002,7 +1044,7 @@ impl ActiveSession {
         self,
         generation: u64,
         binary: PathBuf,
-        session_path: PathBuf,
+        session_path: Option<PathBuf>,
         cwd: PathBuf,
         history: ConversationDocument,
         preset: ToolPreset,
@@ -1354,7 +1396,7 @@ const fn slash_source_order(source: pi_rpc::SlashCommandSource) -> u8 {
 
 fn active_session_config(
     binary: PathBuf,
-    session_path: PathBuf,
+    session_path: Option<PathBuf>,
     cwd: PathBuf,
     tool_preset: ToolPreset,
 ) -> (ClientConfig, Option<String>) {
@@ -1365,14 +1407,14 @@ fn active_session_config(
 
 fn active_session_config_with_materializer(
     binary: PathBuf,
-    session_path: PathBuf,
+    session_path: Option<PathBuf>,
     cwd: PathBuf,
     tool_preset: ToolPreset,
     materialize: impl FnOnce() -> std::io::Result<PathBuf>,
 ) -> (ClientConfig, Option<String>) {
     let mut config = ClientConfig::new(binary);
     config.current_dir = Some(cwd);
-    config.initial_session = Some(session_path);
+    config.initial_session = session_path;
     config.args = vec!["--no-context-files".into()];
     let diagnostic = match materialize() {
         Ok(host_extension) => {
@@ -1451,9 +1493,16 @@ pub fn official_binary() -> PathBuf {
         .join(pi_rpc::pi_binary_name())
 }
 
+fn set_calibration_path(
+    slot: &std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
+    path: Option<PathBuf>,
+) {
+    *slot.lock().unwrap() = path;
+}
+
 fn spawn_event_pump(
     generation: u64,
-    session_path: PathBuf,
+    calibration_path: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
     events: Receiver<ClientEvent>,
     pump: UnboundedSender<PumpMessage>,
 ) {
@@ -1538,8 +1587,8 @@ fn spawn_event_pump(
                 {
                     return;
                 }
-                if settled {
-                    spawn_calibration(generation, activity_generation, session_path.clone(), &pump);
+                if settled && let Some(session_path) = calibration_path.lock().unwrap().clone() {
+                    spawn_calibration(generation, activity_generation, session_path, &pump);
                 }
                 if disconnected {
                     let _ = pump.unbounded_send(PumpMessage::Stopped {
@@ -1911,7 +1960,7 @@ mod tests {
         for (preset, allowlist) in expected {
             let (config, diagnostic) = active_session_config(
                 PathBuf::from("pi.exe"),
-                PathBuf::from("session.jsonl"),
+                Some(PathBuf::from("session.jsonl")),
                 PathBuf::from("project"),
                 preset,
             );
@@ -1935,10 +1984,36 @@ mod tests {
     }
 
     #[test]
+    fn fresh_active_session_config_has_no_initial_session() {
+        let (config, diagnostic) = active_session_config_with_materializer(
+            PathBuf::from("pi.exe"),
+            None,
+            PathBuf::from("project"),
+            ToolPreset::Inherit,
+            || Ok(PathBuf::from("host.ts")),
+        );
+        assert!(diagnostic.is_none());
+        assert_eq!(config.current_dir.as_deref(), Some(Path::new("project")));
+        assert_eq!(config.initial_session, None);
+    }
+
+    #[test]
+    fn calibration_path_helper_updates_the_event_pump_slot() {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        set_calibration_path(&slot, Some(PathBuf::from("real.jsonl")));
+        assert_eq!(
+            slot.lock().unwrap().as_deref(),
+            Some(Path::new("real.jsonl"))
+        );
+        set_calibration_path(&slot, None);
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
     fn active_session_config_degrades_without_extension_and_reports_diagnostic() {
         let (config, diagnostic) = active_session_config_with_materializer(
             PathBuf::from("pi.exe"),
-            PathBuf::from("session.jsonl"),
+            Some(PathBuf::from("session.jsonl")),
             PathBuf::from("project"),
             ToolPreset::ReadOnly,
             || {
