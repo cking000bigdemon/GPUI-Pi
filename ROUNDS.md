@@ -25,7 +25,7 @@
 | **R17** | 打包分发 | Windows | ⬜ | — | — |
 | **R18** | 1:1 验收 + 文档定稿 | Windows | ⬜ | — | — |
 | **R19** | Windows 应用图标（独立维护） | Windows | ✅ 已完成 | [#21](https://github.com/cking000bigdemon/GPUI-Pi/pull/21) | 2026-08-19 |
-| **R20** | Release 试用第一批问题修复（UI-001–UI-008） | Windows | ✅ validation / 视觉全绿，PR 待创建 | — | — |
+| **R20** | Release 试用第一批问题修复（UI-001–UI-008） | Windows | ✅ validation / 视觉全绿，PR 待合并 | [#28](https://github.com/cking000bigdemon/GPUI-Pi/pull/28) | — |
 
 ## 里程碑
 
